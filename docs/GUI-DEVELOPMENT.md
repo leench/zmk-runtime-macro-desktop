@@ -2,7 +2,7 @@
 
 ## 1. 项目定位
 
-这是 `zmk-module-runtime-macro` 的跨平台桌面配置客户端，用于通过设备的 USB HID_1 配置 runtime macro slots。
+这是 `zmk-module-runtime-macro` 的跨平台桌面配置客户端，用于通过设备的专用 runtime macro USB HID interface 配置 runtime macro slots；该 interface 默认使用 HID_1，也可由固件配置为其他未占用的 HID instance。
 
 首版目标平台：
 
@@ -18,13 +18,14 @@ GUI 只负责配置已有固件功能，不修改 ZMK 主仓库，也不改变�
 
 GUI 必须遵守现有 `docs/PROTOCOL.md` 和 `docs/CLI.md` 中的约定：
 
-- 使用第二个 HID interface，即 `HID_1`；ZMK 键盘接口 `HID_0` 保持不变；
+- 使用专用的 runtime macro USB HID interface；默认设备名为 `HID_1`，也可由固件配置为其他未占用的 HID instance；ZMK 键盘接口 `HID_0` 保持不变；
 - 每个 request/response 固定为 32 bytes；
 - `LIST`、`GET`、`SET`、`CLEAR` 是首版支持的全部命令；
 - `SET` 使用每块 22 bytes 的 payload，完整事务完成前不会替换 slot；
 - slot 数量通过 `LIST` 获取，不能在 GUI 中写死为 8；
 - 宏内容只允许 printable US ASCII（`0x20..0x7e`）、LF、Tab、Backspace；
 - 固件最大长度由 `CONFIG_ZMK_RUNTIME_MACRO_MAX_TEXT_LEN` 决定，协议范围上限为 256 bytes，但当前协议不会返回设备实际配置值；
+- 固件执行宏的 `CONFIG_ZMK_RUNTIME_MACRO_TAP_MS` 和 `CONFIG_ZMK_RUNTIME_MACRO_WAIT_MS` 是编译时配置；当前 v1 没有 capability 或设置命令，桌面端不读取也不修改它们；
 - 宏通过键盘事件执行，主机键盘布局可能影响标点结果；
 - USB 配置通道没有认证和加密，本机上能够访问 HID interface 的程序都可能修改 slots；
 - 固件是 RAM-first。返回 `STORAGE_ERROR` 时，内存中的新值可能已经生效，但 Flash/NVS 持久化失败。
@@ -58,19 +59,19 @@ Linux 后端优先使用 `hidraw`。HIDAPI 文档说明 `hidraw` 可以提供 Us
 Runtime Macro                         [刷新设备] [已连接 ▾]
 
 设备：My Keyboard
-接口：Runtime Macro HID_1       状态：已连接
+接口：Runtime Macro USB HID（默认 HID_1，可配置）  状态：已连接
 ```
 
 行为：
 
-- 启动时枚举兼容的 HID_1；
-- 只有一个明确匹配设备时自动连接；
-- 多个设备或无法识别 Usage 元数据时必须让用户选择，不能猜测；
+- 启动时按 vendor Usage Page `0xff60`、Usage `0x61` 枚举 runtime macro HID 候选；不把 `HID_1`/`HID_2` 当作通用规则；
+- 只有一个明确匹配候选时才自动选择；
+- 多个候选（包括其他 vendor HID 使用同一 Usage 的情况）必须显示脱敏后的产品名、VID/PID 和 interface number 让用户选择，不能按 HID instance 或 interface number 猜测；
+- Usage 元数据缺失时不得猜测，必须要求用户用精确 path 选择；完整 HID path 和 serial 不展示、不写入日志；
 - 支持手动刷新、断开、重新连接；
 - 通过定时枚举检测 USB 拔插，首版不依赖平台专用热插拔 API；
-- 记录设备身份时优先使用 VID/PID、序列号、产品名和 interface number，HID path 只作为回退信息；
-- 当前目标设备观察到的 interface number 不能硬编码为所有设备的通用规则；
-- 连接成功后通过 `LIST` 请求确认目标确实是 Runtime Macro HID_1。
+- 界面展示和诊断只保留脱敏产品名、VID/PID 和 interface number；serial/HID path 仅作为当前进程内部精确选择凭据，不展示、不记录；
+- 阶段 2 只负责枚举和候选选择，不进行探测式广播 `LIST`；用户选定并建立连接后，由阶段 3 连接流程发送 `LIST`，确认所选接口确为 runtime macro 协议。
 
 连接失败时需要区分：没有设备、多个候选设备、权限拒绝、设备忙、协议不兼容和 USB 传输失败。
 
@@ -166,7 +167,7 @@ hidapi
    ▼
 Linux / macOS / Windows HID stack
    ▼
-HID_1
+Runtime Macro USB HID（默认 HID_1，可配置）
 ```
 
 Rust 后端负责：

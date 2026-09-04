@@ -22,3 +22,15 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Keep the Linux backend explicit so HID Usage metadata remains available for
+# safe Runtime Macro HID_1 discovery. Other supported platforms use hidapi's
+# bundled portable C backend without a platform-specific feature.
+[target.'cfg(target_os = "linux")'.dependencies.hidapi]
+version = "2.6.7"
+default-features = false
+features = ["linux-static-hidraw"]
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies.hidapi]
+version = "2.6.7"
+default-features = false
