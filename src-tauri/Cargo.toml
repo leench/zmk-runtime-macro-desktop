@@ -1,8 +1,8 @@
 [package]
 name = "zmk-runtime-macro-desktop"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Cross-platform desktop client for ZMK runtime macro slots."
+authors = ["ZMK Runtime Macro contributors"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

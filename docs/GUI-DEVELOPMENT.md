@@ -12,7 +12,7 @@
 
 GUI 只负责配置已有固件功能，不修改 ZMK 主仓库，也不改变当前 v1 wire protocol。
 
-当前状态：阶段 1–4 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表和宏编辑 UI；阶段 5 的自动重连、连接设置和低调诊断已实现，待主代理审核。
+当前状态：阶段 1–5 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表、宏编辑 UI、自动重连、连接设置和低调诊断；阶段 6 的跨平台打包配置已实现，待各平台 runner 验证。
 
 ## 2. 固件和协议约束
 
@@ -394,15 +394,34 @@ Rust 后端负责：
 
 ## 6. 平台发布方案
 
-| 平台 | 首版交付 | 关键事项 |
-|---|---|---|
-| Linux | AppImage + `.deb` | 提供 udev 规则；AppImage 仍需验证目标系统的 WebKitGTK 运行依赖 |
-| macOS | `.dmg` | 构建 Intel/Apple Silicon；正式发布需要代码签名和 notarization |
-| Windows | NSIS 安装包 | 使用系统 HID 驱动；处理 WebView2 Runtime；正式发布建议 Authenticode 签名 |
+首版发布配置位于 [`.github/workflows/release.yml`](../.github/workflows/release.yml)，使用各平台原生 GitHub Actions runner，不依赖交叉编译：
 
-三平台发布使用各自的原生 CI runner，不依赖交叉编译。首发验证范围建议为 Ubuntu 22.04/24.04、Debian 12 或当前 Fedora、macOS Intel/Apple Silicon、Windows 10/11 x64。
+| 平台 | Runner / target | 交付物 | 关键事项 |
+|---|---|---|---|
+| Linux x86_64 | `ubuntu-22.04` | AppImage + `.deb` | 构建时安装 WebKitGTK、Tauri 和 `hidapi`/hidraw 所需依赖 |
+| macOS Intel | `macos-13` / `x86_64-apple-darwin` | `.dmg` | 单独构建 Intel target |
+| macOS Apple Silicon | `macos-14` / `aarch64-apple-darwin` | `.dmg` | 单独构建 Apple Silicon target |
+| Windows x64 | `windows-latest` | NSIS `.exe` | 使用系统 HID 驱动和 WebView2 |
 
-默认不要求管理员权限。Linux udev 规则的安装应由安装包或用户明确执行，不能让 GUI 静默修改系统权限。
+workflow 只在手动触发或推送明确的 `app-vX.Y.Z` 版本 tag 时运行，不会因普通 push 创建 Release。Tauri action 将产物上传到 draft Release；发布者需要检查版本和产物后手动发布。矩阵通过 `--bundles` 显式限制目标，因此 Linux 不产出 RPM、Windows 不产出 MSI。
+
+Tauri bundle 配置只启用 `appimage`、`deb`、`dmg` 和 `nsis`。Windows 使用官方 `downloadBootstrapper` WebView2 安装模式：安装缺少 WebView2 时需要网络；首版不嵌入约 127 MB 的 offline installer。
+
+Linux workflow 安装 Tauri v2 官方 Debian/Ubuntu 依赖，并额外安装 `pkg-config`、`libudev-dev`（`hidapi` 的 `linux-static-hidraw` 构建依赖）、`patchelf`、`xdg-utils` 和 `libfuse2`（AppImage 构建依赖）。CI 只执行依赖安装、前端构建和 Tauri 打包，不访问真实 HID 设备。
+
+当前公开仓库没有可用于所有用户的稳定 VID/PID 映射，因此不凭空提交 udev 规则或真实硬件标识。Linux 普通用户仍需根据所用固件公开的 VID/PID，在本机安装最小权限规则；可以从下面的模板开始，并替换占位符，不要把本机路径、序列号或设备拓扑提交到仓库：
+
+```udev
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="<vendor-id>", ATTRS{idProduct}=="<product-id>", MODE="0660", GROUP="<existing-input-group>"
+```
+
+规则安装由用户或安装包明确执行，GUI 不会静默修改系统权限。待固件发布稳定、公开的 VID/PID 后，再单独评估是否把经过验证的规则加入各平台安装方案。
+
+三平台正式发布仍需要各自的代码签名：macOS 需要 signing/notarization，Windows 需要 Authenticode。当前 workflow 不引用这些 secrets，产物明确视为 unsigned CI artifacts；签名发布应在后续配置好受控 secrets 后进行。
+
+## 6.1 发布操作与文件
+
+具体的版本、tag、draft Release、签名边界和平台检查步骤见 [`docs/RELEASING.md`](RELEASING.md)。版本发布前至少在本机运行 `npm ci`、前端构建、Rust 测试和 Tauri no-bundle 构建；完整的 macOS/Windows/Linux installer 验证必须在对应原生 runner 上完成。
 
 ## 7. 测试计划
 

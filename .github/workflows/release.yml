@@ -1,0 +1,93 @@
+name: Build desktop bundles
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "app-v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64 (AppImage and deb)
+            os: ubuntu-22.04
+            rust-targets: ""
+            args: --bundles appimage,deb
+          - name: macOS Intel (dmg)
+            os: macos-13
+            rust-targets: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
+          - name: macOS Apple Silicon (dmg)
+            os: macos-14
+            rust-targets: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+          - name: Windows x64 (NSIS)
+            os: windows-latest
+            rust-targets: ""
+            args: --bundles nsis
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            pkg-config \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libudev-dev \
+            patchelf \
+            xdg-utils \
+            libfuse2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and upload draft release artifacts
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+          tagName: app-v__VERSION__
+          releaseName: ZMK Runtime Macro v__VERSION__
+          releaseBody: >-
+            Download the installer for your platform. These CI artifacts are
+            unsigned; see docs/RELEASING.md for platform-specific installation
+            and signing notes.
+          releaseDraft: true
+          prerelease: false

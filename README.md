@@ -15,6 +15,7 @@
 完整的功能设计、技术栈、平台发布和测试计划见：
 
 - [`docs/GUI-DEVELOPMENT.md`](docs/GUI-DEVELOPMENT.md)
+- [`docs/RELEASING.md`](docs/RELEASING.md)
 
 ## 开发环境
 
