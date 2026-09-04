@@ -47,13 +47,21 @@ impl DeviceRecord {
         &self.path
     }
 
-    fn has_target_usage(&self) -> bool {
+    pub(crate) fn has_target_usage_for_registry(&self) -> bool {
         self.summary.usage_page == RUNTIME_MACRO_USAGE_PAGE
             && self.summary.usage == RUNTIME_MACRO_USAGE
     }
 
-    fn has_missing_usage(&self) -> bool {
+    pub(crate) fn has_missing_usage_for_registry(&self) -> bool {
         self.summary.usage_page == 0 && self.summary.usage == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: &[u8], summary: DeviceSummary) -> Self {
+        Self {
+            path: path.to_vec(),
+            summary,
+        }
     }
 }
 
@@ -171,7 +179,9 @@ pub fn select_device<'a>(
     if filter.path.is_some() {
         let usable: Vec<&DeviceRecord> = filtered
             .into_iter()
-            .filter(|record| record.has_target_usage() || record.has_missing_usage())
+            .filter(|record| {
+                record.has_target_usage_for_registry() || record.has_missing_usage_for_registry()
+            })
             .collect();
         return select_one(usable);
     }
@@ -179,13 +189,16 @@ pub fn select_device<'a>(
     let exact: Vec<&DeviceRecord> = filtered
         .iter()
         .copied()
-        .filter(|record| record.has_target_usage())
+        .filter(|record| record.has_target_usage_for_registry())
         .collect();
     if !exact.is_empty() {
         return select_one(exact);
     }
 
-    if filtered.iter().any(|record| record.has_missing_usage()) {
+    if filtered
+        .iter()
+        .any(|record| record.has_missing_usage_for_registry())
+    {
         return Err(DeviceDiscoveryError::UsageMetadataMissing);
     }
 

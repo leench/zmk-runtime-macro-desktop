@@ -19,13 +19,14 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # Keep the Linux backend explicit so HID Usage metadata remains available for
-# safe Runtime Macro HID_1 discovery. Other supported platforms use hidapi's
-# bundled portable C backend without a platform-specific feature.
+# safe Runtime Macro HID discovery without assuming a particular HID instance.
+# Other supported platforms use hidapi's bundled portable C backend without a
+# platform-specific feature.
 [target.'cfg(target_os = "linux")'.dependencies.hidapi]
 version = "2.6.7"
 default-features = false
