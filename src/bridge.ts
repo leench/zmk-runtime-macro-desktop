@@ -25,6 +25,9 @@ export type SlotMetadata = {
   length: number;
 };
 
+/** Raw protocol bytes returned for one selected slot. Never log or persist them. */
+export type SlotBytes = number[];
+
 export type CommandError = {
   code: string;
   message: string;
@@ -68,4 +71,16 @@ export function getConnection(): Promise<ConnectionState> {
 
 export function listSlots(): Promise<SlotMetadata[]> {
   return invoke<SlotMetadata[]>("list_slots");
+}
+
+export function getSlot(slot: number): Promise<SlotBytes> {
+  return invoke<SlotBytes>("get_slot", { slot });
+}
+
+export function setSlot(slot: number, text: string): Promise<void> {
+  return invoke("set_slot", { slot, text });
+}
+
+export function clearSlot(slot: number): Promise<void> {
+  return invoke("clear_slot", { slot });
 }

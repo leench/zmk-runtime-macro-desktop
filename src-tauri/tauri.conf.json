@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "zmk-runtime-macro-desktop",
-        "width": 800,
-        "height": 600
+        "title": "ZMK Runtime Macro",
+        "width": 860,
+        "height": 620,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true
       }
     ],
     "security": {

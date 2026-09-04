@@ -10,7 +10,7 @@
 
 ## 当前状态
 
-项目目前完成 Tauri 2 + React + TypeScript 基础工程初始化。HID 通信、slot 管理和宏编辑器尚未实现。
+项目目前完成 Tauri 2 + React + TypeScript 工程、HID 通信、设备发现、slot 列表和 macro 编辑器。编辑器支持本机 label、隐藏/reveal、控制字符 token、保存和清空；完整阶段状态与限制见：
 
 完整的功能设计、技术栈、平台发布和测试计划见：
 

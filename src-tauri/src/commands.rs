@@ -303,11 +303,26 @@ impl DeviceRegistry {
 /// testable without requiring a real USB device.
 pub trait MacroSession: Send {
     fn list_slots(&mut self) -> Result<Vec<SlotInfo>, ClientError>;
+    fn get_slot(&mut self, slot: u8) -> Result<Vec<u8>, ClientError>;
+    fn set_slot(&mut self, slot: u8, data: &[u8]) -> Result<(), ClientError>;
+    fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError>;
 }
 
 impl MacroSession for RuntimeMacroClient<HidTransport> {
     fn list_slots(&mut self) -> Result<Vec<SlotInfo>, ClientError> {
         RuntimeMacroClient::list_slots(self)
+    }
+
+    fn get_slot(&mut self, slot: u8) -> Result<Vec<u8>, ClientError> {
+        RuntimeMacroClient::get_slot(self, slot)
+    }
+
+    fn set_slot(&mut self, slot: u8, data: &[u8]) -> Result<(), ClientError> {
+        RuntimeMacroClient::set_slot(self, slot, data)
+    }
+
+    fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError> {
+        RuntimeMacroClient::clear_slot(self, slot)
     }
 }
 
@@ -420,6 +435,72 @@ impl<F: SessionFactory> AppState<F> {
         }
     }
 
+    pub fn get_slot(&mut self, slot: u8) -> Result<Vec<u8>, CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .get_slot(slot);
+        match result {
+            Ok(data) => Ok(data),
+            Err(error) => {
+                // A failed read invalidates the live session. The frontend must
+                // not continue to present a connected state after a transport
+                // or protocol failure.
+                self.connection = None;
+                Err(CommandError::from(error))
+            }
+        }
+    }
+
+    pub fn set_slot(&mut self, slot: u8, text: &str) -> Result<(), CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .set_slot(slot, text.as_bytes());
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // SET may leave RAM changed when persistence reports an error,
+                // so the session is discarded and the UI must ask the user to
+                // reconnect and read the slot again rather than guessing.
+                self.connection = None;
+                Err(CommandError::from(error))
+            }
+        }
+    }
+
+    pub fn clear_slot(&mut self, slot: u8) -> Result<(), CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .clear_slot(slot);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.connection = None;
+                Err(CommandError::from(error))
+            }
+        }
+    }
+
     pub fn disconnect(&mut self) {
         self.connection = None;
     }
@@ -504,12 +585,64 @@ pub async fn list_slots(
     .map_err(|_| CommandError::state_unavailable())?
 }
 
+#[tauri::command]
+pub async fn get_slot(
+    slot: u8,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<u8>, CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.get_slot(slot)
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
+pub async fn set_slot(
+    slot: u8,
+    text: String,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.set_slot(slot, &text)
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
+pub async fn clear_slot(
+    slot: u8,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.clear_slot(slot)
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hid::DeviceSummary;
     use crate::protocol::Status;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    type SetCall = (u8, Vec<u8>);
+    type SetCalls = Arc<StdMutex<Vec<SetCall>>>;
 
     fn record(path: &[u8], usage_page: u16, usage: u16, interface_number: i32) -> DeviceRecord {
         DeviceRecord::for_test(
@@ -528,19 +661,46 @@ mod tests {
     #[derive(Clone)]
     struct FakeFactory {
         list_result: Result<Vec<SlotInfo>, ClientError>,
+        get_result: Result<Vec<u8>, ClientError>,
+        set_result: Result<(), ClientError>,
+        clear_result: Result<(), ClientError>,
         open_error: Option<DeviceDiscoveryError>,
         open_count: Arc<StdMutex<usize>>,
+        get_calls: Arc<StdMutex<Vec<u8>>>,
+        set_calls: SetCalls,
+        clear_calls: Arc<StdMutex<Vec<u8>>>,
     }
 
     struct FakeSession {
         list_result: Result<Vec<SlotInfo>, ClientError>,
+        get_result: Result<Vec<u8>, ClientError>,
+        set_result: Result<(), ClientError>,
+        clear_result: Result<(), ClientError>,
         list_count: Arc<StdMutex<usize>>,
+        get_calls: Arc<StdMutex<Vec<u8>>>,
+        set_calls: SetCalls,
+        clear_calls: Arc<StdMutex<Vec<u8>>>,
     }
 
     impl MacroSession for FakeSession {
         fn list_slots(&mut self) -> Result<Vec<SlotInfo>, ClientError> {
             *self.list_count.lock().unwrap() += 1;
             self.list_result.clone()
+        }
+
+        fn get_slot(&mut self, slot: u8) -> Result<Vec<u8>, ClientError> {
+            self.get_calls.lock().unwrap().push(slot);
+            self.get_result.clone()
+        }
+
+        fn set_slot(&mut self, slot: u8, data: &[u8]) -> Result<(), ClientError> {
+            self.set_calls.lock().unwrap().push((slot, data.to_vec()));
+            self.set_result.clone()
+        }
+
+        fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError> {
+            self.clear_calls.lock().unwrap().push(slot);
+            self.clear_result.clone()
         }
     }
 
@@ -555,7 +715,13 @@ mod tests {
             }
             Ok(Box::new(FakeSession {
                 list_result: self.list_result.clone(),
+                get_result: self.get_result.clone(),
+                set_result: self.set_result.clone(),
+                clear_result: self.clear_result.clone(),
                 list_count: Arc::clone(&self.open_count),
+                get_calls: Arc::clone(&self.get_calls),
+                set_calls: Arc::clone(&self.set_calls),
+                clear_calls: Arc::clone(&self.clear_calls),
             }))
         }
     }
@@ -565,8 +731,14 @@ mod tests {
         (
             FakeFactory {
                 list_result: slots,
+                get_result: Ok(Vec::new()),
+                set_result: Ok(()),
+                clear_result: Ok(()),
                 open_error: None,
                 open_count: Arc::clone(&count),
+                get_calls: Arc::new(StdMutex::new(Vec::new())),
+                set_calls: Arc::new(StdMutex::new(Vec::new())),
+                clear_calls: Arc::new(StdMutex::new(Vec::new())),
             },
             count,
         )
@@ -759,6 +931,111 @@ mod tests {
         state.disconnect();
         state.disconnect();
         assert!(!state.connection_state().connected);
+    }
+
+    #[test]
+    fn get_set_and_clear_forward_slot_and_fixture_bytes() {
+        let (mut factory, _) = factory(Ok(vec![SlotInfo {
+            slot: 4,
+            length: 12,
+        }]));
+        factory.get_result = Ok(b"fixture-text".to_vec());
+        factory.set_result = Ok(());
+        factory.clear_result = Ok(());
+        let get_calls = Arc::clone(&factory.get_calls);
+        let set_calls = Arc::clone(&factory.set_calls);
+        let clear_calls = Arc::clone(&factory.clear_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"editor",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        assert_eq!(state.get_slot(4).unwrap(), b"fixture-text");
+        state.set_slot(4, "next-fixture\n").unwrap();
+        state.clear_slot(4).unwrap();
+
+        assert_eq!(*get_calls.lock().unwrap(), vec![4]);
+        assert_eq!(
+            *set_calls.lock().unwrap(),
+            vec![(4, b"next-fixture\n".to_vec())]
+        );
+        assert_eq!(*clear_calls.lock().unwrap(), vec![4]);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn get_set_and_clear_failures_drop_the_session_and_preserve_safe_errors() {
+        let (mut get_factory, _) = factory(Ok(Vec::new()));
+        get_factory.get_result = Err(ClientError::Transport(TransportError::Fatal(
+            "private fixture backend detail".to_string(),
+        )));
+        let mut get_state = AppState::new(get_factory);
+        let get_candidate = get_state.refresh_records(vec![record(
+            b"get-failure",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        get_state.connect(&get_candidate.id).unwrap();
+        let get_error = get_state.get_slot(0).unwrap_err();
+        assert_eq!(get_error.code, "transport_error");
+        assert!(!get_error.message.contains("private fixture backend detail"));
+        assert!(!get_state.connection_state().connected);
+
+        let (mut set_factory, _) = factory(Ok(Vec::new()));
+        set_factory.set_result = Err(ClientError::Remote(Status::StorageError));
+        let mut set_state = AppState::new(set_factory);
+        let set_candidate = set_state.refresh_records(vec![record(
+            b"set-failure",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        set_state.connect(&set_candidate.id).unwrap();
+        assert_eq!(
+            set_state.set_slot(0, "fixture").unwrap_err().code,
+            "storage_error"
+        );
+        assert!(!set_state.connection_state().connected);
+
+        let (mut clear_factory, _) = factory(Ok(Vec::new()));
+        clear_factory.clear_result = Err(ClientError::Remote(Status::BadSlot));
+        let mut clear_state = AppState::new(clear_factory);
+        let clear_candidate = clear_state.refresh_records(vec![record(
+            b"clear-failure",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        clear_state.connect(&clear_candidate.id).unwrap();
+        assert_eq!(clear_state.clear_slot(0).unwrap_err().code, "bad_slot");
+        assert!(!clear_state.connection_state().connected);
+    }
+
+    #[test]
+    fn editor_operations_without_a_connection_return_a_stable_error() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let mut state = AppState::new(factory);
+        assert_eq!(
+            state.get_slot(0).unwrap_err(),
+            CommandError::not_connected()
+        );
+        assert_eq!(
+            state.set_slot(0, "fixture").unwrap_err(),
+            CommandError::not_connected()
+        );
+        assert_eq!(
+            state.clear_slot(0).unwrap_err(),
+            CommandError::not_connected()
+        );
     }
 
     #[test]

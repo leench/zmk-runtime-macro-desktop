@@ -16,6 +16,9 @@ pub fn run() {
             commands::disconnect_device,
             commands::get_connection,
             commands::list_slots,
+            commands::get_slot,
+            commands::set_slot,
+            commands::clear_slot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
