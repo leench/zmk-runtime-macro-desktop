@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
 
-use crate::client::{RuntimeMacroClient, SlotInfo};
+use crate::client::{ClientConfig, RuntimeMacroClient, SlotInfo};
 use crate::error::{ClientError, TransportError};
 use crate::hid::{
     enumerate_devices, new_hid_api, open_device, DeviceDiscoveryError, DeviceRecord, DeviceSummary,
@@ -67,11 +67,11 @@ impl From<DeviceDiscoveryError> for CommandError {
             ),
             DeviceDiscoveryError::OpenFailed => Self::new(
                 "device_open_failed",
-                "The selected HID device could not be opened.",
+                "The selected HID device could not be opened; it may be busy or require permission.",
             ),
             DeviceDiscoveryError::InvalidPath => Self::new(
                 "device_open_failed",
-                "The selected HID device could not be opened.",
+                "The selected HID device could not be opened; it may be busy or require permission.",
             ),
         }
     }
@@ -185,6 +185,14 @@ pub struct ConnectedDevice {
 pub struct ConnectionState {
     pub connected: bool,
     pub device: Option<ConnectedDevice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSettings {
+    pub timeout_ms: u64,
+    pub retries: usize,
+    pub applies_next_connection: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -330,6 +338,7 @@ pub trait SessionFactory: Send {
     fn open(
         &mut self,
         record: &DeviceRecord,
+        config: ClientConfig,
     ) -> Result<Box<dyn MacroSession>, DeviceDiscoveryError>;
 }
 
@@ -340,10 +349,11 @@ impl SessionFactory for HidSessionFactory {
     fn open(
         &mut self,
         record: &DeviceRecord,
+        config: ClientConfig,
     ) -> Result<Box<dyn MacroSession>, DeviceDiscoveryError> {
         let api = new_hid_api()?;
         let transport = open_device(&api, record)?;
-        Ok(Box::new(RuntimeMacroClient::with_defaults(transport)))
+        Ok(Box::new(RuntimeMacroClient::with_config(transport, config)))
     }
 }
 
@@ -356,6 +366,7 @@ pub struct AppState<F: SessionFactory = HidSessionFactory> {
     registry: DeviceRegistry,
     connection: Option<ConnectedSession>,
     factory: F,
+    client_config: ClientConfig,
 }
 
 impl Default for AppState<HidSessionFactory> {
@@ -370,7 +381,26 @@ impl<F: SessionFactory> AppState<F> {
             registry: DeviceRegistry::default(),
             connection: None,
             factory,
+            client_config: ClientConfig::default(),
         }
+    }
+
+    pub fn client_settings(&self) -> ClientSettings {
+        ClientSettings {
+            timeout_ms: self.client_config.timeout_ms,
+            retries: self.client_config.retries,
+            applies_next_connection: true,
+        }
+    }
+
+    pub fn set_client_settings(
+        &mut self,
+        timeout_ms: u64,
+        retries: usize,
+    ) -> Result<ClientSettings, CommandError> {
+        let config = ClientConfig::new(timeout_ms, retries).map_err(CommandError::from)?;
+        self.client_config = config;
+        Ok(self.client_settings())
     }
 
     pub fn invalidate_candidates(&mut self) {
@@ -392,7 +422,10 @@ impl<F: SessionFactory> AppState<F> {
             .ok_or_else(CommandError::candidate_not_found)?;
         let summary = record.summary();
         let device = connected_device(&summary);
-        let mut session = self.factory.open(&record).map_err(CommandError::from)?;
+        let mut session = self
+            .factory
+            .open(&record, self.client_config)
+            .map_err(CommandError::from)?;
 
         // Do not install the session until its first complete LIST succeeds.
         session.list_slots().map_err(CommandError::from)?;
@@ -504,6 +537,38 @@ impl<F: SessionFactory> AppState<F> {
     pub fn disconnect(&mut self) {
         self.connection = None;
     }
+}
+
+#[tauri::command]
+pub async fn get_settings(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ClientSettings, CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        Ok(state.client_settings())
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
+pub async fn set_settings(
+    timeout_ms: u64,
+    retries: usize,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<ClientSettings, CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.set_client_settings(timeout_ms, retries)
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -666,6 +731,7 @@ mod tests {
         clear_result: Result<(), ClientError>,
         open_error: Option<DeviceDiscoveryError>,
         open_count: Arc<StdMutex<usize>>,
+        open_configs: Arc<StdMutex<Vec<ClientConfig>>>,
         get_calls: Arc<StdMutex<Vec<u8>>>,
         set_calls: SetCalls,
         clear_calls: Arc<StdMutex<Vec<u8>>>,
@@ -708,7 +774,9 @@ mod tests {
         fn open(
             &mut self,
             _record: &DeviceRecord,
+            config: ClientConfig,
         ) -> Result<Box<dyn MacroSession>, DeviceDiscoveryError> {
+            self.open_configs.lock().unwrap().push(config);
             *self.open_count.lock().unwrap() += 1;
             if let Some(error) = &self.open_error {
                 return Err(error.clone());
@@ -736,12 +804,72 @@ mod tests {
                 clear_result: Ok(()),
                 open_error: None,
                 open_count: Arc::clone(&count),
+                open_configs: Arc::new(StdMutex::new(Vec::new())),
                 get_calls: Arc::new(StdMutex::new(Vec::new())),
                 set_calls: Arc::new(StdMutex::new(Vec::new())),
                 clear_calls: Arc::new(StdMutex::new(Vec::new())),
             },
             count,
         )
+    }
+
+    #[test]
+    fn settings_have_defaults_and_are_rejected_outside_safe_bounds() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let mut state = AppState::new(factory);
+        assert_eq!(
+            state.client_settings(),
+            ClientSettings {
+                timeout_ms: crate::client::DEFAULT_TIMEOUT_MS,
+                retries: crate::client::DEFAULT_RETRIES,
+                applies_next_connection: true,
+            }
+        );
+        assert!(state.set_client_settings(100, 0).is_ok());
+        assert_eq!(state.client_settings().timeout_ms, 100);
+        assert_eq!(state.client_settings().retries, 0);
+        assert!(state.set_client_settings(99, 0).is_err());
+        assert!(state.set_client_settings(5_001, 0).is_err());
+        assert!(state.set_client_settings(1_000, 6).is_err());
+    }
+
+    #[test]
+    fn settings_apply_to_the_next_connection_without_replacing_live_session() {
+        let (factory, _) = factory(Ok(vec![SlotInfo { slot: 0, length: 0 }]));
+        let mut state = AppState::new(factory);
+        let candidates = state.refresh_records(vec![record(
+            b"configurable",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            1,
+        )]);
+        state.set_client_settings(250, 3).unwrap();
+        state.connect(&candidates[0].id).unwrap();
+        assert_eq!(
+            state.factory.open_configs.lock().unwrap().as_slice(),
+            &[ClientConfig {
+                timeout_ms: 250,
+                retries: 3,
+            }]
+        );
+        assert!(state.connection_state().connected);
+        state.set_client_settings(500, 1).unwrap();
+        assert!(state.connection_state().connected);
+        assert_eq!(state.client_settings().timeout_ms, 500);
+        state.connect(&candidates[0].id).unwrap();
+        assert_eq!(
+            state.factory.open_configs.lock().unwrap().as_slice(),
+            &[
+                ClientConfig {
+                    timeout_ms: 250,
+                    retries: 3,
+                },
+                ClientConfig {
+                    timeout_ms: 500,
+                    retries: 1,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1035,6 +1163,19 @@ mod tests {
         assert_eq!(
             state.clear_slot(0).unwrap_err(),
             CommandError::not_connected()
+        );
+    }
+
+    #[test]
+    fn client_settings_serialize_with_camel_case_fields() {
+        let settings = ClientSettings {
+            timeout_ms: 250,
+            retries: 3,
+            applies_next_connection: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&settings).unwrap(),
+            r#"{"timeoutMs":250,"retries":3,"appliesNextConnection":true}"#
         );
     }
 

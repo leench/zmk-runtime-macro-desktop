@@ -25,6 +25,12 @@ export type SlotMetadata = {
   length: number;
 };
 
+export type ClientSettings = {
+  timeoutMs: number;
+  retries: number;
+  appliesNextConnection: boolean;
+};
+
 /** Raw protocol bytes returned for one selected slot. Never log or persist them. */
 export type SlotBytes = number[];
 
@@ -83,4 +89,12 @@ export function setSlot(slot: number, text: string): Promise<void> {
 
 export function clearSlot(slot: number): Promise<void> {
   return invoke("clear_slot", { slot });
+}
+
+export function getSettings(): Promise<ClientSettings> {
+  return invoke<ClientSettings>("get_settings");
+}
+
+export function setSettings(timeoutMs: number, retries: number): Promise<ClientSettings> {
+  return invoke<ClientSettings>("set_settings", { timeoutMs, retries });
 }

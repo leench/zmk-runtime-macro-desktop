@@ -19,6 +19,8 @@ pub fn run() {
             commands::get_slot,
             commands::set_slot,
             commands::clear_slot,
+            commands::get_settings,
+            commands::set_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

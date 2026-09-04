@@ -12,7 +12,7 @@
 
 GUI 只负责配置已有固件功能，不修改 ZMK 主仓库，也不改变当前 v1 wire protocol。
 
-当前状态：阶段 1–3 已完成协议、HID 通信、设备发现、连接状态和 slot 元数据列表；阶段 4 Art Direction 已确认，控制字符编辑、保存和清空 UI 已实现，待主代理审核。
+当前状态：阶段 1–4 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表和宏编辑 UI；阶段 5 的自动重连、连接设置和低调诊断已实现，待主代理审核。
 
 ## 2. 固件和协议约束
 
@@ -329,6 +329,36 @@ Dark Theme：
 5. **过大字体、圆角和留白：** 不要使用 32px 标题、16px 圆角或宽松卡片导致一屏只剩两个 slot；保持精确而紧凑的信息密度。
 
 核心原则：**像一个精密、克制、可靠的桌面硬件配置工具，而不是一个网页 Dashboard。**
+
+## 4.7 阶段 5：错误体验、自动重连、设置和诊断
+
+### 自动重连
+
+- 自动重连默认开启，只针对意外断线、LIST/GET/SET/CLEAR、连接或发现失败进入有限次数的退避尝试。
+- 退避延迟为 1/2/4/8/15 秒，最多自动尝试 8 次；达到上限后显示可操作的 Retry/Reconnect，不进入 tight loop。
+- 用户主动 Disconnect 会抑制自动重连；只有用户主动 Refresh/Reconnect 或选择设备连接后才恢复。
+- 重连期间显示 `Reconnecting…` 或 `Checking device…`，在首次完整 LIST 成功前绝不显示 Connected。多个同 Usage 候选不会自动猜测，要求用户明确选择。
+- 同一安全设备摘要（VID/PID/interface/Usage）重连时保留内存中的 dirty draft；切换到其他摘要时清理旧设备草稿。HID path、serial 和宏正文不参与摘要、不进入日志或持久化。
+- 重连 timer、请求序列和组件卸载均有 cleanup；并发的旧请求不能覆盖新连接状态。自动重连只调用既有 Tauri commands，不在前端直接访问 HID。
+
+### 连接设置
+
+- 新增 `get_settings` 和 `set_settings` Tauri commands，IPC 使用 camelCase 的 `timeoutMs` 和 `retries`。
+- request timeout 默认 `1000 ms`，允许 `100–5000 ms`；retries 默认 `2`，允许 `0–5`。后端 `ClientConfig` 校验边界，设置实际传入下一次创建的 HID protocol session。
+- 当前 session 的配置不会被原地替换；设置面板明确显示 `Timeout and retries apply on next connection.`，保存后重新连接才生效。
+- 仅将 theme、auto reconnect、timeout 和 retries 存入 localStorage；不存储 macro 正文、raw report、HID path 或 serial。
+
+### 低调诊断
+
+诊断区域默认折叠，不增加 Dashboard 或统计卡片，只显示白名单安全摘要：
+
+- Runtime Macro protocol v1 和 USB HID transport；
+- 当前连接状态、脱敏产品名、VID/PID、interface number 和 Usage Page/Usage；
+- 动态 slot count；
+- 最近一次白名单操作（`Discover`、`Connect`、`Disconnect`、`LIST`、`GET`、`SET`、`CLEAR`、`Settings`）；
+- 最近一次结构化 sanitized error code。
+
+诊断不显示 HID path、设备序列号、用户名、raw report 或宏正文；错误 UI 也只使用 `CommandError` 的安全 code/message。`STORAGE_ERROR` 继续提示本次会话可能已生效但未永久保存。
 
 ## 5. 软件结构
 

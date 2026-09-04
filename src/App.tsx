@@ -14,12 +14,15 @@ import {
   connectDevice as connectDeviceCommand,
   disconnectDevice as disconnectDeviceCommand,
   getConnection,
+  getSettings,
   getSlot,
   listDevices,
   listSlots,
+  setSettings as setSettingsCommand,
   setSlot as setSlotCommand,
 } from "./bridge";
 import type {
+  ClientSettings,
   CommandError,
   ConnectedDevice,
   ConnectionState,
@@ -30,6 +33,16 @@ import type {
 import "./App.css";
 
 type ThemeMode = "system" | "light" | "dark";
+type OperationName =
+  | "Discover"
+  | "Connect"
+  | "Disconnect"
+  | "LIST"
+  | "GET"
+  | "SET"
+  | "CLEAR"
+  | "Settings";
+type RefreshSource = "manual" | "automatic";
 type SlotStatus = "idle" | "saving" | "saved" | "error";
 type SlotAction = "load" | "save" | "clear";
 
@@ -48,10 +61,25 @@ type SlotState = {
   lastAction: SlotAction | null;
 };
 
+type UserSettings = ClientSettings & {
+  autoReconnect: boolean;
+};
+
 const disconnected: ConnectionState = { connected: false, device: null };
 const MAX_TEXT_BYTES = 256;
 const LABELS_STORAGE_PREFIX = "zmk-runtime-macro-labels:v1";
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
+const SETTINGS_STORAGE_KEY = "zmk-runtime-macro-settings:v1";
+const DEFAULT_CLIENT_SETTINGS: ClientSettings = {
+  timeoutMs: 1_000,
+  retries: 2,
+  appliesNextConnection: true,
+};
+const MIN_TIMEOUT_MS = 100;
+const MAX_TIMEOUT_MS = 5_000;
+const MAX_RETRIES = 5;
+const RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+const MAX_RECONNECT_ATTEMPTS = 8;
 const CONTROL_TOKENS: Record<string, string> = {
   "↵": "\n",
   "⇥": "\t",
@@ -233,6 +261,78 @@ function readTheme(): ThemeMode {
   return "system";
 }
 
+function readUserSettings(): UserSettings {
+  const defaults: UserSettings = {
+    ...DEFAULT_CLIENT_SETTINGS,
+    autoReconnect: true,
+  };
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) {
+      return defaults;
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return defaults;
+    }
+    const candidate = parsed as Record<string, unknown>;
+    const timeoutMs = candidate.timeoutMs;
+    const retries = candidate.retries;
+    const autoReconnect = candidate.autoReconnect;
+    return {
+      ...defaults,
+      ...(typeof timeoutMs === "number" &&
+      Number.isInteger(timeoutMs) &&
+      timeoutMs >= MIN_TIMEOUT_MS &&
+      timeoutMs <= MAX_TIMEOUT_MS
+        ? { timeoutMs }
+        : {}),
+      ...(typeof retries === "number" &&
+      Number.isInteger(retries) &&
+      retries >= 0 &&
+      retries <= MAX_RETRIES
+        ? { retries }
+        : {}),
+      ...(typeof autoReconnect === "boolean" ? { autoReconnect } : {}),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function writeUserSettings(settings: UserSettings): void {
+  try {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({
+        timeoutMs: settings.timeoutMs,
+        retries: settings.retries,
+        autoReconnect: settings.autoReconnect,
+      }),
+    );
+  } catch {
+    // Local preferences are optional and never affect device operations.
+  }
+}
+
+function validateUserSettings(settings: UserSettings): string | null {
+  if (
+    !Number.isInteger(settings.timeoutMs) ||
+    settings.timeoutMs < MIN_TIMEOUT_MS ||
+    settings.timeoutMs > MAX_TIMEOUT_MS
+  ) {
+    return `Request timeout must be an integer from ${MIN_TIMEOUT_MS} to ${MAX_TIMEOUT_MS} ms.`;
+  }
+  if (
+    !Number.isInteger(settings.retries) ||
+    settings.retries < 0 ||
+    settings.retries > MAX_RETRIES
+  ) {
+    return `Retries must be an integer from 0 to ${MAX_RETRIES}.`;
+  }
+  return null;
+}
+
 function isTextDirty(slot: SlotState): boolean {
   return slot.loaded && slot.draftText !== slot.savedText;
 }
@@ -305,6 +405,16 @@ function App() {
   const [error, setError] = useState<CommandError | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
   const [clearConfirm, setClearConfirm] = useState<number | null>(null);
+  const [settings, setSettings] = useState<UserSettings>(() => readUserSettings());
+  const [settingsDraft, setSettingsDraft] = useState<UserSettings>(() => readUserSettings());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsSaved, setSettingsSaved] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [lastOperation, setLastOperation] = useState<OperationName | null>(null);
+  const [lastErrorCode, setLastErrorCode] = useState<string | null>(null);
 
   const operation = useRef(0);
   const lastDevice = useRef<ConnectedDevice | null>(null);
@@ -312,13 +422,46 @@ function App() {
   const slotRequest = useRef(0);
   const mounted = useRef(false);
   const initialised = useRef(false);
+  const settingsInitialised = useRef(false);
+  const settingsLoad = useRef<Promise<void> | null>(null);
   const editorRef = useRef<HTMLTextAreaElement | null>(null);
   const mutationRequest = useRef(0);
+  const reconnectTimer = useRef<number | null>(null);
+  const reconnectAttempt = useRef(0);
+  const autoReconnectSuppressed = useRef(false);
+  const autoReconnectRef = useRef(settings.autoReconnect);
+  const connectionRef = useRef(connection.connected);
+  const refreshDevicesRef = useRef<((source?: RefreshSource) => Promise<void>) | null>(null);
 
+  autoReconnectRef.current = settings.autoReconnect;
+  connectionRef.current = connection.connected;
   dirtyRef.current = slots.some(isDirty);
 
   const isCurrent = useCallback((sequence: number) => {
     return mounted.current && operation.current === sequence;
+  }, []);
+
+  const recordOperation = useCallback((name: OperationName) => {
+    setLastOperation(name);
+  }, []);
+
+  const commandError = useCallback((caught: unknown): CommandError => {
+    const error = asCommandError(caught);
+    setLastErrorCode(error.code);
+    return error;
+  }, []);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimer.current !== null) {
+      window.clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+  }, []);
+
+  const requestReconnect = useCallback(() => {
+    if (autoReconnectRef.current && !autoReconnectSuppressed.current) {
+      setReconnecting(true);
+    }
   }, []);
 
   const applySlotList = useCallback(
@@ -354,13 +497,14 @@ function App() {
       nextLabels = labels,
       preserveDirtyDrafts = true,
     ) => {
+      recordOperation("LIST");
       const metadata = await listSlots();
       if (!isCurrent(sequence)) {
         return;
       }
       applySlotList(metadata, nextLabels, preserveDirtyDrafts);
     },
-    [applySlotList, isCurrent, labels],
+    [applySlotList, isCurrent, labels, recordOperation],
   );
 
   const connectDevice = useCallback(
@@ -368,10 +512,15 @@ function App() {
       const sequence = existingSequence ?? ++operation.current;
       const ownsBusyState = existingSequence === undefined;
       if (ownsBusyState) {
+        autoReconnectSuppressed.current = false;
+        reconnectAttempt.current = 0;
+        clearReconnectTimer();
         setBusy(true);
         setChecking(true);
+        setReconnecting(false);
         setError(null);
       }
+      recordOperation("Connect");
       setSelectedId(id);
       setClearConfirm(null);
       setConnection(disconnected);
@@ -402,11 +551,15 @@ function App() {
         await loadSlots(sequence, nextLabels, preserveDirtyDrafts);
         if (isCurrent(sequence)) {
           setError(null);
+          setReconnecting(false);
+          reconnectAttempt.current = 0;
         }
       } catch (caught) {
         if (isCurrent(sequence)) {
-          setError(asCommandError(caught));
+          const nextError = commandError(caught);
+          setError(nextError);
           setConnection(disconnected);
+          requestReconnect();
         }
       } finally {
         if (ownsBusyState && isCurrent(sequence)) {
@@ -415,14 +568,29 @@ function App() {
         }
       }
     },
-    [isCurrent, loadSlots],
+    [clearReconnectTimer, commandError, isCurrent, loadSlots, recordOperation, requestReconnect],
   );
 
-  const refreshDevices = useCallback(async () => {
+  const refreshDevices = useCallback(async (source: RefreshSource = "manual") => {
+    if (
+      source === "automatic" &&
+      (!autoReconnectRef.current || autoReconnectSuppressed.current)
+    ) {
+      return;
+    }
     const sequence = ++operation.current;
+    if (source === "manual") {
+      autoReconnectSuppressed.current = false;
+      reconnectAttempt.current = 0;
+      clearReconnectTimer();
+    }
     setBusy(true);
     setChecking(true);
-    setError(null);
+    setReconnecting(source === "automatic");
+    if (source === "manual") {
+      setError(null);
+    }
+    recordOperation("Discover");
 
     try {
       const [nextDevices, nextConnection] = await Promise.all([
@@ -453,27 +621,64 @@ function App() {
           await loadSlots(sequence, nextLabels);
         } catch (caught) {
           if (isCurrent(sequence)) {
+            const nextError = commandError(caught);
             setConnection(disconnected);
             setSlots((previous) =>
               previous.map((slot) =>
                 slot.revealed ? { ...slot, revealed: false } : slot,
               ),
             );
-            setError(asCommandError(caught));
+            setError(nextError);
+            requestReconnect();
           }
           return;
+        }
+        if (isCurrent(sequence)) {
+          setReconnecting(false);
+          reconnectAttempt.current = 0;
         }
       }
 
       const exactDevices = nextDevices.filter(
         (device) => device.usageMetadata === "exact",
       );
-      if (!nextConnection.connected && exactDevices.length === 1) {
+      if (!nextConnection.connected && nextDevices.length === 0) {
+        const noDeviceError: CommandError = {
+          code: "no_device",
+          message: "No compatible Runtime Macro HID device was found.",
+        };
+        setLastErrorCode(noDeviceError.code);
+        setError(noDeviceError);
+      } else if (
+        !nextConnection.connected &&
+        nextDevices.length > 0 &&
+        exactDevices.length === 0
+      ) {
+        autoReconnectSuppressed.current = true;
+        setReconnecting(false);
+        const metadataError: CommandError = {
+          code: "usage_metadata_missing",
+          message: "HID Usage metadata is unavailable; choose a device explicitly.",
+        };
+        setLastErrorCode(metadataError.code);
+        setError(metadataError);
+      } else if (!nextConnection.connected && exactDevices.length === 1) {
         await connectDevice(exactDevices[0].id, sequence);
+      } else if (!nextConnection.connected && exactDevices.length > 1) {
+        autoReconnectSuppressed.current = true;
+        setReconnecting(false);
+        const ambiguousError: CommandError = {
+          code: "ambiguous_devices",
+          message: "Multiple compatible HID devices were found; choose one explicitly.",
+        };
+        setLastErrorCode(ambiguousError.code);
+        setError(ambiguousError);
       }
     } catch (caught) {
       if (isCurrent(sequence)) {
-        setError(asCommandError(caught));
+        const nextError = commandError(caught);
+        setError(nextError);
+        requestReconnect();
       }
     } finally {
       if (isCurrent(sequence)) {
@@ -481,12 +686,19 @@ function App() {
         setChecking(false);
       }
     }
-  }, [connectDevice, isCurrent, loadSlots]);
+  }, [clearReconnectTimer, commandError, connectDevice, isCurrent, loadSlots, recordOperation, requestReconnect]);
+
+  refreshDevicesRef.current = refreshDevices;
 
   const disconnectDevice = useCallback(async () => {
     const sequence = ++operation.current;
+    autoReconnectSuppressed.current = true;
+    reconnectAttempt.current = 0;
+    clearReconnectTimer();
+    setReconnecting(false);
     setBusy(true);
     setError(null);
+    recordOperation("Disconnect");
     try {
       await disconnectDeviceCommand();
       if (!isCurrent(sequence)) {
@@ -502,14 +714,14 @@ function App() {
       setClearConfirm(null);
     } catch (caught) {
       if (isCurrent(sequence)) {
-        setError(asCommandError(caught));
+        setError(commandError(caught));
       }
     } finally {
       if (isCurrent(sequence)) {
         setBusy(false);
       }
     }
-  }, [isCurrent]);
+  }, [clearReconnectTimer, commandError, isCurrent, recordOperation]);
 
   const refreshSlots = useCallback(async () => {
     const sequence = ++operation.current;
@@ -519,20 +731,22 @@ function App() {
       await loadSlots(sequence);
     } catch (caught) {
       if (isCurrent(sequence)) {
-        setError(asCommandError(caught));
+        const nextError = commandError(caught);
+        setError(nextError);
         setConnection(disconnected);
         setSlots((previous) =>
           previous.map((slot) =>
             slot.revealed ? { ...slot, revealed: false } : slot,
           ),
         );
+        requestReconnect();
       }
     } finally {
       if (isCurrent(sequence)) {
         setBusy(false);
       }
     }
-  }, [isCurrent, loadSlots]);
+  }, [commandError, isCurrent, loadSlots, requestReconnect]);
 
   const loadSlotContent = useCallback(
     async (slotNumber: number) => {
@@ -551,6 +765,7 @@ function App() {
         ),
       );
       setInputError(null);
+      recordOperation("GET");
 
       try {
         const bytes = await getSlot(slotNumber);
@@ -588,7 +803,7 @@ function App() {
         if (!isCurrent(sequence)) {
           return;
         }
-        const commandError = asCommandError(caught);
+        const nextError = commandError(caught);
         setConnection(disconnected);
         setSlots((previous) =>
           previous.map((slot) => {
@@ -602,7 +817,7 @@ function App() {
                 ...(isCurrentSlotRequest
                   ? {
                       status: "error" as const,
-                      error: commandError,
+                      error: nextError,
                       lastAction: "load" as const,
                     }
                   : {
@@ -615,10 +830,11 @@ function App() {
             return slot.revealed ? { ...slot, revealed: false } : slot;
           }),
         );
-        setError(commandError);
+        setError(nextError);
+        requestReconnect();
       }
     },
-    [isCurrent, selectedSlot],
+    [commandError, isCurrent, recordOperation, requestReconnect, selectedSlot],
   );
 
   const selectedState = useMemo(
@@ -740,6 +956,7 @@ function App() {
       );
       try {
         if (slot.draftText !== slot.savedText) {
+          recordOperation("SET");
           await setSlotCommand(slotNumber, slot.draftText);
         }
         if (!mounted.current || mutationRequest.current !== request) {
@@ -781,9 +998,9 @@ function App() {
         if (!mounted.current || mutationRequest.current !== request) {
           return;
         }
-        const commandError = asCommandError(caught);
+        const nextError = commandError(caught);
         setConnection(disconnected);
-        setError(commandError);
+        setError(nextError);
         setSlots((previous) =>
           previous.map((item) =>
             item.slot === slotNumber
@@ -791,19 +1008,20 @@ function App() {
                   ...item,
                   revealed: false,
                   status: "error",
-                  error: commandError,
+                  error: nextError,
                   lastAction: "save",
                 }
               : item,
           ),
         );
+        requestReconnect();
       } finally {
         if (mounted.current && mutationRequest.current === request) {
           setMutationBusy(false);
         }
       }
     },
-    [connection, labels, mutationBusy, selectedSlot, slots],
+    [commandError, connection, labels, mutationBusy, recordOperation, requestReconnect, selectedSlot, slots],
   );
 
   const clearSlot = useCallback(
@@ -826,6 +1044,7 @@ function App() {
         ),
       );
       try {
+        recordOperation("CLEAR");
         await clearSlotCommand(slotNumber);
         if (!mounted.current || mutationRequest.current !== request) {
           return;
@@ -862,9 +1081,9 @@ function App() {
         if (!mounted.current || mutationRequest.current !== request) {
           return;
         }
-        const commandError = asCommandError(caught);
+        const nextError = commandError(caught);
         setConnection(disconnected);
-        setError(commandError);
+        setError(nextError);
         setSlots((previous) =>
           previous.map((item) =>
             item.slot === slotNumber
@@ -872,19 +1091,20 @@ function App() {
                   ...item,
                   revealed: false,
                   status: "error",
-                  error: commandError,
+                  error: nextError,
                   lastAction: "clear",
                 }
               : item,
           ),
         );
+        requestReconnect();
       } finally {
         if (mounted.current && mutationRequest.current === request) {
           setMutationBusy(false);
         }
       }
     },
-    [connection.connected, mutationBusy, slots],
+    [commandError, connection.connected, mutationBusy, recordOperation, requestReconnect, slots],
   );
 
   const retrySlotAction = useCallback(
@@ -949,12 +1169,125 @@ function App() {
     window.requestAnimationFrame(() => editorRef.current?.focus());
   }, [selectedState, updateSelectedSlot]);
 
+  const updateSettingsDraft = useCallback((update: Partial<UserSettings>) => {
+    setSettingsDraft((previous) => ({ ...previous, ...update }));
+    setSettingsError(null);
+    setSettingsSaved(false);
+  }, []);
+
+  const saveSettings = useCallback(async () => {
+    const validation = validateUserSettings(settingsDraft);
+    if (validation) {
+      setSettingsError(validation);
+      setSettingsSaved(false);
+      return;
+    }
+    setSettingsBusy(true);
+    setSettingsError(null);
+    setSettingsSaved(false);
+    recordOperation("Settings");
+    try {
+      const nextTransport = await setSettingsCommand(
+        settingsDraft.timeoutMs,
+        settingsDraft.retries,
+      );
+      const nextSettings: UserSettings = {
+        ...nextTransport,
+        autoReconnect: settingsDraft.autoReconnect,
+      };
+      setSettings(nextSettings);
+      setSettingsDraft(nextSettings);
+      writeUserSettings(nextSettings);
+      setSettingsSaved(true);
+      window.setTimeout(() => setSettingsSaved(false), 2200);
+    } catch (caught) {
+      const nextError = commandError(caught);
+      setSettingsError(nextError.message);
+    } finally {
+      setSettingsBusy(false);
+    }
+  }, [commandError, recordOperation, settingsDraft]);
+
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      clearReconnectTimer();
     };
-  }, []);
+  }, [clearReconnectTimer]);
+
+  useEffect(() => {
+    if (settingsInitialised.current) {
+      return;
+    }
+    settingsInitialised.current = true;
+    const stored = readUserSettings();
+    settingsLoad.current = (async () => {
+      recordOperation("Settings");
+      try {
+        const backend = await getSettings();
+        const transport =
+          backend.timeoutMs !== stored.timeoutMs || backend.retries !== stored.retries
+            ? await setSettingsCommand(stored.timeoutMs, stored.retries)
+            : backend;
+        const nextSettings: UserSettings = {
+          ...transport,
+          autoReconnect: stored.autoReconnect,
+        };
+        setSettings(nextSettings);
+        setSettingsDraft(nextSettings);
+        writeUserSettings(nextSettings);
+      } catch (caught) {
+        setSettingsError(commandError(caught).message);
+      }
+    })();
+  }, [commandError, recordOperation]);
+
+  useEffect(() => {
+    if (
+      connection.connected ||
+      !settings.autoReconnect ||
+      autoReconnectSuppressed.current
+    ) {
+      clearReconnectTimer();
+      if (!connection.connected) {
+        setReconnecting(false);
+      }
+      return;
+    }
+    if (
+      !mounted.current ||
+      checking ||
+      busy ||
+      reconnectTimer.current !== null
+    ) {
+      return;
+    }
+    if (reconnectAttempt.current >= MAX_RECONNECT_ATTEMPTS) {
+      setReconnecting(false);
+      return;
+    }
+
+    const delay =
+      RECONNECT_DELAYS_MS[
+        Math.min(reconnectAttempt.current, RECONNECT_DELAYS_MS.length - 1)
+      ];
+    setReconnecting(true);
+    reconnectTimer.current = window.setTimeout(() => {
+      reconnectTimer.current = null;
+      if (
+        !mounted.current ||
+        connectionRef.current ||
+        !autoReconnectRef.current ||
+        autoReconnectSuppressed.current
+      ) {
+        setReconnecting(false);
+        return;
+      }
+      reconnectAttempt.current += 1;
+      void refreshDevicesRef.current?.("automatic");
+    }, delay);
+  }, [busy, checking, clearReconnectTimer, connection.connected, settings.autoReconnect]);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -1033,7 +1366,12 @@ function App() {
       return;
     }
     initialised.current = true;
-    void refreshDevices();
+    void (async () => {
+      await settingsLoad.current;
+      if (mounted.current) {
+        await refreshDevices();
+      }
+    })();
   }, [refreshDevices]);
 
   const selectedDevice = devices.find((device) => device.id === selectedId);
@@ -1062,7 +1400,11 @@ function App() {
         </div>
         <div className="topbar-actions">
           <div className="connection-summary" aria-live="polite">
-            {checking ? (
+            {reconnecting ? (
+              <span className="status status-checking">
+                <span className="status-dot" aria-hidden="true" /> Reconnecting…
+              </span>
+            ) : checking ? (
               <span className="status status-checking">
                 <span className="status-dot" aria-hidden="true" /> Checking device…
               </span>
@@ -1090,6 +1432,20 @@ function App() {
           >
             {busy ? "…" : "↻"}
           </button>
+          <button
+            className={`icon-button ${settingsOpen ? "active" : ""}`}
+            type="button"
+            onClick={() => {
+              setSettingsOpen((open) => !open);
+              setSettingsDraft(settings);
+              setSettingsError(null);
+              setSettingsSaved(false);
+            }}
+            aria-label="Settings"
+            aria-expanded={settingsOpen}
+          >
+            ⚙
+          </button>
           <label className="theme-control">
             <span className="sr-only">Theme</span>
             <select
@@ -1104,6 +1460,92 @@ function App() {
           </label>
         </div>
       </header>
+
+      {settingsOpen ? (
+        <section className="settings-panel" aria-labelledby="settings-heading">
+          <div className="settings-heading">
+            <div>
+              <p className="eyebrow">Preferences</p>
+              <h2 id="settings-heading">Connection settings</h2>
+            </div>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => setSettingsOpen(false)}
+              disabled={settingsBusy}
+            >
+              Close
+            </button>
+          </div>
+          <label className="setting-toggle">
+            <input
+              type="checkbox"
+              checked={settingsDraft.autoReconnect}
+              onChange={(event) =>
+                updateSettingsDraft({ autoReconnect: event.target.checked })
+              }
+              disabled={settingsBusy}
+            />
+            <span>
+              <strong>Auto reconnect</strong>
+              <small>Retry unexpected disconnects with a bounded backoff.</small>
+            </span>
+          </label>
+          <div className="settings-grid">
+            <label className="setting-field" htmlFor="timeout-setting">
+              <span>Request timeout</span>
+              <input
+                id="timeout-setting"
+                type="number"
+                min={MIN_TIMEOUT_MS}
+                max={MAX_TIMEOUT_MS}
+                step={1}
+                value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs}
+                onChange={(event) =>
+                  updateSettingsDraft({ timeoutMs: Number(event.target.value) })
+                }
+                disabled={settingsBusy}
+                aria-describedby="settings-help"
+              />
+              <small>Milliseconds · {MIN_TIMEOUT_MS}–{MAX_TIMEOUT_MS}</small>
+            </label>
+            <label className="setting-field" htmlFor="retries-setting">
+              <span>Retries</span>
+              <input
+                id="retries-setting"
+                type="number"
+                min={0}
+                max={MAX_RETRIES}
+                step={1}
+                value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries}
+                onChange={(event) =>
+                  updateSettingsDraft({ retries: Number(event.target.value) })
+                }
+                disabled={settingsBusy}
+                aria-describedby="settings-help"
+              />
+              <small>Transport retries · 0–{MAX_RETRIES}</small>
+            </label>
+          </div>
+          <p id="settings-help" className="field-help settings-help">
+            Timeout and retries apply on next connection. Macro content is never stored in preferences.
+          </p>
+          {settingsError ? (
+            <p className="field-error" role="alert">{settingsError}</p>
+          ) : null}
+          <div className="settings-actions">
+            {settingsSaved ? <span className="settings-saved">✓ Saved</span> : null}
+            <button
+              className="button-primary"
+              type="button"
+              onClick={() => void saveSettings()}
+              disabled={settingsBusy}
+            >
+              {settingsBusy ? "Saving…" : "Save settings"}
+            </button>
+          </div>
+        </section>
+      ) : null}
 
       {error ? (
         <div className="inline-message message-error" role="alert">
@@ -1216,8 +1658,44 @@ function App() {
                 Disconnect
               </button>
             ) : null}
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => setDiagnosticsOpen((open) => !open)}
+              aria-expanded={diagnosticsOpen}
+            >
+              Diagnostics
+            </button>
           </div>
         </div>
+
+        {diagnosticsOpen ? (
+          <section className="diagnostics-panel" aria-labelledby="diagnostics-heading">
+            <div className="diagnostics-heading">
+              <div>
+                <p className="eyebrow">Diagnostics</p>
+                <h2 id="diagnostics-heading">Connection details</h2>
+              </div>
+              <span className={`status ${connection.connected ? "status-connected" : "status-disconnected"}`}>
+                {connection.connected ? "Connected" : "Disconnected"}
+              </span>
+            </div>
+            <dl className="diagnostics-grid">
+              <div><dt>Protocol</dt><dd>Runtime Macro v1</dd></div>
+              <div><dt>Transport</dt><dd>USB HID</dd></div>
+              <div><dt>Device</dt><dd>{connection.device?.productName ?? "—"}</dd></div>
+              <div><dt>VID / PID</dt><dd>{connection.device ? `${formatHex(connection.device.vendorId)} / ${formatHex(connection.device.productId)}` : "—"}</dd></div>
+              <div><dt>Interface</dt><dd>{connection.device?.interfaceNumber ?? "—"}</dd></div>
+              <div><dt>Usage</dt><dd>{connection.device ? `${formatHex(connection.device.usagePage)} / ${formatHex(connection.device.usage)}` : "—"}</dd></div>
+              <div><dt>Slot count</dt><dd>{slots.length}</dd></div>
+              <div><dt>Last operation</dt><dd>{lastOperation ?? "None"}</dd></div>
+              <div><dt>Last error code</dt><dd>{lastErrorCode ?? "None"}</dd></div>
+            </dl>
+            <p className="field-help diagnostics-help">
+              Diagnostics never include macro content, HID paths, serial numbers, or raw reports.
+            </p>
+          </section>
+        ) : null}
 
         <div className="workspace">
           <aside className="slot-list" aria-label="Macro slots">

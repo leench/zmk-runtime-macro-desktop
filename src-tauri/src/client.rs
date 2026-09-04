@@ -9,7 +9,44 @@ use crate::protocol::{
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_RETRIES: usize = 2;
+pub const MIN_TIMEOUT_MS: u64 = 100;
+pub const MAX_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_RETRIES: usize = 5;
 const MAX_LIST_RESULT_LENGTH: usize = 1 + 2 * u8::MAX as usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientConfig {
+    pub timeout_ms: u64,
+    pub retries: usize,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            retries: DEFAULT_RETRIES,
+        }
+    }
+}
+
+impl ClientConfig {
+    pub fn new(timeout_ms: u64, retries: usize) -> Result<Self, ClientError> {
+        if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(ClientError::InvalidConfiguration(
+                "timeout must be between 100 and 5000 milliseconds",
+            ));
+        }
+        if retries > MAX_RETRIES {
+            return Err(ClientError::InvalidConfiguration(
+                "retries must be between 0 and 5",
+            ));
+        }
+        Ok(Self {
+            timeout_ms,
+            retries,
+        })
+    }
+}
 
 /// A transport-independent interface for the fixed-frame protocol client.
 ///
@@ -50,13 +87,17 @@ impl<T: Transport> RuntimeMacroClient<T> {
         })
     }
 
-    pub fn with_defaults(transport: T) -> Self {
+    pub fn with_config(transport: T, config: ClientConfig) -> Self {
         Self {
             transport,
-            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
-            retries: DEFAULT_RETRIES,
+            timeout: Duration::from_millis(config.timeout_ms),
+            retries: config.retries,
             next_request_id: 0,
         }
+    }
+
+    pub fn with_defaults(transport: T) -> Self {
+        Self::with_config(transport, ClientConfig::default())
     }
 
     pub fn transport_mut(&mut self) -> &mut T {
@@ -465,6 +506,48 @@ mod tests {
             offset,
             total,
         ))
+    }
+
+    #[test]
+    fn client_config_has_safe_defaults_and_validates_bounds() {
+        assert_eq!(
+            ClientConfig::default(),
+            ClientConfig {
+                timeout_ms: DEFAULT_TIMEOUT_MS,
+                retries: DEFAULT_RETRIES,
+            }
+        );
+        assert!(ClientConfig::new(MIN_TIMEOUT_MS, 0).is_ok());
+        assert!(ClientConfig::new(MAX_TIMEOUT_MS, MAX_RETRIES).is_ok());
+        assert!(ClientConfig::new(MIN_TIMEOUT_MS - 1, 0).is_err());
+        assert!(ClientConfig::new(MAX_TIMEOUT_MS + 1, 0).is_err());
+        assert!(ClientConfig::new(DEFAULT_TIMEOUT_MS, MAX_RETRIES + 1).is_err());
+    }
+
+    #[test]
+    fn client_config_keeps_runtime_client_timeout_and_retry_values() {
+        let config = ClientConfig::new(250, 3).unwrap();
+        let mut attempts = 0;
+        let mut client = RuntimeMacroClient::with_config(
+            FakeTransport::with_handler(move |request| {
+                attempts += 1;
+                if attempts <= 3 {
+                    vec![Err(TransportError::Timeout)]
+                } else {
+                    vec![ok_response(request, 1, 1)]
+                }
+            }),
+            config,
+        );
+        client.set_slot(0, b"x").unwrap();
+        let read_timeouts = &client.transport_mut().read_timeouts;
+        assert_eq!(read_timeouts.len(), 4);
+        assert!(read_timeouts
+            .iter()
+            .all(|timeout| *timeout <= Duration::from_millis(250)));
+        assert!(read_timeouts
+            .iter()
+            .all(|timeout| *timeout > Duration::from_millis(200)));
     }
 
     #[test]
