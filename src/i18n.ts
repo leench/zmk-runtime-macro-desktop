@@ -16,6 +16,7 @@ export type MessageTable = {
   statusDisconnected: string;
   statusAuthenticated: string;
   statusOpen: string;
+  authSessionRemaining: (seconds: number) => string;
   chooseDevice: string;
   discoveredDevicesCount: (count: number) => string;
   discoveredDevices: string;
@@ -200,6 +201,7 @@ const english: MessageTable = {
   statusDisconnected: "Device disconnected",
   statusAuthenticated: "Authenticated",
   statusOpen: "Connected",
+  authSessionRemaining: (seconds) => `Session ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")} remaining`,
   chooseDevice: "Choose a keyboard",
   discoveredDevicesCount: (count) => `${count} device${count === 1 ? "" : "s"} found`,
   discoveredDevices: "Available devices",
@@ -382,6 +384,7 @@ const chinese: MessageTable = {
   statusDisconnected: "设备已断开",
   statusAuthenticated: "已认证",
   statusOpen: "已连接",
+  authSessionRemaining: (seconds) => `认证窗口剩余 ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`,
   chooseDevice: "选择键盘",
   discoveredDevicesCount: (count) => `发现 ${count} 台设备`,
   discoveredDevices: "可用设备",
@@ -577,6 +580,7 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     storage_error: "Applied for this session, but could not be saved permanently.",
     device_internal_error: "The device reported an internal error.",
     auth_required: "Unlock the device before managing macros.",
+    auth_expired: "The authentication window expired. Unlock the device again.",
     auth_failed: "The management password was not accepted.",
     auth_not_configured: "The device has no management password configured.",
     rate_limited: "Too many authentication attempts; wait before trying again.",
@@ -610,6 +614,7 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     storage_error: "本次会话可能已生效，但未能永久保存。",
     device_internal_error: "设备报告了内部错误。",
     auth_required: "请先解锁设备再管理宏。",
+    auth_expired: "认证窗口已过期，请重新解锁设备。",
     auth_failed: "管理密码不正确。",
     auth_not_configured: "设备未设置管理密码。",
     rate_limited: "认证尝试过多，请等待后再试。",

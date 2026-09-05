@@ -12,6 +12,7 @@ import {
   getSettings,
   getSlot,
   listDevices,
+  refreshAuthState as refreshAuthStateCommand,
   listSlots,
   lockDevice,
   setPassword as setPasswordCommand,
@@ -61,6 +62,10 @@ const MIN_HOVER_REVEAL_DELAY = -1;
 const MAX_HOVER_REVEAL_DELAY = 5;
 const MAX_TIMEOUT_MS = 5_000;
 const MAX_RETRIES = 5;
+const AUTH_SESSION_TIMEOUT_MS = 5 * 60 * 1_000;
+const AUTH_SESSION_POLL_MS = 5_000;
+const AUTO_RECONNECT_POLL_MS = 3_000;
+const AUTO_RECONNECT_MISSED_POLLS = 2;
 const DEFAULT_CLIENT_SETTINGS: ClientSettings = { timeoutMs: 1_000, retries: 2, appliesNextConnection: true };
 
 type SettingsDraft = ClientSettings;
@@ -147,6 +152,10 @@ function writePrivacyPreviewSettings(settings: PrivacyPreviewSettings): void {
 function deviceSummaryKey(device: ConnectedDevice | DeviceCandidate | null): string | null {
   if (!device) return null;
   return [device.vendorId, device.productId, device.interfaceNumber, device.usagePage, device.usage].join(":");
+}
+
+function matchingCandidates(devices: DeviceCandidate[], key: string): DeviceCandidate[] {
+  return devices.filter((device) => deviceSummaryKey(device) === key);
 }
 
 function isDirty(slot: SlotState): boolean {
@@ -276,6 +285,7 @@ function App() {
   const [lastOperation, setLastOperation] = useState<string | null>(null);
   const [lastErrorCode, setLastErrorCode] = useState<string | null>(null);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const [authRemainingSeconds, setAuthRemainingSeconds] = useState<number | null>(null);
 
   const mounted = useRef(false);
   const operation = useRef(0);
@@ -284,11 +294,31 @@ function App() {
   const connectionRef = useRef<ConnectionState>(connection);
   const dirtyRef = useRef(false);
   const closeConfirmRef = useRef(false);
+  const closingRef = useRef(false);
+  const authDeadlineRef = useRef<number | null>(null);
+  const authRefreshInFlightRef = useRef(false);
+  const busyRef = useRef(false);
+  const autoReconnectEnabledRef = useRef(false);
+  const autoReconnectInFlightRef = useRef(false);
+  const missingDevicePollsRef = useRef(0);
   selectedSlotRef.current = selectedSlot;
   connectionRef.current = connection;
   dirtyRef.current = slots.some(isDirty);
+  busyRef.current = busy;
 
   const recordOperation = useCallback((name: string) => setLastOperation(name), []);
+
+  const clearAuthDeadline = useCallback(() => {
+    authDeadlineRef.current = null;
+    setAuthRemainingSeconds(null);
+  }, []);
+
+  const markAuthenticatedActivity = useCallback((authenticated = connectionRef.current.authState === "authenticated") => {
+    if (!authenticated) return;
+    const deadline = Date.now() + AUTH_SESSION_TIMEOUT_MS;
+    authDeadlineRef.current = deadline;
+    setAuthRemainingSeconds(Math.ceil(AUTH_SESSION_TIMEOUT_MS / 1_000));
+  }, []);
 
   const commandError = useCallback((caught: unknown): CommandError => {
     const error = asCommandError(caught);
@@ -305,12 +335,16 @@ function App() {
     const nextAuthState = authStateForErrorCode(error.code);
     if (nextAuthState) {
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+      clearAuthDeadline();
       hideRevealed();
     } else if (dropsConnection(error.code)) {
       setConnection(disconnected);
+      clearAuthDeadline();
       hideRevealed();
+      autoReconnectEnabledRef.current = error.code !== "bad_version";
+      missingDevicePollsRef.current = 0;
     }
-  }, [hideRevealed]);
+  }, [clearAuthDeadline, hideRevealed]);
 
   const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean) => {
     setSlots((previous) => metadata.map((item) => makeSlotState(item, nextLabels, previous.find((slot) => slot.slot === item.slot), preserveDirty)));
@@ -323,8 +357,9 @@ function App() {
     const metadata = await listSlots();
     if (!mounted.current || operation.current !== sequence) return false;
     mergeSlotMetadata(metadata, nextLabels, preserveDirty);
+    markAuthenticatedActivity();
     return true;
-  }, [mergeSlotMetadata, recordOperation]);
+  }, [markAuthenticatedActivity, mergeSlotMetadata, recordOperation]);
 
   const refreshDevices = useCallback(async () => {
     const sequence = ++operation.current;
@@ -350,6 +385,11 @@ function App() {
           setSelectedSlot(null);
         }
         deviceKey.current = nextKey;
+        autoReconnectEnabledRef.current = false;
+        missingDevicePollsRef.current = 0;
+      } else if (priorConnected && !nextConnection.connected) {
+        autoReconnectEnabledRef.current = true;
+        missingDevicePollsRef.current = 0;
       }
       const nextLabels = readLabels(nextConnection.device);
       setLabels(nextLabels);
@@ -359,9 +399,13 @@ function App() {
         return matching?.id ?? nextDevices[0]?.id ?? "";
       });
       if (nextConnection.connected && canManage(nextConnection)) {
+        if (nextConnection.authState === "authenticated" && authDeadlineRef.current === null) {
+          markAuthenticatedActivity(true);
+        }
         await loadSlots(sequence, nextLabels, preserveDirty);
         if (nextConnection.authState === "open" && !priorConnected) setSetupOpen(true);
       } else {
+        clearAuthDeadline();
         hideRevealed();
       }
       if (!nextConnection.connected && nextDevices.length === 0) {
@@ -380,10 +424,12 @@ function App() {
         setRefreshing(false);
       }
     }
-  }, [applyErrorState, commandError, hideRevealed, loadSlots, recordOperation]);
+  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
 
-  const connectDevice = useCallback(async (id: string) => {
+  const connectDevice = useCallback(async (id: string, automaticReconnect = false) => {
     const sequence = ++operation.current;
+    autoReconnectEnabledRef.current = automaticReconnect;
+    clearAuthDeadline();
     setSelectedId(id);
     setChecking(true);
     setBusy(true);
@@ -409,10 +455,13 @@ function App() {
           setSelectedSlot(null);
         }
         deviceKey.current = nextKey;
+        autoReconnectEnabledRef.current = false;
+        missingDevicePollsRef.current = 0;
       }
       const nextLabels = readLabels(nextConnection.device);
       setLabels(nextLabels);
       setConnection(nextConnection);
+      markAuthenticatedActivity(nextConnection.authState === "authenticated");
       if (canManage(nextConnection)) {
         const listed = await loadSlots(sequence, nextLabels, preserveDirty);
         if (listed && nextConnection.authState === "open") setSetupOpen(true);
@@ -422,6 +471,7 @@ function App() {
         const error = commandError(caught);
         setConnection(disconnected);
         hideRevealed();
+        autoReconnectEnabledRef.current = automaticReconnect && error.code !== "bad_version";
         if (error.code === "bad_version") setErrorCode("bad_version");
       }
     } finally {
@@ -430,7 +480,7 @@ function App() {
         setBusy(false);
       }
     }
-  }, [commandError, hideRevealed, loadSlots, recordOperation]);
+  }, [clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const requestDeviceConnect = useCallback((id: string) => {
     const candidate = devices.find((item) => item.id === id);
@@ -444,6 +494,8 @@ function App() {
 
   const disconnectDevice = useCallback(async () => {
     const sequence = ++operation.current;
+    autoReconnectEnabledRef.current = false;
+    missingDevicePollsRef.current = 0;
     setBusy(true);
     setErrorCode(null);
     setSetupOpen(false);
@@ -453,6 +505,7 @@ function App() {
       await disconnectDeviceCommand();
       if (!mounted.current || operation.current !== sequence) return;
       setConnection(disconnected);
+      clearAuthDeadline();
       setSelectedId("");
       setClearConfirm(null);
       setSwitchConfirm(null);
@@ -463,7 +516,132 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [commandError, hideRevealed, recordOperation]);
+  }, [clearAuthDeadline, commandError, hideRevealed, recordOperation]);
+
+  const pollDeviceConnection = useCallback(async () => {
+    const knownKey = deviceKey.current;
+    if (!mounted.current || !knownKey || busyRef.current || autoReconnectInFlightRef.current) return;
+    if (!connectionRef.current.connected && !autoReconnectEnabledRef.current) return;
+    autoReconnectInFlightRef.current = true;
+    try {
+      const candidates = await listDevices();
+      if (!mounted.current || deviceKey.current !== knownKey) return;
+      setDevices(candidates);
+      const matches = matchingCandidates(candidates, knownKey);
+      if (connectionRef.current.connected) {
+        if (matches.length === 0) {
+          missingDevicePollsRef.current += 1;
+          if (missingDevicePollsRef.current < AUTO_RECONNECT_MISSED_POLLS) return;
+          const sequence = ++operation.current;
+          await disconnectDeviceCommand().catch(() => undefined);
+          if (!mounted.current || operation.current !== sequence || deviceKey.current !== knownKey) return;
+          setConnection(disconnected);
+          clearAuthDeadline();
+          hideRevealed();
+          autoReconnectEnabledRef.current = true;
+          missingDevicePollsRef.current = 0;
+        } else {
+          missingDevicePollsRef.current = 0;
+        }
+        return;
+      }
+      missingDevicePollsRef.current = 0;
+      if (!autoReconnectEnabledRef.current || matches.length !== 1) return;
+      await connectDevice(matches[0].id, true);
+    } catch {
+      // Discovery is a background recovery probe. Keep the current UI and draft
+      // intact on a transient enumeration failure; the next poll retries it.
+    } finally {
+      autoReconnectInFlightRef.current = false;
+    }
+  }, [clearAuthDeadline, connectDevice, hideRevealed]);
+
+  useEffect(() => {
+    if (!inTauri()) return undefined;
+    const timer = window.setInterval(() => { void pollDeviceConnection(); }, AUTO_RECONNECT_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [pollDeviceConnection]);
+
+  const expireAuthSession = useCallback(() => {
+    if (!connectionRef.current.connected || connectionRef.current.authState !== "authenticated" || authRefreshInFlightRef.current || busyRef.current) return;
+    const sequence = ++operation.current;
+    authRefreshInFlightRef.current = true;
+    authDeadlineRef.current = null;
+    setAuthRemainingSeconds(0);
+    setConnection((current) => current.connected ? { ...current, authState: "locked" } : current);
+    setErrorCode("auth_expired");
+    hideRevealed();
+    void refreshAuthStateCommand()
+      .then((nextAuthState) => {
+        if (!mounted.current || operation.current !== sequence || !connectionRef.current.connected) return;
+        if (nextAuthState === "authenticated") {
+          setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+          setErrorCode(null);
+          markAuthenticatedActivity(true);
+        } else {
+          setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+          clearAuthDeadline();
+          hideRevealed();
+        }
+      })
+      .catch((caught) => {
+        if (!mounted.current || operation.current !== sequence) return;
+        const error = commandError(caught);
+        applyErrorState(error);
+      })
+      .finally(() => {
+        authRefreshInFlightRef.current = false;
+      });
+  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, markAuthenticatedActivity]);
+
+  useEffect(() => {
+    if (!connection.connected || connection.authState !== "authenticated") {
+      if (authDeadlineRef.current !== null) clearAuthDeadline();
+      return undefined;
+    }
+    if (authDeadlineRef.current === null) markAuthenticatedActivity(true);
+    const tick = () => {
+      const deadline = authDeadlineRef.current;
+      if (deadline === null) return;
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1_000));
+      setAuthRemainingSeconds(remaining);
+      if (remaining === 0) expireAuthSession();
+    };
+    tick();
+    const timer = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(timer);
+  }, [clearAuthDeadline, connection.authState, connection.connected, expireAuthSession, markAuthenticatedActivity]);
+
+  useEffect(() => {
+    if (!connection.connected || connection.authState !== "authenticated" || !inTauri()) return undefined;
+    const poll = () => {
+      if (busyRef.current || authRefreshInFlightRef.current) return;
+      const sequence = ++operation.current;
+      authRefreshInFlightRef.current = true;
+      void refreshAuthStateCommand()
+        .then((nextAuthState) => {
+          if (!mounted.current || operation.current !== sequence || !connectionRef.current.connected) return;
+          if (nextAuthState === "authenticated") {
+            if (authDeadlineRef.current === null) markAuthenticatedActivity(true);
+            return;
+          }
+          setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+          clearAuthDeadline();
+          hideRevealed();
+          setErrorCode(nextAuthState === "locked" ? "auth_required" : null);
+        })
+        .catch((caught) => {
+          if (!mounted.current || operation.current !== sequence) return;
+          const error = commandError(caught);
+          applyErrorState(error);
+        })
+        .finally(() => {
+          authRefreshInFlightRef.current = false;
+        });
+    };
+    const timer = window.setInterval(poll, AUTH_SESSION_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [applyErrorState, clearAuthDeadline, commandError, connection.authState, connection.connected, hideRevealed, markAuthenticatedActivity]);
 
   const refreshSlots = useCallback(async () => {
     if (!canManage(connectionRef.current)) return;
@@ -505,6 +683,7 @@ function App() {
       }
       if (!mounted.current || operation.current !== sequence || selectedSlotRef.current !== slotNumber) return;
       setErrorCode(null);
+      markAuthenticatedActivity();
       setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, revealed: false, status: "idle", error: null, lastAction: null, savedAt: slot.savedAt } : slot));
     } catch (caught) {
       if (mounted.current && operation.current === sequence) {
@@ -516,7 +695,7 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, commandError, recordOperation]);
+  }, [applyErrorState, commandError, markAuthenticatedActivity, recordOperation]);
 
   useEffect(() => {
     if (!canManage(connection) || selectedSlot === null) return;
@@ -624,6 +803,7 @@ function App() {
       }
       if (!mounted.current || operation.current !== sequence) return;
       setErrorCode(null);
+      markAuthenticatedActivity();
       const nextLabels = { ...labels, [selected.slot]: selected.draftLabel };
       writeLabels(connectionRef.current.device, nextLabels);
       setLabels(nextLabels);
@@ -641,7 +821,7 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, busy, commandError, labels, recordOperation, selectedSlot, slots]);
+  }, [applyErrorState, busy, commandError, labels, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
 
   const requestClear = useCallback(() => {
     if (selectedSlot !== null) setClearConfirm(selectedSlot);
@@ -661,6 +841,7 @@ function App() {
       if (!mounted.current || operation.current !== sequence) return;
       const now = new Date().toISOString();
       setErrorCode(null);
+      markAuthenticatedActivity();
       setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, length: 0, savedText: "", draftText: "", loaded: true, revealed: false, status: "saved", error: null, lastAction: null, savedAt: now } : slot));
       window.setTimeout(() => {
         if (mounted.current) setSlots((previous) => previous.map((slot) => slot.slot === selected.slot && slot.status === "saved" ? { ...slot, status: "idle" } : slot));
@@ -674,7 +855,7 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, busy, commandError, recordOperation, selectedSlot, slots]);
+  }, [applyErrorState, busy, commandError, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
 
   const retrySelected = useCallback(() => {
     const selected = slots.find((slot) => slot.slot === selectedSlot);
@@ -687,6 +868,7 @@ function App() {
 
   const authenticateDevice = useCallback(async (password: string): Promise<CommandError | null> => {
     if (!connectionRef.current.connected) return { code: "not_connected", message: "" };
+    const sequence = ++operation.current;
     setBusy(true);
     setErrorCode(null);
     recordOperation("AUTH");
@@ -695,8 +877,11 @@ function App() {
       if (!mounted.current) return null;
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
       if (nextAuthState === "authenticated") {
-        const sequence = ++operation.current;
+        markAuthenticatedActivity(true);
         await loadSlots(sequence, labels, true);
+      } else {
+        clearAuthDeadline();
+        hideRevealed();
       }
       return null;
     } catch (caught) {
@@ -706,7 +891,7 @@ function App() {
     } finally {
       if (mounted.current) setBusy(false);
     }
-  }, [applyErrorState, commandError, labels, loadSlots, recordOperation]);
+  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, labels, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const setPassword = useCallback(async (password: string): Promise<CommandError | null> => {
     if (!connectionRef.current.connected) return { code: "not_connected", message: "" };
@@ -717,6 +902,7 @@ function App() {
       const nextAuthState = await setPasswordCommand(password);
       if (!mounted.current) return null;
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+      clearAuthDeadline();
       hideRevealed();
       setSetupOpen(false);
       setPasswordModalMode(null);
@@ -728,7 +914,7 @@ function App() {
     } finally {
       if (mounted.current) setBusy(false);
     }
-  }, [applyErrorState, commandError, hideRevealed, recordOperation]);
+  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, recordOperation]);
 
   const lockManagement = useCallback(async () => {
     if (!connectionRef.current.connected || connectionRef.current.authState !== "authenticated" || busy) return;
@@ -740,6 +926,7 @@ function App() {
       const nextAuthState = await lockDevice();
       if (!mounted.current) return;
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+      clearAuthDeadline();
     } catch (caught) {
       const error = commandError(caught);
       applyErrorState(error);
@@ -747,7 +934,7 @@ function App() {
     } finally {
       if (mounted.current) setBusy(false);
     }
-  }, [applyErrorState, busy, commandError, hideRevealed, recordOperation]);
+  }, [applyErrorState, busy, clearAuthDeadline, commandError, hideRevealed, recordOperation]);
 
   const saveSettings = useCallback(async () => {
     if (!Number.isInteger(settingsDraft.timeoutMs) || settingsDraft.timeoutMs < MIN_TIMEOUT_MS || settingsDraft.timeoutMs > MAX_TIMEOUT_MS) {
@@ -800,17 +987,28 @@ function App() {
     setCloseConfirmOpen(false);
   }, []);
 
+  const closeWindowWithBestEffortLock = useCallback(() => {
+    if (!inTauri() || closingRef.current) return;
+    closingRef.current = true;
+    const windowHandle = getCurrentWindow();
+    const lockAttempt = disconnectDeviceCommand().catch(() => undefined);
+    const closeDeadline = new Promise<void>((resolve) => { window.setTimeout(resolve, 250); });
+    void Promise.race([lockAttempt, closeDeadline])
+      .then(() => windowHandle.destroy())
+      .catch(() => {
+        closingRef.current = false;
+        if (mounted.current) {
+          closeConfirmRef.current = true;
+          setCloseConfirmOpen(true);
+        }
+      });
+  }, []);
+
   const closeWithoutSaving = useCallback(() => {
     closeConfirmRef.current = false;
     setCloseConfirmOpen(false);
-    if (!inTauri()) return;
-    void getCurrentWindow().destroy().catch(() => {
-      if (mounted.current) {
-        closeConfirmRef.current = true;
-        setCloseConfirmOpen(true);
-      }
-    });
-  }, []);
+    closeWindowWithBestEffortLock();
+  }, [closeWindowWithBestEffortLock]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -848,12 +1046,14 @@ function App() {
     let unlisten: (() => void) | undefined;
     try {
       void getCurrentWindow().onCloseRequested((event) => {
-        if (!dirtyRef.current) return;
+        if (closingRef.current) return;
         event.preventDefault();
-        if (!closeConfirmRef.current) {
+        if (dirtyRef.current && !closeConfirmRef.current) {
           closeConfirmRef.current = true;
           setCloseConfirmOpen(true);
+          return;
         }
+        closeWindowWithBestEffortLock();
       }).then((stopListening) => {
         if (active) unlisten = stopListening;
         else stopListening();
@@ -868,7 +1068,7 @@ function App() {
       unlisten?.();
       window.removeEventListener("beforeunload", beforeUnload);
     };
-  }, []);
+  }, [closeWindowWithBestEffortLock]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -937,6 +1137,7 @@ function App() {
           interfaceLabel={copy.interfaceNumber(connection.device.interfaceNumber)}
           interfaceNumberLabel={copy.interfaceNumber}
           connectionStatusLabel={statusLabel}
+          authRemainingSeconds={authRemainingSeconds}
           protectedAuthenticated={connection.authState === "authenticated"}
           isOpen={connection.authState === "open"}
           slots={slots}

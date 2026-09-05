@@ -23,6 +23,7 @@ type AppHeaderProps = {
   currentCandidateId?: string;
   deviceName: string;
   statusLabel: string;
+  authRemainingSeconds: number | null;
   interfaceLabel: string;
   interfaceNumberLabel: (value: number) => string;
   configuredBytes: number;
@@ -53,6 +54,7 @@ export function AppHeader({
   currentCandidateId,
   deviceName,
   statusLabel,
+  authRemainingSeconds,
   interfaceLabel,
   interfaceNumberLabel,
   configuredBytes,
@@ -116,6 +118,12 @@ export function AppHeader({
         label={copy.configuredBytes}
         valueLabel={copy.configuredBytesValue(configuredBytes)}
       />
+
+      {protectedAuthenticated && authRemainingSeconds !== null ? (
+        <span className="shrink-0 font-mono text-xs font-medium text-ink-muted" role="status" aria-live="polite">
+          {copy.authSessionRemaining(authRemainingSeconds)}
+        </span>
+      ) : null}
 
       <div className="ml-auto flex items-center gap-1">
         <IconButton icon={refreshing ? Activity : RefreshCw} label={copy.refreshSlots} onClick={onRefresh} disabled={disabled || refreshing} />

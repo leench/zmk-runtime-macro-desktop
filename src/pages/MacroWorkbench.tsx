@@ -18,6 +18,7 @@ type MacroWorkbenchProps = {
   interfaceLabel: string;
   interfaceNumberLabel: (value: number) => string;
   connectionStatusLabel: string;
+  authRemainingSeconds: number | null;
   protectedAuthenticated: boolean;
   isOpen: boolean;
   slots: SlotState[];
@@ -72,6 +73,7 @@ export function MacroWorkbench({
   interfaceLabel,
   interfaceNumberLabel,
   connectionStatusLabel,
+  authRemainingSeconds,
   protectedAuthenticated,
   isOpen,
   slots,
@@ -137,6 +139,7 @@ export function MacroWorkbench({
         currentCandidateId={currentCandidateId}
         deviceName={deviceName}
         statusLabel={connectionStatusLabel}
+        authRemainingSeconds={authRemainingSeconds}
         interfaceLabel={interfaceLabel}
         interfaceNumberLabel={interfaceNumberLabel}
         configuredBytes={configuredBytes}

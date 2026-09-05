@@ -876,6 +876,15 @@ impl<F: SessionFactory> AppState<F> {
     }
 }
 
+impl<F: SessionFactory> Drop for AppState<F> {
+    fn drop(&mut self) {
+        // A normal Tauri application shutdown drops managed state after the
+        // window closes. Reuse the same best-effort LOCK path used for explicit
+        // disconnects; a failed LOCK never changes shutdown behavior.
+        self.disconnect();
+    }
+}
+
 fn state_after_lock_result(previous_state: AuthState) -> AuthState {
     match previous_state {
         AuthState::Open => AuthState::Open,
@@ -1926,6 +1935,32 @@ mod tests {
         state.disconnect();
         assert_eq!(*lock_calls.lock().unwrap(), 3);
         assert_eq!(state.connection_state().auth_state, AuthState::Disconnected);
+    }
+
+    #[test]
+    fn dropping_connected_state_attempts_best_effort_lock() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x65; crate::auth::SALT_SIZE],
+        });
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        {
+            let mut state = AppState::new(factory);
+            let candidate = state.refresh_records(vec![record(
+                b"drop-lock",
+                RUNTIME_MACRO_USAGE_PAGE,
+                RUNTIME_MACRO_USAGE,
+                2,
+            )])[0]
+                .clone();
+            state.connect(&candidate.id).unwrap();
+            assert!(state.connection_state().connected);
+        }
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
     }
 
     #[test]
