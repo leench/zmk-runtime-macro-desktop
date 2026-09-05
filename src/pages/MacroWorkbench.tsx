@@ -35,6 +35,7 @@ type MacroWorkbenchProps = {
   onRefreshDevices: () => void;
   onSettings: () => void;
   onDiagnostics: () => void;
+  onSetPassword: () => void;
   onChangePassword: () => void;
   onLock: () => void;
   onSwitchDevice: (id: string) => void;
@@ -86,6 +87,7 @@ export function MacroWorkbench({
   onRefreshDevices,
   onSettings,
   onDiagnostics,
+  onSetPassword,
   onChangePassword,
   onLock,
   onSwitchDevice,
@@ -136,11 +138,13 @@ export function MacroWorkbench({
         theme={theme}
         refreshing={refreshing}
         protectedAuthenticated={protectedAuthenticated}
+        isOpen={isOpen}
         onThemeChange={onThemeChange}
         onRefresh={onRefresh}
         onRefreshDevices={onRefreshDevices}
         onSettings={onSettings}
         onDiagnostics={onDiagnostics}
+        onSetPassword={onSetPassword}
         onChangePassword={onChangePassword}
         onLock={onLock}
         onSwitchDevice={onSwitchDevice}

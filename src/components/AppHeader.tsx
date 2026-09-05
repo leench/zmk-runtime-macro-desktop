@@ -29,11 +29,13 @@ type AppHeaderProps = {
   theme: ThemeMode;
   refreshing: boolean;
   protectedAuthenticated: boolean;
+  isOpen: boolean;
   onThemeChange: (theme: ThemeMode) => void;
   onRefresh: () => void;
   onRefreshDevices: () => void;
   onSettings: () => void;
   onDiagnostics: () => void;
+  onSetPassword: () => void;
   onChangePassword: () => void;
   onLock: () => void;
   onSwitchDevice: (id: string) => void;
@@ -57,11 +59,13 @@ export function AppHeader({
   theme,
   refreshing,
   protectedAuthenticated,
+  isOpen,
   onThemeChange,
   onRefresh,
   onRefreshDevices,
   onSettings,
   onDiagnostics,
+  onSetPassword,
   onChangePassword,
   onLock,
   onSwitchDevice,
@@ -136,26 +140,28 @@ export function AppHeader({
                 <Activity className="h-4 w-4 text-ink-muted" aria-hidden="true" />
                 {copy.diagnostics}
               </button>
-              {protectedAuthenticated ? (
+              {protectedAuthenticated || isOpen ? (
                 <>
                   <button
                     type="button"
                     role="menuitem"
-                    onClick={() => { setMenuOpen(false); onChangePassword(); }}
+                    onClick={() => { setMenuOpen(false); protectedAuthenticated ? onChangePassword() : onSetPassword(); }}
                     className="flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm text-ink hover:bg-surface-2"
                   >
                     <ShieldCheck className="h-4 w-4 text-ink-muted" aria-hidden="true" />
-                    {copy.changePassword}
+                    {protectedAuthenticated ? copy.changePassword : copy.setPassword}
                   </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => { setMenuOpen(false); onLock(); }}
-                    className="flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm text-ink hover:bg-surface-2"
-                  >
-                    <LockKeyhole className="h-4 w-4 text-ink-muted" aria-hidden="true" />
-                    {copy.lockDevice}
-                  </button>
+                  {protectedAuthenticated ? (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => { setMenuOpen(false); onLock(); }}
+                      className="flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-sm text-ink hover:bg-surface-2"
+                    >
+                      <LockKeyhole className="h-4 w-4 text-ink-muted" aria-hidden="true" />
+                      {copy.lockDevice}
+                    </button>
+                  ) : null}
                 </>
               ) : null}
               <button

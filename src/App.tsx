@@ -899,6 +899,7 @@ function App() {
           onRefreshDevices={() => void refreshDevices()}
           onSettings={() => { setSettingsDraft(settings); setSettingsError(null); setSettingsOpen(true); }}
           onDiagnostics={() => setDiagnosticsOpen((value) => !value)}
+          onSetPassword={() => { setPasswordModalMode("setup"); setErrorCode(null); }}
           onChangePassword={() => { setPasswordModalMode("change"); setErrorCode(null); }}
           onLock={() => void lockManagement()}
           onSwitchDevice={requestDeviceConnect}
@@ -931,15 +932,15 @@ function App() {
         />
       ) : null}
 
-      {route === "workbench" && setupOpen ? (
+      {route === "workbench" && (setupOpen || passwordModalMode === "setup") ? (
         <PasswordSetupModal
           copy={copy}
           locale={locale}
           mode="setup"
           busy={busy}
           externalErrorCode={errorCode}
-          onSkip={() => { setSetupOpen(false); setErrorCode(null); }}
-          onClose={() => setSetupOpen(false)}
+          onSkip={() => { setSetupOpen(false); setPasswordModalMode(null); setErrorCode(null); }}
+          onClose={() => { setSetupOpen(false); setPasswordModalMode(null); setErrorCode(null); }}
           onSubmit={setPassword}
         />
       ) : null}
