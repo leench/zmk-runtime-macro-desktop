@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use hidapi::{DeviceInfo as HidDeviceInfo, HidApi, HidDevice, HidError};
+use zeroize::Zeroizing;
 
 use crate::client::Transport;
 use crate::error::TransportError;
@@ -313,13 +314,13 @@ impl HidTransport {
 
 impl Transport for HidTransport {
     fn write_frame(&mut self, frame: &Frame) -> Result<(), TransportError> {
-        let mut report = [0u8; REPORT_SIZE];
+        let mut report = Zeroizing::new([0u8; REPORT_SIZE]);
         report[0] = REPORT_ID;
         report[1..].copy_from_slice(frame);
 
         let written = self
             .device
-            .write(&report)
+            .write(&report[..])
             .map_err(|error| Self::map_hid_error("write", error))?;
         if written != REPORT_SIZE {
             return Err(TransportError::Fatal(format!(

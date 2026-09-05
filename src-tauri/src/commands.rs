@@ -10,6 +10,7 @@ use crate::hid::{
     enumerate_devices, new_hid_api, open_device, DeviceDiscoveryError, DeviceRecord, DeviceSummary,
     HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
+use crate::protocol::AuthInfo;
 
 /// A stable, serializable error envelope used by every frontend command.
 ///
@@ -92,6 +93,22 @@ impl From<ClientError> for CommandError {
                 "protocol_error",
                 "The device returned an invalid protocol response.",
             ),
+            ClientError::Auth(error) => match error {
+                crate::error::AuthError::EmptyPassword => {
+                    Self::new("empty_password", "A management password must not be empty.")
+                }
+                crate::error::AuthError::InvalidIterations
+                | crate::error::AuthError::InvalidSalt
+                | crate::error::AuthError::InvalidDerivedKey
+                | crate::error::AuthError::InvalidNonce => Self::new(
+                    "invalid_authentication_input",
+                    "The authentication input is invalid.",
+                ),
+                crate::error::AuthError::RandomnessUnavailable => Self::new(
+                    "randomness_unavailable",
+                    "The operating system secure random source is unavailable.",
+                ),
+            },
             ClientError::Remote(status) => {
                 let (code, message) = match status {
                     crate::protocol::Status::BadVersion => (
@@ -123,6 +140,28 @@ impl From<ClientError> for CommandError {
                     crate::protocol::Status::Internal => (
                         "device_internal_error",
                         "The device reported an internal error.",
+                    ),
+                    crate::protocol::Status::AuthRequired => {
+                        ("auth_required", "Unlock the device before managing macros.")
+                    }
+                    crate::protocol::Status::AuthFailed => {
+                        ("auth_failed", "The management password was not accepted.")
+                    }
+                    crate::protocol::Status::AuthNotConfigured => (
+                        "auth_not_configured",
+                        "The device has no management password configured.",
+                    ),
+                    crate::protocol::Status::RateLimited => (
+                        "rate_limited",
+                        "Too many authentication attempts; wait before trying again.",
+                    ),
+                    crate::protocol::Status::AuthNoChallenge => (
+                        "auth_no_challenge",
+                        "The authentication challenge is no longer available.",
+                    ),
+                    crate::protocol::Status::CredentialInvalid => (
+                        "credential_invalid",
+                        "The device rejected the new management credential.",
                     ),
                     crate::protocol::Status::Ok => {
                         ("device_error", "The device returned an unexpected status.")
@@ -314,6 +353,33 @@ pub trait MacroSession: Send {
     fn get_slot(&mut self, slot: u8) -> Result<Vec<u8>, ClientError>;
     fn set_slot(&mut self, slot: u8, data: &[u8]) -> Result<(), ClientError>;
     fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError>;
+
+    /// Authentication methods are part of the backend session boundary so
+    /// the next Tauri command layer cannot accidentally bypass v2. Custom
+    /// test sessions remain source-compatible until they opt into auth.
+    fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement v2 authentication",
+        ))
+    }
+
+    fn authenticate(&mut self, _password: &str) -> Result<(), ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement v2 authentication",
+        ))
+    }
+
+    fn set_password(&mut self, _password: &str) -> Result<(), ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement v2 authentication",
+        ))
+    }
+
+    fn lock(&mut self) -> Result<(), ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement v2 authentication",
+        ))
+    }
 }
 
 impl MacroSession for RuntimeMacroClient<HidTransport> {
@@ -331,6 +397,22 @@ impl MacroSession for RuntimeMacroClient<HidTransport> {
 
     fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError> {
         RuntimeMacroClient::clear_slot(self, slot)
+    }
+
+    fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
+        RuntimeMacroClient::auth_info(self)
+    }
+
+    fn authenticate(&mut self, password: &str) -> Result<(), ClientError> {
+        RuntimeMacroClient::authenticate(self, password)
+    }
+
+    fn set_password(&mut self, password: &str) -> Result<(), ClientError> {
+        RuntimeMacroClient::set_password(self, password)
+    }
+
+    fn lock(&mut self) -> Result<(), ClientError> {
+        RuntimeMacroClient::lock(self)
     }
 }
 
@@ -1146,6 +1228,56 @@ mod tests {
         clear_state.connect(&clear_candidate.id).unwrap();
         assert_eq!(clear_state.clear_slot(0).unwrap_err().code, "bad_slot");
         assert!(!clear_state.connection_state().connected);
+    }
+
+    #[test]
+    fn authentication_errors_map_without_secret_material() {
+        let auth_errors = [
+            (crate::error::AuthError::EmptyPassword, "empty_password"),
+            (
+                crate::error::AuthError::InvalidIterations,
+                "invalid_authentication_input",
+            ),
+            (
+                crate::error::AuthError::InvalidSalt,
+                "invalid_authentication_input",
+            ),
+            (
+                crate::error::AuthError::InvalidDerivedKey,
+                "invalid_authentication_input",
+            ),
+            (
+                crate::error::AuthError::InvalidNonce,
+                "invalid_authentication_input",
+            ),
+            (
+                crate::error::AuthError::RandomnessUnavailable,
+                "randomness_unavailable",
+            ),
+        ];
+        for (error, expected_code) in auth_errors {
+            let mapped = CommandError::from(ClientError::Auth(error));
+            assert_eq!(mapped.code, expected_code);
+            assert!(!mapped.message.contains("fixture-password"));
+            assert!(!mapped.message.contains("proof"));
+            assert!(!mapped.message.contains("nonce"));
+            let serialized = serde_json::to_string(&mapped).unwrap();
+            assert!(!serialized.contains("fixture-password"));
+        }
+
+        for (status, expected_code) in [
+            (Status::AuthRequired, "auth_required"),
+            (Status::AuthFailed, "auth_failed"),
+            (Status::AuthNotConfigured, "auth_not_configured"),
+            (Status::RateLimited, "rate_limited"),
+            (Status::AuthNoChallenge, "auth_no_challenge"),
+            (Status::CredentialInvalid, "credential_invalid"),
+        ] {
+            assert_eq!(
+                CommandError::from(ClientError::Remote(status)).code,
+                expected_code
+            );
+        }
     }
 
     #[test]

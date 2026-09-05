@@ -22,6 +22,14 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# Authentication uses the protocol's fixed PBKDF2/HMAC parameters. Keep
+# password-derived material in non-serializable, zeroized wrappers.
+getrandom = "0.2.17"
+hmac = "0.12.1"
+pbkdf2 = "0.12.2"
+sha2 = "0.10.9"
+unicode-normalization = "0.1.25"
+zeroize = "1.9"
 
 # Keep the Linux backend explicit so HID Usage metadata remains available for
 # safe Runtime Macro HID discovery without assuming a particular HID instance.

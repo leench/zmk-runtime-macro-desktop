@@ -1,10 +1,16 @@
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
+use crate::auth::{AuthSession, Credential, SALT_SIZE};
 use crate::error::{ClientError, ProtocolError, TransportError};
 use crate::protocol::{
-    build_frame, normalize_response, read_u16, response_identity_matches, validate_response,
-    validate_text, Frame, Opcode, Status, LIST_SLOT, MAX_TEXT_LENGTH, OFFSET_OFFSET,
-    PAYLOAD_LENGTH_OFFSET, PAYLOAD_OFFSET, PAYLOAD_SIZE, TOTAL_LENGTH_OFFSET,
+    build_auth_challenge_request, build_auth_info_request, build_auth_prove_request, build_frame,
+    build_lock_request, build_password_set_chunk, normalize_response,
+    parse_auth_challenge_response, parse_auth_info_response, read_u16, response_identity_matches,
+    validate_empty_success, validate_response, validate_text, AuthInfo, Frame, Opcode, Status,
+    LIST_SLOT, MAX_TEXT_LENGTH, OFFSET_OFFSET, PASSWORD_SET_LENGTH, PAYLOAD_LENGTH_OFFSET,
+    PAYLOAD_OFFSET, PAYLOAD_SIZE, TOTAL_LENGTH_OFFSET,
 };
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
@@ -69,6 +75,7 @@ pub struct RuntimeMacroClient<T> {
     timeout: Duration,
     retries: usize,
     next_request_id: u8,
+    auth_session: AuthSession,
 }
 
 impl<T: Transport> RuntimeMacroClient<T> {
@@ -84,6 +91,7 @@ impl<T: Transport> RuntimeMacroClient<T> {
             timeout: Duration::from_millis(timeout_ms),
             retries,
             next_request_id: 0,
+            auth_session: AuthSession::new(),
         })
     }
 
@@ -93,6 +101,7 @@ impl<T: Transport> RuntimeMacroClient<T> {
             timeout: Duration::from_millis(config.timeout_ms),
             retries: config.retries,
             next_request_id: 0,
+            auth_session: AuthSession::new(),
         }
     }
 
@@ -102,6 +111,14 @@ impl<T: Transport> RuntimeMacroClient<T> {
 
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.auth_session.is_authenticated()
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.auth_session.is_protected()
     }
 
     fn take_request_id(&mut self) -> u8 {
@@ -138,7 +155,18 @@ impl<T: Transport> RuntimeMacroClient<T> {
         let response = self.exchange(request)?;
         match validate_response(request, &response)? {
             Status::Ok => Ok(response),
-            status => Err(ClientError::Remote(status)),
+            status => {
+                if matches!(
+                    status,
+                    Status::AuthRequired
+                        | Status::AuthFailed
+                        | Status::AuthNoChallenge
+                        | Status::AuthNotConfigured
+                ) {
+                    self.auth_session.clear_session();
+                }
+                Err(ClientError::Remote(status))
+            }
         }
     }
 
@@ -158,6 +186,220 @@ impl<T: Transport> RuntimeMacroClient<T> {
             }
         }
         Err(last_error.expect("at least one transport attempt is always made"))
+    }
+
+    /// Query the public authentication state and KDF parameters.
+    pub fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
+        let response = match self.call_with_transport_retry(|request_id| {
+            build_auth_info_request(request_id).map_err(ClientError::from)
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                self.auth_session.clear_session();
+                return Err(error);
+            }
+        };
+        let info = match parse_auth_info_response(&response) {
+            Ok(info) => info,
+            Err(error) => {
+                // AUTH_INFO is the device-authoritative session observation;
+                // never retain a prior authenticated state after a malformed
+                // or otherwise non-canonical successful response.
+                self.auth_session.clear_session();
+                return Err(error.into());
+            }
+        };
+        self.auth_session
+            .observe(info.password_configured, info.session_authenticated);
+        Ok(info)
+    }
+
+    /// Request a fresh one-time challenge. Transport retries create a fresh
+    /// request ID and must be parsed as a new challenge; no old nonce is
+    /// retained by the client.
+    pub fn auth_challenge(&mut self) -> Result<crate::auth::Nonce, ClientError> {
+        let response = self.call_with_transport_retry(|request_id| {
+            build_auth_challenge_request(request_id).map_err(ClientError::from)
+        })?;
+        Ok(parse_auth_challenge_response(&response)?)
+    }
+
+    /// Perform AUTH_INFO -> AUTH_CHALLENGE -> AUTH_PROVE for a password.
+    /// AUTH_PROVE is deliberately a single non-retried exchange because its
+    /// challenge is one-shot, including when the response is lost.
+    pub fn authenticate(&mut self, password: &str) -> Result<(), ClientError> {
+        let info = self.auth_info()?;
+        if !info.password_configured {
+            return Err(ClientError::Remote(Status::AuthNotConfigured));
+        }
+
+        let credential = Credential::derive(password, info.salt, info.iterations)?;
+        let nonce = match self.auth_challenge() {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                self.auth_session.clear_session();
+                return Err(error);
+            }
+        };
+        let proof = credential.proof(&nonce);
+        let request_id = self.take_request_id();
+        let request = match build_auth_prove_request(request_id, &proof) {
+            Ok(request) => request,
+            Err(error) => {
+                self.auth_session.clear_session();
+                return Err(error.into());
+            }
+        };
+        let response = match self.call(request.as_frame()) {
+            Ok(response) => response,
+            Err(error) => {
+                // Clear local authentication state for AUTH_FAILED and
+                // AUTH_NO_CHALLENGE as well as unknown transport/protocol
+                // outcomes.
+                self.auth_session.clear_session();
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_empty_success(&response, "AUTH_PROVE") {
+            self.auth_session.clear_session();
+            return Err(error.into());
+        }
+
+        self.auth_session.install_authenticated();
+        Ok(())
+    }
+
+    fn validate_password_set_ack(
+        response: &Frame,
+        expected_offset: u16,
+    ) -> Result<(), ClientError> {
+        if response[PAYLOAD_LENGTH_OFFSET] != 0 {
+            return Err(ProtocolError::UnexpectedResponsePayload {
+                operation: "PASSWORD_SET",
+            }
+            .into());
+        }
+        let actual_offset = read_u16(response, OFFSET_OFFSET);
+        if actual_offset != expected_offset {
+            return Err(ProtocolError::SetAckOffset {
+                expected: expected_offset,
+                actual: actual_offset,
+            }
+            .into());
+        }
+        let actual_total = read_u16(response, TOTAL_LENGTH_OFFSET);
+        if actual_total != PASSWORD_SET_LENGTH as u16 {
+            return Err(ProtocolError::SetAckTotal {
+                expected: PASSWORD_SET_LENGTH as u16,
+                actual: actual_total,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Resolve an uncertain final PASSWORD_SET result without replaying its
+    /// secret chunk. AUTH_INFO updates local state authoritatively; a matching
+    /// new credential tuple means the device committed the change.
+    fn resolve_password_set_outcome(
+        &mut self,
+        expected_iterations: u32,
+        expected_salt: [u8; SALT_SIZE],
+        original_error: Option<ClientError>,
+    ) -> Result<(), ClientError> {
+        let info = match self.auth_info() {
+            Ok(info) => info,
+            Err(error) => {
+                self.auth_session.clear_session();
+                return Err(error);
+            }
+        };
+        if info.password_configured
+            && info.iterations == expected_iterations
+            && info.salt == expected_salt
+        {
+            self.auth_session.become_protected();
+            Ok(())
+        } else {
+            Err(original_error
+                .unwrap_or_else(|| ProtocolError::PasswordSetConfirmationMismatch.into()))
+        }
+    }
+
+    /// Submit a complete 52-byte PASSWORD_SET object. The operation never
+    /// retries a chunk: a lost final ACK is resolved with AUTH_INFO, not by
+    /// blindly repeating a secret transaction.
+    pub fn set_password(&mut self, password: &str) -> Result<(), ClientError> {
+        let info = self.auth_info()?;
+        if info.password_configured && !info.session_authenticated {
+            return Err(ClientError::Remote(Status::AuthRequired));
+        }
+
+        let credential = Credential::generate(password)?;
+        let mut object = Zeroizing::new([0u8; PASSWORD_SET_LENGTH]);
+        credential.write_password_set_object(&mut object[..])?;
+        let expected_iterations = credential.iterations();
+        let expected_salt = credential.salt();
+        drop(credential);
+        let request_id = self.take_request_id();
+
+        let mut offset = 0usize;
+        while offset < PASSWORD_SET_LENGTH {
+            let end = (offset + PAYLOAD_SIZE).min(PASSWORD_SET_LENGTH);
+            let is_final_chunk = end == PASSWORD_SET_LENGTH;
+            let request =
+                build_password_set_chunk(request_id, offset as u16, &object[offset..end])?;
+            let response = self.call(request.as_frame());
+            drop(request);
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if is_final_chunk
+                        && matches!(
+                            error,
+                            ClientError::Transport(_) | ClientError::Protocol(_)
+                        ) =>
+                {
+                    drop(object);
+                    return self.resolve_password_set_outcome(
+                        expected_iterations,
+                        expected_salt,
+                        Some(error),
+                    );
+                }
+                Err(error) => return Err(error),
+            };
+
+            if let Err(error) = Self::validate_password_set_ack(&response, end as u16) {
+                if is_final_chunk {
+                    drop(object);
+                    return self.resolve_password_set_outcome(
+                        expected_iterations,
+                        expected_salt,
+                        Some(error),
+                    );
+                }
+                return Err(error);
+            }
+            offset = end;
+        }
+
+        // Even a well-shaped final OK is only an acknowledgement of the
+        // transaction. Confirm the committed tuple before changing local state.
+        drop(object);
+        self.resolve_password_set_outcome(expected_iterations, expected_salt, None)
+    }
+
+    /// Ask the device to clear its transient authentication session. Local
+    /// authentication state is cleared even when the best-effort request fails.
+    pub fn lock(&mut self) -> Result<(), ClientError> {
+        let response = self.call_with_transport_retry(|request_id| {
+            build_lock_request(request_id).map_err(ClientError::from)
+        });
+        self.auth_session.clear_session();
+        let response = response?;
+        validate_empty_success(&response, "LOCK")?;
+        Ok(())
     }
 
     pub fn list_slots(&mut self) -> Result<Vec<SlotInfo>, ClientError> {
@@ -418,7 +660,7 @@ mod tests {
     type Handler = Box<dyn FnMut(&Frame) -> Vec<ReadResult>>;
 
     struct FakeTransport {
-        writes: Vec<Frame>,
+        writes: Vec<Zeroizing<Frame>>,
         reads: VecDeque<ReadResult>,
         read_timeouts: Vec<Duration>,
         on_write: Option<Handler>,
@@ -476,7 +718,7 @@ mod tests {
 
     impl Transport for FakeTransport {
         fn write_frame(&mut self, frame: &Frame) -> Result<(), TransportError> {
-            self.writes.push(*frame);
+            self.writes.push(Zeroizing::new(*frame));
             if let Some(handler) = self.on_write.as_mut() {
                 self.reads.extend(handler(frame));
             }
@@ -506,6 +748,624 @@ mod tests {
             offset,
             total,
         ))
+    }
+
+    fn auth_info_ok(
+        request: &Frame,
+        configured: bool,
+        authenticated: bool,
+        iterations: u32,
+        salt: [u8; crate::auth::SALT_SIZE],
+    ) -> Vec<ReadResult> {
+        let mut payload = [0u8; crate::protocol::AUTH_INFO_LENGTH];
+        payload[0] = (configured as u8 * crate::protocol::PASSWORD_CONFIGURED_FLAG)
+            | (authenticated as u8 * crate::protocol::SESSION_AUTHENTICATED_FLAG);
+        payload[1] = crate::auth::KDF_ID;
+        payload[2..6].copy_from_slice(&iterations.to_le_bytes());
+        payload[6..].copy_from_slice(&salt);
+        vec![Ok(FakeTransport::response(
+            request,
+            Status::Ok,
+            &payload,
+            0,
+            crate::protocol::AUTH_INFO_LENGTH as u16,
+        ))]
+    }
+
+    fn auth_challenge_ok(request: &Frame, nonce: [u8; crate::auth::NONCE_SIZE]) -> Vec<ReadResult> {
+        vec![Ok(FakeTransport::response(
+            request,
+            Status::Ok,
+            &nonce,
+            0,
+            crate::protocol::AUTH_CHALLENGE_LENGTH as u16,
+        ))]
+    }
+
+    #[test]
+    fn auth_info_and_password_set_follow_open_wire_contract() {
+        let mut auth_info_calls = 0;
+        let mut new_salt = [0u8; crate::auth::SALT_SIZE];
+        let mut client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_calls += 1;
+                    let (configured, authenticated, iterations, salt) = if auth_info_calls == 1 {
+                        (
+                            false,
+                            false,
+                            crate::auth::DEFAULT_ITERATIONS,
+                            [0; crate::auth::SALT_SIZE],
+                        )
+                    } else {
+                        (true, false, crate::auth::DEFAULT_ITERATIONS, new_salt)
+                    };
+                    auth_info_ok(request, configured, authenticated, iterations, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::PasswordSet => {
+                    let offset = read_u16(request, OFFSET_OFFSET);
+                    if offset == 0 {
+                        new_salt.copy_from_slice(
+                            &request
+                                [PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 4 + crate::auth::SALT_SIZE],
+                        );
+                    }
+                    let payload_length = request[PAYLOAD_LENGTH_OFFSET] as u16;
+                    vec![ok_response(
+                        request,
+                        offset + payload_length,
+                        PASSWORD_SET_LENGTH as u16,
+                    )]
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+
+        client.set_password("fixture-new-password").unwrap();
+        assert!(client.is_protected());
+        assert!(!client.is_authenticated());
+
+        let writes = &client.transport_mut().writes;
+        assert_eq!(writes.len(), 5);
+        assert_eq!(writes[0][OPCODE_OFFSET], Opcode::AuthInfo as u8);
+        assert_eq!(writes[4][OPCODE_OFFSET], Opcode::AuthInfo as u8);
+        assert_eq!(
+            writes[1..4]
+                .iter()
+                .map(|frame| (
+                    frame[REQUEST_ID_OFFSET],
+                    read_u16(frame, OFFSET_OFFSET),
+                    frame[PAYLOAD_LENGTH_OFFSET],
+                    read_u16(frame, TOTAL_LENGTH_OFFSET),
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 22, 52), (1, 22, 22, 52), (1, 44, 8, 52)]
+        );
+        assert!(writes[1..4]
+            .iter()
+            .all(|frame| frame[VERSION_OFFSET] == crate::protocol::VERSION
+                && frame[SLOT_OFFSET] == crate::protocol::AUTH_SLOT
+                && frame[PAYLOAD_OFFSET + frame[PAYLOAD_LENGTH_OFFSET] as usize..]
+                    .iter()
+                    .all(|byte| *byte == 0)));
+        assert!(writes[1][PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 20]
+            .iter()
+            .any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn authenticate_derives_nfc_password_and_sends_one_proof() {
+        let salt = [0x31; crate::auth::SALT_SIZE];
+        let nonce_bytes = [0x41; crate::auth::NONCE_SIZE];
+        let expected = Credential::derive("fixture-password", salt, crate::auth::MIN_ITERATIONS)
+            .unwrap()
+            .proof(&crate::auth::Nonce::from_wire(nonce_bytes).unwrap());
+        let expected_bytes = *expected.as_bytes();
+
+        let mut client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_ok(request, true, false, crate::auth::MIN_ITERATIONS, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::AuthChallenge => auth_challenge_ok(request, nonce_bytes)
+                    .into_iter()
+                    .collect(),
+                Opcode::AuthProve => {
+                    assert_eq!(
+                        &request
+                            [PAYLOAD_OFFSET..PAYLOAD_OFFSET + crate::protocol::AUTH_PROVE_LENGTH],
+                        &expected_bytes
+                    );
+                    vec![ok_response(request, 0, 0)]
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+
+        client.authenticate("fixture-password").unwrap();
+        assert!(client.is_protected());
+        assert!(client.is_authenticated());
+        assert_eq!(
+            client
+                .transport_mut()
+                .writes
+                .iter()
+                .map(|frame| frame[OPCODE_OFFSET])
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::AuthInfo as u8,
+                Opcode::AuthChallenge as u8,
+                Opcode::AuthProve as u8
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_remote_errors_and_prove_timeout_are_not_retried() {
+        let salt = [0x32; crate::auth::SALT_SIZE];
+        let nonce = [0x42; crate::auth::NONCE_SIZE];
+        let mut failed = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_ok(request, true, false, crate::auth::MIN_ITERATIONS, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::AuthChallenge => auth_challenge_ok(request, nonce).into_iter().collect(),
+                Opcode::AuthProve => vec![Ok(FakeTransport::response(
+                    request,
+                    Status::AuthFailed,
+                    &[],
+                    0,
+                    0,
+                ))],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            failed.authenticate("fixture-wrong-password"),
+            Err(ClientError::Remote(Status::AuthFailed))
+        );
+        assert_eq!(failed.transport_mut().writes.len(), 3);
+        assert!(!failed.is_authenticated());
+
+        let mut timed_out = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_ok(request, true, false, crate::auth::MIN_ITERATIONS, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::AuthChallenge => auth_challenge_ok(request, nonce).into_iter().collect(),
+                Opcode::AuthProve => vec![Err(TransportError::Timeout)],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            timed_out.authenticate("fixture-password"),
+            Err(ClientError::Transport(TransportError::Timeout))
+        );
+        assert_eq!(timed_out.transport_mut().writes.len(), 3);
+        assert!(!timed_out.is_authenticated());
+    }
+
+    #[test]
+    fn challenge_timeout_restarts_challenge_and_rate_limit_stops_immediately() {
+        let salt = [0x33; crate::auth::SALT_SIZE];
+        let mut timeout_client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_ok(request, true, false, crate::auth::MIN_ITERATIONS, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::AuthChallenge => vec![Err(TransportError::Timeout)],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            timeout_client.authenticate("fixture-password"),
+            Err(ClientError::Transport(TransportError::Timeout))
+        );
+        assert_eq!(timeout_client.transport_mut().writes.len(), 5);
+
+        let mut rate_limited = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_ok(request, true, false, crate::auth::MIN_ITERATIONS, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::AuthChallenge => vec![Ok(FakeTransport::response(
+                    request,
+                    Status::RateLimited,
+                    &[],
+                    0,
+                    0,
+                ))],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            rate_limited.authenticate("fixture-password"),
+            Err(ClientError::Remote(Status::RateLimited))
+        );
+        assert_eq!(rate_limited.transport_mut().writes.len(), 2);
+
+        let mut no_challenge = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthChallenge => vec![Ok(FakeTransport::response(
+                    request,
+                    Status::AuthNoChallenge,
+                    &[],
+                    0,
+                    0,
+                ))],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert!(matches!(
+            no_challenge.auth_challenge(),
+            Err(ClientError::Remote(Status::AuthNoChallenge))
+        ));
+        assert_eq!(no_challenge.transport_mut().writes.len(), 1);
+    }
+
+    #[test]
+    fn password_set_storage_failure_preserves_session_and_lost_ack_is_not_repeated() {
+        let salt = [0x34; crate::auth::SALT_SIZE];
+        let mut calls = 0;
+        let mut storage_error = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_ok(request, true, true, crate::auth::MIN_ITERATIONS, salt)
+                        .into_iter()
+                        .collect()
+                }
+                Opcode::PasswordSet => {
+                    calls += 1;
+                    if calls == 3 {
+                        vec![Ok(FakeTransport::response(
+                            request,
+                            Status::StorageError,
+                            &[],
+                            0,
+                            0,
+                        ))]
+                    } else {
+                        let offset = read_u16(request, OFFSET_OFFSET);
+                        vec![ok_response(
+                            request,
+                            offset + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                            PASSWORD_SET_LENGTH as u16,
+                        )]
+                    }
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            storage_error.set_password("fixture-new-password"),
+            Err(ClientError::Remote(Status::StorageError))
+        );
+        assert!(storage_error.is_authenticated());
+        assert_eq!(storage_error.transport_mut().writes.len(), 4);
+
+        let mut lost_ack_calls = 0;
+        let mut lost_ack = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => auth_info_ok(
+                    request,
+                    false,
+                    false,
+                    crate::auth::DEFAULT_ITERATIONS,
+                    [0; crate::auth::SALT_SIZE],
+                )
+                .into_iter()
+                .collect(),
+                Opcode::PasswordSet => {
+                    lost_ack_calls += 1;
+                    if lost_ack_calls == 3 {
+                        vec![Err(TransportError::Timeout)]
+                    } else {
+                        let offset = read_u16(request, OFFSET_OFFSET);
+                        vec![ok_response(
+                            request,
+                            offset + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                            PASSWORD_SET_LENGTH as u16,
+                        )]
+                    }
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            lost_ack.set_password("fixture-new-password"),
+            Err(ClientError::Transport(TransportError::Timeout))
+        );
+        assert_eq!(lost_ack.transport_mut().writes.len(), 5);
+        assert!(!lost_ack.is_protected());
+        assert_eq!(
+            lost_ack
+                .transport_mut()
+                .writes
+                .iter()
+                .filter(|frame| frame[OPCODE_OFFSET] == Opcode::PasswordSet as u8)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn password_set_final_timeout_recovers_from_matching_auth_info() {
+        let old_salt = [0x35; crate::auth::SALT_SIZE];
+        let mut auth_info_calls = 0;
+        let mut password_set_calls = 0;
+        let mut new_salt = [0u8; crate::auth::SALT_SIZE];
+        let mut client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_calls += 1;
+                    if auth_info_calls == 1 {
+                        auth_info_ok(request, true, true, crate::auth::MIN_ITERATIONS, old_salt)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        auth_info_ok(
+                            request,
+                            true,
+                            false,
+                            crate::auth::DEFAULT_ITERATIONS,
+                            new_salt,
+                        )
+                        .into_iter()
+                        .collect()
+                    }
+                }
+                Opcode::PasswordSet => {
+                    password_set_calls += 1;
+                    let offset = read_u16(request, OFFSET_OFFSET);
+                    if offset == 0 {
+                        new_salt.copy_from_slice(
+                            &request
+                                [PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 4 + crate::auth::SALT_SIZE],
+                        );
+                    }
+                    if password_set_calls == 3 {
+                        vec![Err(TransportError::Timeout)]
+                    } else {
+                        vec![ok_response(
+                            request,
+                            offset + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                            PASSWORD_SET_LENGTH as u16,
+                        )]
+                    }
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+
+        client.set_password("fixture-new-password").unwrap();
+        assert!(client.is_protected());
+        assert!(!client.is_authenticated());
+        assert_eq!(
+            client
+                .transport_mut()
+                .writes
+                .iter()
+                .filter(|frame| frame[OPCODE_OFFSET] == Opcode::AuthInfo as u8)
+                .count(),
+            2
+        );
+        assert_eq!(
+            client
+                .transport_mut()
+                .writes
+                .iter()
+                .filter(|frame| frame[OPCODE_OFFSET] == Opcode::PasswordSet as u8)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn password_set_final_ack_shape_is_resolved_without_replaying_chunk() {
+        let old_salt = [0x36; crate::auth::SALT_SIZE];
+        let mut auth_info_calls = 0;
+        let mut password_set_calls = 0;
+        let mut new_salt = [0u8; crate::auth::SALT_SIZE];
+        let mut client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_calls += 1;
+                    if auth_info_calls == 1 {
+                        auth_info_ok(request, true, true, crate::auth::MIN_ITERATIONS, old_salt)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        auth_info_ok(
+                            request,
+                            true,
+                            false,
+                            crate::auth::DEFAULT_ITERATIONS,
+                            new_salt,
+                        )
+                        .into_iter()
+                        .collect()
+                    }
+                }
+                Opcode::PasswordSet => {
+                    password_set_calls += 1;
+                    let offset = read_u16(request, OFFSET_OFFSET);
+                    if offset == 0 {
+                        new_salt.copy_from_slice(
+                            &request
+                                [PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 4 + crate::auth::SALT_SIZE],
+                        );
+                    }
+                    let payload_length = request[PAYLOAD_LENGTH_OFFSET] as u16;
+                    let acknowledged_offset = if password_set_calls == 3 {
+                        offset
+                    } else {
+                        offset + payload_length
+                    };
+                    vec![ok_response(
+                        request,
+                        acknowledged_offset,
+                        PASSWORD_SET_LENGTH as u16,
+                    )]
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+
+        client.set_password("fixture-new-password").unwrap();
+        assert!(client.is_protected());
+        assert!(!client.is_authenticated());
+        assert_eq!(client.transport_mut().writes.len(), 5);
+        assert_eq!(
+            client.transport_mut().writes[4][OPCODE_OFFSET],
+            Opcode::AuthInfo as u8
+        );
+    }
+
+    #[test]
+    fn password_set_confirmation_failure_clears_local_authentication() {
+        let old_salt = [0x37; crate::auth::SALT_SIZE];
+        let mut auth_info_calls = 0;
+        let mut password_set_calls = 0;
+        let mut client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_calls += 1;
+                    if auth_info_calls == 1 {
+                        auth_info_ok(request, true, true, crate::auth::MIN_ITERATIONS, old_salt)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        vec![Err(TransportError::Timeout)]
+                    }
+                }
+                Opcode::PasswordSet => {
+                    password_set_calls += 1;
+                    let offset = read_u16(request, OFFSET_OFFSET);
+                    if password_set_calls == 3 {
+                        vec![Err(TransportError::Timeout)]
+                    } else {
+                        vec![ok_response(
+                            request,
+                            offset + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                            PASSWORD_SET_LENGTH as u16,
+                        )]
+                    }
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+
+        assert_eq!(
+            client.set_password("fixture-new-password"),
+            Err(ClientError::Transport(TransportError::Timeout))
+        );
+        assert!(client.is_protected());
+        assert!(!client.is_authenticated());
+    }
+
+    #[test]
+    fn malformed_auth_info_clears_previous_authenticated_state() {
+        let salt = [0x38; crate::auth::SALT_SIZE];
+        let mut auth_info_calls = 0;
+        let mut client = client_with_handler(
+            move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => {
+                    auth_info_calls += 1;
+                    if auth_info_calls == 1 {
+                        auth_info_ok(request, true, true, crate::auth::MIN_ITERATIONS, salt)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        let mut malformed =
+                            auth_info_ok(request, true, true, crate::auth::MIN_ITERATIONS, salt)
+                                .pop()
+                                .unwrap()
+                                .unwrap();
+                        malformed[PAYLOAD_OFFSET] = 0x80;
+                        vec![Ok(malformed)]
+                    }
+                }
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+
+        client.auth_info().unwrap();
+        assert!(client.is_authenticated());
+        assert_eq!(
+            client.auth_info(),
+            Err(ClientError::Protocol(ProtocolError::InvalidAuthFlags {
+                flags: 0x80
+            }))
+        );
+        assert!(client.is_protected());
+        assert!(!client.is_authenticated());
+    }
+
+    #[test]
+    fn protected_macro_error_is_not_retried_and_empty_password_writes_nothing() {
+        let mut client = client_with_handler(
+            |request| {
+                vec![Ok(FakeTransport::response(
+                    request,
+                    Status::AuthRequired,
+                    &[],
+                    0,
+                    0,
+                ))]
+            },
+            3,
+        );
+        assert_eq!(
+            client.list_slots(),
+            Err(ClientError::Remote(Status::AuthRequired))
+        );
+        assert_eq!(client.transport_mut().writes.len(), 1);
+
+        let mut empty = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::AuthInfo => auth_info_ok(
+                    request,
+                    false,
+                    false,
+                    crate::auth::DEFAULT_ITERATIONS,
+                    [0; crate::auth::SALT_SIZE],
+                )
+                .into_iter()
+                .collect(),
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert_eq!(
+            empty.set_password(""),
+            Err(ClientError::Auth(crate::error::AuthError::EmptyPassword))
+        );
+        assert_eq!(empty.transport_mut().writes.len(), 1);
     }
 
     #[test]
@@ -783,11 +1643,11 @@ mod tests {
         client.set_slot(7, &[b'A'; 23]).unwrap();
         assert_eq!(
             client.transport_mut().writes[0][..10],
-            [1, 3, 0, 0, 7, 22, 0, 0, 23, 0]
+            [crate::protocol::VERSION, 3, 0, 0, 7, 22, 0, 0, 23, 0]
         );
         assert_eq!(
             client.transport_mut().writes[1][..10],
-            [1, 3, 0, 0, 7, 1, 22, 0, 23, 0]
+            [crate::protocol::VERSION, 3, 0, 0, 7, 1, 22, 0, 23, 0]
         );
         assert!(client.transport_mut().writes.iter().all(|frame| frame
             [PAYLOAD_OFFSET + frame[PAYLOAD_LENGTH_OFFSET] as usize..]
@@ -1117,7 +1977,7 @@ mod tests {
         let mut version_client = client_with_handler(
             |request| {
                 let mut response = FakeTransport::response(request, Status::Ok, &[], 0, 0);
-                response[VERSION_OFFSET] = 2;
+                response[VERSION_OFFSET] = 1;
                 vec![Ok(response)]
             },
             0,

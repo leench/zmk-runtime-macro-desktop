@@ -2,7 +2,7 @@
 
 ## 1. 项目定位
 
-这是 `zmk-module-runtime-macro` 的跨平台桌面配置客户端，用于通过设备的专用 runtime macro USB HID interface 配置 runtime macro slots；该 interface 默认使用 HID_1，也可由固件配置为其他未占用的 HID instance。
+这是 `zmk-module-runtime-macro` 的跨平台桌面配置客户端，用于通过设备的专用 runtime macro USB HID interface 配置 runtime macro slots；该 interface 默认使用 HID_1，也可由固件配置为其他未占用的 HID instance。桌面端管理流程只支持 v2 认证协议，不提供 Legacy v1 管理，也不会静默降级。
 
 首版目标平台：
 
@@ -10,27 +10,39 @@
 - macOS Intel 和 Apple Silicon；
 - Windows x64。
 
-GUI 只负责配置已有固件功能，不修改 ZMK 主仓库，也不改变当前 v1 wire protocol。
+GUI 只负责配置已有固件功能，不修改 ZMK 主仓库。宏管理使用 v2 wire protocol；检测到旧 v1 固件时只显示不兼容提示，不执行未认证的宏管理。
 
-当前状态：阶段 1–5 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表、宏编辑 UI、自动重连、连接设置和低调诊断；阶段 6 的跨平台打包配置已实现，待各平台 runner 验证。
+当前状态：阶段 1–5 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表、宏编辑 UI、自动重连、连接设置和低调诊断；阶段 6 的跨平台打包配置已实现，待各平台 runner 验证。另，v2 认证协议/密码学后端基础、可测试认证 session 和 fake HID golden tests 已完成，认证 command/UI 接入仍需后续阶段推进。
 
 ## 2. 固件和协议约束
 
-GUI 必须遵守现有 `docs/PROTOCOL.md` 和 `docs/CLI.md` 中的约定：
+GUI 必须遵守现有 `docs/PROTOCOL.md`、`docs/CLI.md` 和 v2 认证契约中的约定：
 
 - 使用专用的 runtime macro USB HID interface；默认设备名为 `HID_1`，也可由固件配置为其他未占用的 HID instance；ZMK 键盘接口 `HID_0` 保持不变；
 - 每个 request/response 固定为 32 bytes；
-- `LIST`、`GET`、`SET`、`CLEAR` 是首版支持的全部命令；
+- v2 的宏命令为 `LIST`、`GET`、`SET`、`CLEAR`；认证管理使用 `AUTH_INFO`、`AUTH_CHALLENGE`、`AUTH_PROVE`、`PASSWORD_SET`、`LOCK`；
 - `SET` 使用每块 22 bytes 的 payload，完整事务完成前不会替换 slot；
 - slot 数量通过 `LIST` 获取，不能在 GUI 中写死为 8；
 - 宏内容只允许 printable US ASCII（`0x20..0x7e`）、LF、Tab、Backspace；
 - 固件最大长度由 `CONFIG_ZMK_RUNTIME_MACRO_MAX_TEXT_LEN` 决定，协议范围上限为 256 bytes，但当前协议不会返回设备实际配置值；
-- 固件执行宏的 `CONFIG_ZMK_RUNTIME_MACRO_TAP_MS` 和 `CONFIG_ZMK_RUNTIME_MACRO_WAIT_MS` 是编译时配置；当前 v1 没有 capability 或设置命令，桌面端不读取也不修改它们；
+- 固件执行宏的 `CONFIG_ZMK_RUNTIME_MACRO_TAP_MS` 和 `CONFIG_ZMK_RUNTIME_MACRO_WAIT_MS` 是编译时配置；当前 v2 没有 capability 或设置命令，桌面端不读取也不修改它们；
 - 宏通过键盘事件执行，主机键盘布局可能影响标点结果；
-- USB 配置通道没有认证和加密，本机上能够访问 HID interface 的程序都可能修改 slots；
+- v2 USB 配置通道不加密；`OPEN` 状态下本机上能够访问 HID interface 的程序都可能修改 slots，`PROTECTED` 状态下宏管理命令需要有效认证窗口；
 - 固件是 RAM-first。返回 `STORAGE_ERROR` 时，内存中的新值可能已经生效，但 Flash/NVS 持久化失败。
 
 GUI 的界面语言可以使用中文或英文，但宏内容本身不支持中文、Emoji 或其他 Unicode。
+
+### 阶段 1：v2 认证协议/密码学后端基础
+
+阶段 1 的实现位于 `src-tauri/src/protocol.rs`、`auth.rs` 和 `client.rs`，只提供后续 Tauri command 可以调用的 Rust 后端能力，不实现 command 或 React UI：
+
+- v2 固定 32-byte frame、22-byte payload、认证 opcode/status、`AUTH_INFO`/`AUTH_CHALLENGE`/`AUTH_PROVE`/`PASSWORD_SET`/`LOCK` 的 canonical 构帧和严格 response 校验；
+- 密码先做 Unicode NFC，再编码 UTF-8；新凭据使用操作系统 CSPRNG 生成 16-byte salt，PBKDF2-HMAC-SHA256 600000 次迭代得到 32-byte `K`；proof 为指定 domain 与一次性 nonce 的 HMAC-SHA256 前 16 bytes；
+- `Credential`、nonce、proof 和认证 request frame 不实现日志/序列化接口，并在生命周期结束时清零敏感 buffer；本地认证 session 只保留 device-authoritative 状态，原始密码只作为调用参数，不进入错误或 DTO；
+- `PASSWORD_SET` 严格使用 52-byte 对象和 22-byte chunks，单一 request ID；最终 OK 或结果不确定时都通过新的 `AUTH_INFO` 确认新 salt/iterations，认证 status response 不走宏事务重试，最终 ACK 丢失时不重复发送旧 chunk；
+- fake HID golden tests 覆盖 canonical frame、认证状态/错误、NFC/KDF/proof、challenge/nonce、超时、限速、认证失败、storage failure 和 password-set ACK 边界。
+
+协议文档规定的 5 分钟认证窗口、30 秒 challenge 生命周期和限速计时由固件维护；桌面端只根据 `AUTH_INFO` 与认证错误状态更新本地 session，不在客户端猜测设备时间。
 
 ## 3. 推荐技术栈
 
@@ -155,7 +167,7 @@ Hello, world! ↵
 
 ## 4.6 阶段 4 已确认 Art Direction
 
-本节记录用户已确认、阶段 4 实现必须遵守的视觉和交互规范。若本节与 Tauri、浏览器或 v1 协议的具体能力冲突，以实际平台行为为准，并在实现说明中记录偏差。
+本节记录用户已确认、阶段 4 实现必须遵守的视觉和交互规范。若本节与 Tauri、浏览器或 v2 协议的具体能力冲突，以实际平台行为为准，并在实现说明中记录偏差。
 
 ### 产品定位和总体方向
 
@@ -168,7 +180,7 @@ Hello, world! ↵
 
 ### 实际协议边界
 
-v1 wire protocol 没有 slot name 字段，只有 slot 编号、正文和 byte length。因此界面中的 `Password`、`VPN`、`Server` 等名称是本机 UI label：不写入键盘、不参与宏执行，并在输入框下明确标注 `Local label · not written to the keyboard`。如果持久化标签，只允许保存标签本身，并以 VID/PID/interface/Usage 等安全摘要作为 key；不得保存 macro 正文。清空 macro 只清空固件正文，保留本机 label。
+v2 wire protocol 没有 slot name 字段，只有 slot 编号、正文和 byte length。因此界面中的 `Password`、`VPN`、`Server` 等名称是本机 UI label：不写入键盘、不参与宏执行，并在输入框下明确标注 `Local label · not written to the keyboard`。如果持久化标签，只允许保存标签本身，并以 VID/PID/interface/Usage 等安全摘要作为 key；不得保存 macro 正文。清空 macro 只清空固件正文，保留本机 label。
 
 宏正文默认隐藏。只有用户主动点击 Reveal 后才显示并可编辑；slot 列表、状态、错误、tooltip、日志和持久化数据都不得包含正文。当前实现使用单字符可视 token 编辑：LF 为 `↵`、Tab 为 `⇥`、Backspace 为 `⌫`；保存时转换回实际协议 byte。Enter 和 Tab 会插入对应 token，工具栏提供三类控制字符插入按钮，普通 Backspace 仍用于删除 token。这样避免不可见 byte 被静默丢失；不支持的 Unicode 会显示本地校验错误。
 
@@ -360,7 +372,7 @@ Dark Theme：
 
 诊断区域默认折叠，不增加 Dashboard 或统计卡片，只显示白名单安全摘要：
 
-- Runtime Macro protocol v1 和 USB HID transport；
+- Runtime Macro protocol v2 和 USB HID transport；
 - 当前连接状态、脱敏产品名、VID/PID、interface number 和 Usage Page/Usage；
 - 动态 slot count；
 - 最近一次白名单操作（`Discover`、`Connect`、`Disconnect`、`LIST`、`GET`、`SET`、`CLEAR`、`Settings`）；
@@ -378,7 +390,7 @@ Rust command layer
    ▼
 串行化 HID session
    ▼
-Runtime Macro protocol v1
+Runtime Macro protocol v2
    ▼
 hidapi
    ▼
@@ -457,20 +469,17 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="<vendor-id>", ATTRS{idProduct}=="<product
 
 ## 8. 实施阶段
 
-1. 将现有 Python v1 客户端行为移植为 Rust 协议/传输模块；
-2. 加入 fake HID 和协议 golden tests；
-3. 实现设备发现、连接状态和 slot 列表；
-4. 实现控制字符编辑器和保存/清空流程；
-5. 加入错误提示、自动重连和诊断界面；
-6. 配置 Linux/macOS/Windows 打包；
-7. 在三平台和真实键盘上完成硬件验证。
+1. 实现 v2 认证协议、密码学基础和 fake HID golden tests；
+2. 实现 Tauri session/auth commands 和前端 bridge 状态模型；
+3. 按已确认的 MagicPatterns 新视觉实现完整 UI，编译并打开桌面应用供用户验收；获得视觉确认后才提交；
+4. 整合隐私预览设置、错误恢复、认证过期和 `LOCK`；
+5. 完善文档，完成跨平台构建和最终验证。
 
 ## 开发流程门禁与协作约定
 
-- 每个实施阶段完成后由主代理审核；审核通过后按当前授权自动 commit 并 push。
-- 用户已确认阶段 4 Art Direction，并授权后续阶段默认由 worker 实现、主代理审核；审核通过后自动提交、推送并继续，不再逐阶段等待确认，直到项目完成。
+- 主代理制定每个实施阶段的计划并负责审核；worker 负责实现、修改、测试和文档落盘。
+- 每阶段审核通过后，由主代理负责 commit 并 push，然后暂停并明确询问用户是否继续；未经用户明确确认，不得开始下一阶段。
 - 开始阶段 4 前，必须先与用户讨论并确认 GUI 的 UI 视觉审美和 Art Direction。该门禁已于阶段 4 开始前完成；讨论范围包括视觉语言、配色、字体、布局密度、组件形态、状态反馈、平台一致性和参考产品。
-- 主代理负责计划和审核，worker 负责实现、修改、测试和文档落盘。
 - 本项目是公开项目。代码、测试、文档、日志和诊断不得包含真实 HID path、设备序列号、用户名、设备拓扑或其他本机隐私信息；示例仅使用明显虚构的值，例如 `Example Keyboard` 和 `<EXAMPLE-HID-PATH>`。
 
 ## 9. 后续功能
@@ -483,4 +492,4 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="<vendor-id>", ATTRS{idProduct}=="<product
 - 多设备配置切换；
 - 协议 v2 的 capability/firmware information 命令。
 
-这些功能不应改变当前 v1 协议的兼容性。
+后续功能不得削弱 v2 认证安全边界；Legacy v1 不属于桌面端管理范围。
