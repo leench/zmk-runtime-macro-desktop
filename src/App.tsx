@@ -234,6 +234,7 @@ function makeSlotState(metadata: SlotMetadata, labels: Record<number, string>, p
     draftLabel: label,
     loaded: metadata.length === 0,
     loading: false,
+    previewLoading: false,
     revealed: false,
     status: "idle",
     error: null,
@@ -301,12 +302,29 @@ function App() {
   const autoReconnectEnabledRef = useRef(false);
   const autoReconnectInFlightRef = useRef(false);
   const missingDevicePollsRef = useRef(0);
+  const slotsRef = useRef<SlotState[]>(slots);
+  const previewGenerationRef = useRef(0);
+  const protocolOperationQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   selectedSlotRef.current = selectedSlot;
   connectionRef.current = connection;
   dirtyRef.current = slots.some(isDirty);
   busyRef.current = busy;
+  slotsRef.current = slots;
 
   const recordOperation = useCallback((name: string) => setLastOperation(name), []);
+
+  const enqueueProtocolOperation = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const queued = protocolOperationQueueRef.current.then(operation, operation);
+    protocolOperationQueueRef.current = queued.then(() => undefined, () => undefined);
+    return queued;
+  }, []);
+
+  const cancelPreviewLoads = useCallback(() => {
+    previewGenerationRef.current += 1;
+    setSlots((previous) => previous.map((slot) => slot.previewLoading
+      ? { ...slot, loading: false, previewLoading: false }
+      : slot));
+  }, []);
 
   const clearAuthDeadline = useCallback(() => {
     authDeadlineRef.current = null;
@@ -336,30 +354,103 @@ function App() {
     if (nextAuthState) {
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
       clearAuthDeadline();
+      cancelPreviewLoads();
       hideRevealed();
     } else if (dropsConnection(error.code)) {
       setConnection(disconnected);
       clearAuthDeadline();
+      cancelPreviewLoads();
       hideRevealed();
       autoReconnectEnabledRef.current = error.code !== "bad_version";
       missingDevicePollsRef.current = 0;
     }
-  }, [clearAuthDeadline, hideRevealed]);
+  }, [cancelPreviewLoads, clearAuthDeadline, hideRevealed]);
 
-  const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean) => {
-    setSlots((previous) => metadata.map((item) => makeSlotState(item, nextLabels, previous.find((slot) => slot.slot === item.slot), preserveDirty)));
+  const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean): SlotState[] => {
+    const nextSlots = metadata.map((item) => makeSlotState(item, nextLabels, slotsRef.current.find((slot) => slot.slot === item.slot), preserveDirty));
+    slotsRef.current = nextSlots;
+    setSlots(nextSlots);
     setSelectedSlot((current) => current !== null && metadata.some((item) => item.slot === current) ? current : metadata[0]?.slot ?? null);
     setClearConfirm(null);
+    return nextSlots;
   }, []);
 
+  const preloadSlotPreviews = useCallback(async (
+    metadata: SlotMetadata[],
+    generation: number,
+    initialSlots: SlotState[],
+    selectedSlotNumber: number | null,
+    connectionKey: string | null,
+  ) => {
+    let snapshot = initialSlots;
+    const isCurrentPreviewContext = () => mounted.current
+      && generation === previewGenerationRef.current
+      && canManage(connectionRef.current)
+      && deviceSummaryKey(connectionRef.current.device) === connectionKey;
+
+    for (const item of metadata) {
+      const current = snapshot.find((slot) => slot.slot === item.slot);
+      if (!current || item.slot === selectedSlotNumber || item.length === 0 || current.loaded || current.loading || current.error || isDirty(current)) continue;
+      if (!isCurrentPreviewContext()) return;
+
+      snapshot = snapshot.map((slot) => slot.slot === item.slot
+        ? { ...slot, loading: true, previewLoading: true, error: null, lastAction: null }
+        : slot);
+      setSlots((previous) => previous.map((slot) => {
+        if (slot.slot !== item.slot || slot.loaded || slot.loading || slot.error || isDirty(slot)) return slot;
+        return { ...slot, loading: true, previewLoading: true, error: null, lastAction: null };
+      }));
+
+      try {
+        const bytes = await enqueueProtocolOperation(async () => {
+          if (!isCurrentPreviewContext()) return null;
+          return getSlot(item.slot);
+        });
+        if (bytes === null) return;
+        const text = decodeSlotBytes(bytes);
+        if (text === null) throw { code: "invalid_text", message: "" } satisfies CommandError;
+        if (!isCurrentPreviewContext()) return;
+        snapshot = snapshot.map((slot) => slot.slot === item.slot
+          ? { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, previewLoading: false, revealed: false, status: "idle", error: null, lastAction: null }
+          : slot);
+        setSlots((previous) => previous.map((slot) => {
+          if (slot.slot !== item.slot || !slot.previewLoading) return slot;
+          if (isDirty(slot)) return { ...slot, loading: false, previewLoading: false };
+          return { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, previewLoading: false, revealed: false, status: "idle", error: null, lastAction: null };
+        }));
+      } catch (caught) {
+        // Check generation and the safe device summary before mapping the
+        // result. A canceled request must not affect a newer connection.
+        if (!isCurrentPreviewContext()) return;
+        setSlots((previous) => previous.map((slot) => slot.slot === item.slot && slot.previewLoading
+          ? { ...slot, loading: false, previewLoading: false }
+          : slot));
+        const error = asCommandError(caught);
+        if (authStateForErrorCode(error.code) || dropsConnection(error.code)) {
+          applyErrorState(commandError(caught));
+          return;
+        }
+        // A remote non-auth error leaves the session usable. Keep this row
+        // safely masked and continue best-effort loading of later rows.
+      }
+    }
+  }, [applyErrorState, commandError, enqueueProtocolOperation]);
+
   const loadSlots = useCallback(async (sequence: number, nextLabels: Record<number, string>, preserveDirty: boolean): Promise<boolean> => {
+    cancelPreviewLoads();
     recordOperation("LIST");
-    const metadata = await listSlots();
+    const metadata = await enqueueProtocolOperation(() => listSlots());
     if (!mounted.current || operation.current !== sequence) return false;
-    mergeSlotMetadata(metadata, nextLabels, preserveDirty);
+    const nextSlots = mergeSlotMetadata(metadata, nextLabels, preserveDirty);
+    const generation = previewGenerationRef.current;
+    const selectedSlotNumber = selectedSlotRef.current !== null && metadata.some((item) => item.slot === selectedSlotRef.current)
+      ? selectedSlotRef.current
+      : metadata[0]?.slot ?? null;
+    const connectionKey = deviceSummaryKey(connectionRef.current.device);
+    void preloadSlotPreviews(metadata, generation, nextSlots, selectedSlotNumber, connectionKey);
     markAuthenticatedActivity();
     return true;
-  }, [markAuthenticatedActivity, mergeSlotMetadata, recordOperation]);
+  }, [cancelPreviewLoads, enqueueProtocolOperation, markAuthenticatedActivity, mergeSlotMetadata, preloadSlotPreviews, recordOperation]);
 
   const refreshDevices = useCallback(async () => {
     const sequence = ++operation.current;
@@ -406,6 +497,7 @@ function App() {
         if (nextConnection.authState === "open" && !priorConnected) setSetupOpen(true);
       } else {
         clearAuthDeadline();
+        cancelPreviewLoads();
         hideRevealed();
       }
       if (!nextConnection.connected && nextDevices.length === 0) {
@@ -424,12 +516,13 @@ function App() {
         setRefreshing(false);
       }
     }
-  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
+  }, [applyErrorState, cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const connectDevice = useCallback(async (id: string, automaticReconnect = false) => {
     const sequence = ++operation.current;
     autoReconnectEnabledRef.current = automaticReconnect;
     clearAuthDeadline();
+    cancelPreviewLoads();
     setSelectedId(id);
     setChecking(true);
     setBusy(true);
@@ -480,7 +573,7 @@ function App() {
         setBusy(false);
       }
     }
-  }, [clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
+  }, [cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const requestDeviceConnect = useCallback((id: string) => {
     const candidate = devices.find((item) => item.id === id);
@@ -496,6 +589,7 @@ function App() {
     const sequence = ++operation.current;
     autoReconnectEnabledRef.current = false;
     missingDevicePollsRef.current = 0;
+    cancelPreviewLoads();
     setBusy(true);
     setErrorCode(null);
     setSetupOpen(false);
@@ -516,7 +610,7 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [clearAuthDeadline, commandError, hideRevealed, recordOperation]);
+  }, [cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, recordOperation]);
 
   const pollDeviceConnection = useCallback(async () => {
     const knownKey = deviceKey.current;
@@ -537,6 +631,7 @@ function App() {
           if (!mounted.current || operation.current !== sequence || deviceKey.current !== knownKey) return;
           setConnection(disconnected);
           clearAuthDeadline();
+          cancelPreviewLoads();
           hideRevealed();
           autoReconnectEnabledRef.current = true;
           missingDevicePollsRef.current = 0;
@@ -554,7 +649,7 @@ function App() {
     } finally {
       autoReconnectInFlightRef.current = false;
     }
-  }, [clearAuthDeadline, connectDevice, hideRevealed]);
+  }, [cancelPreviewLoads, clearAuthDeadline, connectDevice, hideRevealed]);
 
   useEffect(() => {
     if (!inTauri()) return undefined;
@@ -567,6 +662,7 @@ function App() {
     const sequence = ++operation.current;
     authRefreshInFlightRef.current = true;
     authDeadlineRef.current = null;
+    cancelPreviewLoads();
     setAuthRemainingSeconds(0);
     setConnection((current) => current.connected ? { ...current, authState: "locked" } : current);
     setErrorCode("auth_expired");
@@ -592,7 +688,7 @@ function App() {
       .finally(() => {
         authRefreshInFlightRef.current = false;
       });
-  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, markAuthenticatedActivity]);
+  }, [applyErrorState, cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, markAuthenticatedActivity]);
 
   useEffect(() => {
     if (!connection.connected || connection.authState !== "authenticated") {
@@ -625,6 +721,7 @@ function App() {
             if (authDeadlineRef.current === null) markAuthenticatedActivity(true);
             return;
           }
+          cancelPreviewLoads();
           setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
           clearAuthDeadline();
           hideRevealed();
@@ -641,7 +738,7 @@ function App() {
     };
     const timer = window.setInterval(poll, AUTH_SESSION_POLL_MS);
     return () => window.clearInterval(timer);
-  }, [applyErrorState, clearAuthDeadline, commandError, connection.authState, connection.connected, hideRevealed, markAuthenticatedActivity]);
+  }, [applyErrorState, cancelPreviewLoads, clearAuthDeadline, commandError, connection.authState, connection.connected, hideRevealed, markAuthenticatedActivity]);
 
   const refreshSlots = useCallback(async () => {
     if (!canManage(connectionRef.current)) return;
@@ -667,13 +764,14 @@ function App() {
 
   const loadSlotContent = useCallback(async (slotNumber: number) => {
     if (!canManage(connectionRef.current)) return;
+    cancelPreviewLoads();
     const sequence = ++operation.current;
     setBusy(true);
     setInputError(null);
-    setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, loading: true, error: null, lastAction: null } : slot));
+    setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, loading: true, previewLoading: false, error: null, lastAction: null } : slot));
     recordOperation("GET");
     try {
-      const bytes = await getSlot(slotNumber);
+      const bytes = await enqueueProtocolOperation(() => getSlot(slotNumber));
       const text = decodeSlotBytes(bytes);
       if (text === null) {
         const error: CommandError = { code: "invalid_text", message: "" };
@@ -684,18 +782,18 @@ function App() {
       if (!mounted.current || operation.current !== sequence || selectedSlotRef.current !== slotNumber) return;
       setErrorCode(null);
       markAuthenticatedActivity();
-      setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, revealed: false, status: "idle", error: null, lastAction: null, savedAt: slot.savedAt } : slot));
+      setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, previewLoading: false, revealed: false, status: "idle", error: null, lastAction: null, savedAt: slot.savedAt } : slot));
     } catch (caught) {
       if (mounted.current && operation.current === sequence) {
         const error = caught && typeof caught === "object" && "code" in caught ? caught as CommandError : commandError(caught);
         if (error.code !== "invalid_text") commandError(caught);
         applyErrorState(error);
-        setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, loading: false, revealed: false, status: "error", error, lastAction: "load" } : slot));
+        setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, loading: false, previewLoading: false, revealed: false, status: "error", error, lastAction: "load" } : slot));
       }
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, commandError, markAuthenticatedActivity, recordOperation]);
+  }, [applyErrorState, cancelPreviewLoads, commandError, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation]);
 
   useEffect(() => {
     if (!canManage(connection) || selectedSlot === null) return;
@@ -799,7 +897,7 @@ function App() {
     try {
       if (selected.draftText !== selected.savedText) {
         recordOperation("SET");
-        await setSlotCommand(selected.slot, selected.draftText);
+        await enqueueProtocolOperation(() => setSlotCommand(selected.slot, selected.draftText));
       }
       if (!mounted.current || operation.current !== sequence) return;
       setErrorCode(null);
@@ -821,7 +919,7 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, busy, commandError, labels, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
+  }, [applyErrorState, busy, commandError, enqueueProtocolOperation, labels, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
 
   const requestClear = useCallback(() => {
     if (selectedSlot !== null) setClearConfirm(selectedSlot);
@@ -837,7 +935,7 @@ function App() {
     setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, status: "saving", error: null, lastAction: null } : slot));
     try {
       recordOperation("CLEAR");
-      await clearSlotCommand(selected.slot);
+      await enqueueProtocolOperation(() => clearSlotCommand(selected.slot));
       if (!mounted.current || operation.current !== sequence) return;
       const now = new Date().toISOString();
       setErrorCode(null);
@@ -855,7 +953,7 @@ function App() {
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, busy, commandError, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
+  }, [applyErrorState, busy, commandError, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
 
   const retrySelected = useCallback(() => {
     const selected = slots.find((slot) => slot.slot === selectedSlot);
@@ -873,7 +971,7 @@ function App() {
     setErrorCode(null);
     recordOperation("AUTH");
     try {
-      const nextAuthState = await authenticate(password);
+      const nextAuthState = await enqueueProtocolOperation(() => authenticate(password));
       if (!mounted.current) return null;
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
       if (nextAuthState === "authenticated") {
@@ -891,15 +989,16 @@ function App() {
     } finally {
       if (mounted.current) setBusy(false);
     }
-  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, labels, loadSlots, markAuthenticatedActivity, recordOperation]);
+  }, [applyErrorState, clearAuthDeadline, commandError, enqueueProtocolOperation, hideRevealed, labels, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const setPassword = useCallback(async (password: string): Promise<CommandError | null> => {
     if (!connectionRef.current.connected) return { code: "not_connected", message: "" };
+    cancelPreviewLoads();
     setBusy(true);
     setErrorCode(null);
     recordOperation("PASSWORD_SET");
     try {
-      const nextAuthState = await setPasswordCommand(password);
+      const nextAuthState = await enqueueProtocolOperation(() => setPasswordCommand(password));
       if (!mounted.current) return null;
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
       clearAuthDeadline();
@@ -914,16 +1013,17 @@ function App() {
     } finally {
       if (mounted.current) setBusy(false);
     }
-  }, [applyErrorState, clearAuthDeadline, commandError, hideRevealed, recordOperation]);
+  }, [applyErrorState, cancelPreviewLoads, clearAuthDeadline, commandError, enqueueProtocolOperation, hideRevealed, recordOperation]);
 
   const lockManagement = useCallback(async () => {
     if (!connectionRef.current.connected || connectionRef.current.authState !== "authenticated" || busy) return;
+    cancelPreviewLoads();
     setBusy(true);
     setErrorCode(null);
     recordOperation("LOCK");
     hideRevealed();
     try {
-      const nextAuthState = await lockDevice();
+      const nextAuthState = await enqueueProtocolOperation(() => lockDevice());
       if (!mounted.current) return;
       setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
       clearAuthDeadline();
@@ -934,7 +1034,7 @@ function App() {
     } finally {
       if (mounted.current) setBusy(false);
     }
-  }, [applyErrorState, busy, clearAuthDeadline, commandError, hideRevealed, recordOperation]);
+  }, [applyErrorState, busy, cancelPreviewLoads, clearAuthDeadline, commandError, enqueueProtocolOperation, hideRevealed, recordOperation]);
 
   const saveSettings = useCallback(async () => {
     if (!Number.isInteger(settingsDraft.timeoutMs) || settingsDraft.timeoutMs < MIN_TIMEOUT_MS || settingsDraft.timeoutMs > MAX_TIMEOUT_MS) {
@@ -961,8 +1061,8 @@ function App() {
       setPrivacySettings(nextPrivacy);
       setPrivacyDraft(nextPrivacy);
       writePrivacyPreviewSettings(nextPrivacy);
-      setSettingsSaved(true);
-      window.setTimeout(() => setSettingsSaved(false), 2_000);
+      setSettingsSaved(false);
+      setSettingsOpen(false);
     } catch (caught) {
       setSettingsError(commandError(caught));
     } finally {

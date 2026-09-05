@@ -12,6 +12,7 @@ export type SlotState = {
   draftLabel: string;
   loaded: boolean;
   loading: boolean;
+  previewLoading: boolean;
   revealed: boolean;
   status: SlotStatus;
   error: CommandError | null;
