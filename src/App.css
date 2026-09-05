@@ -198,7 +198,8 @@ select:disabled {
   line-height: 16px;
 }
 
-.setting-field input[type="number"] {
+.setting-field input[type="number"],
+.setting-field select {
   width: 100%;
   height: 36px;
   border: 1px solid var(--border);
@@ -206,8 +207,11 @@ select:disabled {
   padding: 0 10px;
   color: var(--primary-text);
   background: var(--elevated-surface);
-  font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", "Segoe UI Mono", monospace;
   font-size: 13px;
+}
+
+.setting-field input[type="number"] {
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", "Segoe UI Mono", monospace;
   font-variant-numeric: tabular-nums;
 }
 
@@ -884,6 +888,45 @@ h2 {
 
 .confirm-row > span {
   margin-right: auto;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 32%);
+}
+
+.close-dialog {
+  width: min(400px, 100%);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 24px;
+  color: var(--primary-text);
+  background: var(--elevated-surface);
+  box-shadow: 0 12px 36px rgb(0 0 0 / 18%);
+}
+
+.close-dialog .eyebrow {
+  margin-bottom: 6px;
+}
+
+.close-dialog h2 {
+  margin-bottom: 8px;
+}
+
+.close-dialog .muted-copy {
+  margin-bottom: 24px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .slot-error {

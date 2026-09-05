@@ -9,6 +9,20 @@ import {
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  getMessages,
+  isLanguagePreference,
+  readLanguagePreference,
+  resolveLocale,
+  translateCommandError,
+  translateInputError,
+  translateSettingsValidation,
+  writeLanguagePreference,
+  type InputErrorKey,
+  type LanguagePreference,
+  type Locale,
+  type SettingsValidationKey,
+} from "./i18n";
+import {
   asCommandError,
   clearSlot as clearSlotCommand,
   connectDevice as connectDeviceCommand,
@@ -99,8 +113,9 @@ function formatSlotNumber(slot: number): string {
   return String(slot + 1).padStart(2, "0");
 }
 
-function defaultLabel(slot: number): string {
-  return `Slot ${formatSlotNumber(slot)}`;
+function defaultLabel(slot: number, locale: Locale): string {
+  const formattedSlot = formatSlotNumber(slot);
+  return locale === "zh-CN" ? `插槽 ${formattedSlot}` : `Slot ${formattedSlot}`;
 }
 
 function textByteLength(text: string): number {
@@ -124,7 +139,7 @@ function normalizeEditorText(value: string): string {
 
 function parseEditorText(value: string):
   | { text: string; error: null }
-  | { text: null; error: string } {
+  | { text: null; error: InputErrorKey } {
   const normalized = normalizeEditorText(value);
   let text = "";
   for (const character of normalized) {
@@ -138,15 +153,14 @@ function parseEditorText(value: string):
     }
     return {
       text: null,
-      error:
-        "Macro text supports printable US ASCII, LF, Tab, and Backspace only.",
+      error: "unsupportedText",
     };
   }
 
   if (textByteLength(text) > MAX_TEXT_BYTES) {
     return {
       text: null,
-      error: "Macro text cannot exceed 256 bytes.",
+      error: "textTooLong",
     };
   }
   return { text, error: null };
@@ -315,20 +329,20 @@ function writeUserSettings(settings: UserSettings): void {
   }
 }
 
-function validateUserSettings(settings: UserSettings): string | null {
+function validateUserSettings(settings: UserSettings): SettingsValidationKey | null {
   if (
     !Number.isInteger(settings.timeoutMs) ||
     settings.timeoutMs < MIN_TIMEOUT_MS ||
     settings.timeoutMs > MAX_TIMEOUT_MS
   ) {
-    return `Request timeout must be an integer from ${MIN_TIMEOUT_MS} to ${MAX_TIMEOUT_MS} ms.`;
+    return "timeout";
   }
   if (
     !Number.isInteger(settings.retries) ||
     settings.retries < 0 ||
     settings.retries > MAX_RETRIES
   ) {
-    return `Retries must be an integer from 0 to ${MAX_RETRIES}.`;
+    return "retries";
   }
   return null;
 }
@@ -351,7 +365,7 @@ function createSlotState(
   previous?: SlotState,
   preserveDirtyDraft = true,
 ): SlotState {
-  const label = labels[metadata.slot] ?? defaultLabel(metadata.slot);
+  const label = labels[metadata.slot] ?? "";
   if (previous && preserveDirtyDraft && isTextDirty(previous)) {
     return {
       ...previous,
@@ -384,15 +398,15 @@ function createSlotState(
   };
 }
 
-function errorMessage(error: CommandError): string {
-  if (error.code === "storage_error") {
-    return "Applied for this session, but could not be saved permanently.";
-  }
-  return error.message;
-}
+type SettingsError = SettingsValidationKey | CommandError;
 
 function App() {
   const [theme, setTheme] = useState<ThemeMode>(readTheme);
+  const [languagePreference, setLanguagePreference] = useState<LanguagePreference>(
+    readLanguagePreference,
+  );
+  const locale: Locale = resolveLocale(languagePreference);
+  const copy = getMessages(locale);
   const [devices, setDevices] = useState<DeviceCandidate[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [connection, setConnection] = useState<ConnectionState>(disconnected);
@@ -403,18 +417,19 @@ function App() {
   const [checking, setChecking] = useState(true);
   const [mutationBusy, setMutationBusy] = useState(false);
   const [error, setError] = useState<CommandError | null>(null);
-  const [inputError, setInputError] = useState<string | null>(null);
+  const [inputError, setInputError] = useState<InputErrorKey | null>(null);
   const [clearConfirm, setClearConfirm] = useState<number | null>(null);
   const [settings, setSettings] = useState<UserSettings>(() => readUserSettings());
   const [settingsDraft, setSettingsDraft] = useState<UserSettings>(() => readUserSettings());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<SettingsError | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [lastOperation, setLastOperation] = useState<OperationName | null>(null);
   const [lastErrorCode, setLastErrorCode] = useState<string | null>(null);
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
   const operation = useRef(0);
   const lastDevice = useRef<ConnectedDevice | null>(null);
@@ -432,6 +447,7 @@ function App() {
   const autoReconnectRef = useRef(settings.autoReconnect);
   const connectionRef = useRef(connection.connected);
   const refreshDevicesRef = useRef<((source?: RefreshSource) => Promise<void>) | null>(null);
+  const closeConfirmOpenRef = useRef(false);
 
   autoReconnectRef.current = settings.autoReconnect;
   connectionRef.current = connection.connected;
@@ -894,7 +910,7 @@ function App() {
     (value: string) => {
       const parsed = parseEditorText(value);
       if (parsed.error || parsed.text === null) {
-        setInputError(parsed.error ?? "Macro text could not be parsed.");
+        setInputError(parsed.error ?? "parseFailed");
         return;
       }
       setInputError(null);
@@ -915,7 +931,7 @@ function App() {
       const nextValue = currentValue.slice(0, start) + token + currentValue.slice(end);
       const parsed = parseEditorText(nextValue);
       if (parsed.error || parsed.text === null) {
-        setInputError(parsed.error ?? "Macro text could not be parsed.");
+        setInputError(parsed.error ?? "parseFailed");
         return;
       }
       setInputError(null);
@@ -1127,9 +1143,7 @@ function App() {
       }
       const currentSlot = slots.find((slot) => slot.slot === selectedSlot);
       if (currentSlot && isDirty(currentSlot)) {
-        const confirmed = window.confirm(
-          "This slot has unsaved changes. Switch slots anyway?",
-        );
+        const confirmed = window.confirm(copy.switchUnsavedMessage);
         if (!confirmed) {
           return;
         }
@@ -1139,7 +1153,7 @@ function App() {
       setClearConfirm(null);
       setInputError(null);
     },
-    [mutationBusy, selectedSlot, slots],
+    [copy.switchUnsavedMessage, mutationBusy, selectedSlot, slots],
   );
 
   const handleEditorKeyDown = useCallback(
@@ -1175,6 +1189,18 @@ function App() {
     setSettingsSaved(false);
   }, []);
 
+  const updateLanguagePreference = useCallback(
+    (event: ChangeEvent<HTMLSelectElement>) => {
+      const nextPreference = event.target.value;
+      if (!isLanguagePreference(nextPreference)) {
+        return;
+      }
+      setLanguagePreference(nextPreference);
+      writeLanguagePreference(nextPreference);
+    },
+    [],
+  );
+
   const saveSettings = useCallback(async () => {
     const validation = validateUserSettings(settingsDraft);
     if (validation) {
@@ -1202,11 +1228,44 @@ function App() {
       window.setTimeout(() => setSettingsSaved(false), 2200);
     } catch (caught) {
       const nextError = commandError(caught);
-      setSettingsError(nextError.message);
+      setSettingsError(nextError);
     } finally {
       setSettingsBusy(false);
     }
   }, [commandError, recordOperation, settingsDraft]);
+
+  const cancelCloseRequest = useCallback(() => {
+    closeConfirmOpenRef.current = false;
+    setCloseConfirmOpen(false);
+  }, []);
+
+  const closeWithoutSaving = useCallback(() => {
+    closeConfirmOpenRef.current = false;
+    setCloseConfirmOpen(false);
+    if (!("__TAURI_INTERNALS__" in window)) {
+      return;
+    }
+    void getCurrentWindow().destroy().catch(() => {
+      if (mounted.current) {
+        closeConfirmOpenRef.current = true;
+        setCloseConfirmOpen(true);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!closeConfirmOpen) {
+      return;
+    }
+    const handleCloseKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelCloseRequest();
+      }
+    };
+    window.addEventListener("keydown", handleCloseKeyDown);
+    return () => window.removeEventListener("keydown", handleCloseKeyDown);
+  }, [cancelCloseRequest, closeConfirmOpen]);
 
   useEffect(() => {
     mounted.current = true;
@@ -1238,7 +1297,7 @@ function App() {
         setSettingsDraft(nextSettings);
         writeUserSettings(nextSettings);
       } catch (caught) {
-        setSettingsError(commandError(caught).message);
+        setSettingsError(commandError(caught));
       }
     })();
   }, [commandError, recordOperation]);
@@ -1316,11 +1375,13 @@ function App() {
       const appWindow = getCurrentWindow();
       void appWindow
         .onCloseRequested((event) => {
-          if (
-            dirtyRef.current &&
-            !window.confirm("This window has unsaved changes. Close anyway?")
-          ) {
-            event.preventDefault();
+          if (!dirtyRef.current) {
+            return;
+          }
+          event.preventDefault();
+          if (!closeConfirmOpenRef.current) {
+            closeConfirmOpenRef.current = true;
+            setCloseConfirmOpen(true);
           }
         })
         .then((stopListening) => {
@@ -1342,16 +1403,19 @@ function App() {
     return () => {
       active = false;
       unlisten?.();
+      closeConfirmOpenRef.current = false;
       removeBrowserFallback();
     };
   }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    document.documentElement.lang = locale;
     return () => {
       delete document.documentElement.dataset.theme;
+      document.documentElement.lang = "";
     };
-  }, [theme]);
+  }, [locale, theme]);
 
   useEffect(() => {
     try {
@@ -1390,36 +1454,50 @@ function App() {
       ? textByteLength(selectedState.draftText)
       : selectedState.length
     : 0;
+  const inputErrorMessage = inputError
+    ? translateInputError(inputError, locale)
+    : null;
+  const settingsErrorMessage = settingsError
+    ? typeof settingsError === "string"
+      ? translateSettingsValidation(
+          settingsError,
+          locale,
+          MIN_TIMEOUT_MS,
+          MAX_TIMEOUT_MS,
+          MAX_RETRIES,
+        )
+      : translateCommandError(settingsError.code, locale)
+    : null;
 
   return (
     <main className="app-shell" data-theme={theme}>
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true" />
-          <span className="brand-name">ZMK Runtime Macro</span>
+          <span className="brand-name">{copy.appName}</span>
         </div>
         <div className="topbar-actions">
           <div className="connection-summary" aria-live="polite">
             {reconnecting ? (
               <span className="status status-checking">
-                <span className="status-dot" aria-hidden="true" /> Reconnecting…
+                <span className="status-dot" aria-hidden="true" /> {copy.statusReconnecting}
               </span>
             ) : checking ? (
               <span className="status status-checking">
-                <span className="status-dot" aria-hidden="true" /> Checking device…
+                <span className="status-dot" aria-hidden="true" /> {copy.statusChecking}
               </span>
             ) : connection.connected ? (
               <>
                 <span className="device-name">
-                  {connection.device?.productName ?? "Runtime Macro device"}
+                  {connection.device?.productName ?? copy.runtimeMacroDevice}
                 </span>
                 <span className="status status-connected">
-                  <span className="status-dot" aria-hidden="true" /> Connected
+                  <span className="status-dot" aria-hidden="true" /> {copy.statusConnected}
                 </span>
               </>
             ) : (
               <span className="status status-disconnected">
-                <span className="status-dot" aria-hidden="true" /> Device disconnected
+                <span className="status-dot" aria-hidden="true" /> {copy.statusDisconnected}
               </span>
             )}
           </div>
@@ -1428,7 +1506,7 @@ function App() {
             type="button"
             onClick={() => void refreshDevices()}
             disabled={busy || mutationInProgress}
-            aria-label={connection.connected ? "Reconnect or refresh device" : "Reconnect device"}
+            aria-label={connection.connected ? copy.reconnectOrRefresh : copy.reconnectDevice}
           >
             {busy ? "…" : "↻"}
           </button>
@@ -1441,21 +1519,21 @@ function App() {
               setSettingsError(null);
               setSettingsSaved(false);
             }}
-            aria-label="Settings"
+            aria-label={copy.settings}
             aria-expanded={settingsOpen}
           >
             ⚙
           </button>
           <label className="theme-control">
-            <span className="sr-only">Theme</span>
+            <span className="sr-only">{copy.theme}</span>
             <select
               value={theme}
               onChange={(event) => setTheme(event.target.value as ThemeMode)}
-              aria-label="Theme"
+              aria-label={copy.theme}
             >
-              <option value="system">System</option>
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
+              <option value="system">{copy.themeSystem}</option>
+              <option value="light">{copy.themeLight}</option>
+              <option value="dark">{copy.themeDark}</option>
             </select>
           </label>
         </div>
@@ -1465,8 +1543,8 @@ function App() {
         <section className="settings-panel" aria-labelledby="settings-heading">
           <div className="settings-heading">
             <div>
-              <p className="eyebrow">Preferences</p>
-              <h2 id="settings-heading">Connection settings</h2>
+              <p className="eyebrow">{copy.preferences}</p>
+              <h2 id="settings-heading">{copy.connectionSettings}</h2>
             </div>
             <button
               className="text-button"
@@ -1474,7 +1552,7 @@ function App() {
               onClick={() => setSettingsOpen(false)}
               disabled={settingsBusy}
             >
-              Close
+              {copy.close}
             </button>
           </div>
           <label className="setting-toggle">
@@ -1487,13 +1565,27 @@ function App() {
               disabled={settingsBusy}
             />
             <span>
-              <strong>Auto reconnect</strong>
-              <small>Retry unexpected disconnects with a bounded backoff.</small>
+              <strong>{copy.autoReconnect}</strong>
+              <small>{copy.autoReconnectHelp}</small>
             </span>
           </label>
           <div className="settings-grid">
+            <label className="setting-field" htmlFor="language-setting">
+              <span>{copy.language}</span>
+              <select
+                id="language-setting"
+                value={languagePreference}
+                onChange={updateLanguagePreference}
+                disabled={settingsBusy}
+              >
+                <option value="system">{copy.languageFollowSystem}</option>
+                <option value="zh-CN">{copy.languageChinese}</option>
+                <option value="en">{copy.languageEnglish}</option>
+              </select>
+              <small>{copy.languageHelp}</small>
+            </label>
             <label className="setting-field" htmlFor="timeout-setting">
-              <span>Request timeout</span>
+              <span>{copy.requestTimeout}</span>
               <input
                 id="timeout-setting"
                 type="number"
@@ -1507,10 +1599,10 @@ function App() {
                 disabled={settingsBusy}
                 aria-describedby="settings-help"
               />
-              <small>Milliseconds · {MIN_TIMEOUT_MS}–{MAX_TIMEOUT_MS}</small>
+              <small>{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small>
             </label>
             <label className="setting-field" htmlFor="retries-setting">
-              <span>Retries</span>
+              <span>{copy.retries}</span>
               <input
                 id="retries-setting"
                 type="number"
@@ -1524,24 +1616,24 @@ function App() {
                 disabled={settingsBusy}
                 aria-describedby="settings-help"
               />
-              <small>Transport retries · 0–{MAX_RETRIES}</small>
+              <small>{copy.transportRetriesRange(MAX_RETRIES)}</small>
             </label>
           </div>
           <p id="settings-help" className="field-help settings-help">
-            Timeout and retries apply on next connection. Macro content is never stored in preferences.
+            {copy.settingsHelp}
           </p>
-          {settingsError ? (
-            <p className="field-error" role="alert">{settingsError}</p>
+          {settingsErrorMessage ? (
+            <p className="field-error" role="alert">{settingsErrorMessage}</p>
           ) : null}
           <div className="settings-actions">
-            {settingsSaved ? <span className="settings-saved">✓ Saved</span> : null}
+            {settingsSaved ? <span className="settings-saved">{copy.saved}</span> : null}
             <button
               className="button-primary"
               type="button"
               onClick={() => void saveSettings()}
               disabled={settingsBusy}
             >
-              {settingsBusy ? "Saving…" : "Save settings"}
+              {settingsBusy ? copy.saving : copy.saveSettings}
             </button>
           </div>
         </section>
@@ -1549,7 +1641,7 @@ function App() {
 
       {error ? (
         <div className="inline-message message-error" role="alert">
-          <span>{errorMessage(error)}</span>
+          <span>{translateCommandError(error.code, locale)}</span>
           {!connection.connected ? (
             <button
               className="text-button"
@@ -1557,7 +1649,7 @@ function App() {
               onClick={() => void refreshDevices()}
               disabled={busy || mutationInProgress}
             >
-              Reconnect
+              {copy.reconnect}
             </button>
           ) : null}
         </div>
@@ -1567,18 +1659,18 @@ function App() {
         <section className="device-picker" aria-labelledby="device-picker-heading">
           <div className="section-heading compact-heading">
             <div>
-              <p className="eyebrow">Connection</p>
-              <h1 id="device-picker-heading">Choose a Runtime Macro interface</h1>
+              <p className="eyebrow">{copy.connection}</p>
+              <h1 id="device-picker-heading">{copy.chooseInterface}</h1>
             </div>
             <span className={`status ${checking ? "status-checking" : "status-disconnected"}`}>
-              {checking ? "Checking device…" : "Not connected"}
+              {checking ? copy.statusChecking : copy.notConnected}
             </span>
           </div>
           {devices.length === 0 ? (
             <p className="muted-copy">
               {checking
-                ? "Checking for compatible Runtime Macro devices…"
-                : "No compatible Runtime Macro device found."}
+                ? copy.checkingCompatibleDevices
+                : copy.noCompatibleDevice}
             </p>
           ) : (
             <div className="candidate-list" aria-live="polite">
@@ -1592,13 +1684,13 @@ function App() {
                   aria-pressed={selectedId === device.id}
                 >
                   <span className="candidate-copy">
-                    <strong>{device.productName ?? "Unnamed device"}</strong>
+                    <strong>{device.productName ?? copy.unnamedDevice}</strong>
                     <span>
-                      {formatHex(device.vendorId)} / {formatHex(device.productId)} · Interface {device.interfaceNumber}
+                      {formatHex(device.vendorId)} / {formatHex(device.productId)} · {copy.interfaceNumber(device.interfaceNumber)}
                     </span>
                   </span>
                   <span className="candidate-meta">
-                    {device.usageMetadata === "exact" ? "Runtime Macro" : "Usage metadata unavailable"}
+                    {device.usageMetadata === "exact" ? copy.runtimeMacro : copy.usageMetadataUnavailable}
                   </span>
                 </button>
               ))}
@@ -1611,7 +1703,7 @@ function App() {
               onClick={() => void connectDevice(selectedId)}
               disabled={busy || mutationInProgress || !selectedDevice}
             >
-              Connect selected
+              {copy.connectSelected}
             </button>
             <button
               className="button-secondary"
@@ -1619,7 +1711,7 @@ function App() {
               onClick={() => void refreshDevices()}
               disabled={busy || mutationInProgress}
             >
-              Refresh
+              {copy.refresh}
             </button>
           </div>
         </section>
@@ -1628,14 +1720,14 @@ function App() {
       <section className="macro-section" aria-labelledby="slots-heading">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">Configuration</p>
-            <h1 id="slots-heading">Macro Slots</h1>
+            <p className="eyebrow">{copy.configuration}</p>
+            <h1 id="slots-heading">{copy.macroSlots}</h1>
           </div>
           <div className="section-actions">
-            <span className="slot-count">{slots.length} slots</span>
+            <span className="slot-count">{copy.slotCount(slots.length)}</span>
             {connection.device ? (
               <span className="device-detail">
-                {formatHex(connection.device.vendorId)} / {formatHex(connection.device.productId)} · Interface {connection.device.interfaceNumber}
+                {formatHex(connection.device.vendorId)} / {formatHex(connection.device.productId)} · {copy.interfaceNumber(connection.device.interfaceNumber)}
               </span>
             ) : null}
             {connection.connected ? (
@@ -1645,7 +1737,7 @@ function App() {
                 onClick={() => void refreshSlots()}
                 disabled={busy || mutationInProgress}
               >
-                Refresh slots
+                {copy.refreshSlots}
               </button>
             ) : null}
             {connection.connected ? (
@@ -1655,7 +1747,7 @@ function App() {
                 onClick={() => void disconnectDevice()}
                 disabled={busy || mutationInProgress}
               >
-                Disconnect
+                {copy.disconnect}
               </button>
             ) : null}
             <button
@@ -1664,7 +1756,7 @@ function App() {
               onClick={() => setDiagnosticsOpen((open) => !open)}
               aria-expanded={diagnosticsOpen}
             >
-              Diagnostics
+              {copy.diagnostics}
             </button>
           </div>
         </div>
@@ -1673,35 +1765,35 @@ function App() {
           <section className="diagnostics-panel" aria-labelledby="diagnostics-heading">
             <div className="diagnostics-heading">
               <div>
-                <p className="eyebrow">Diagnostics</p>
-                <h2 id="diagnostics-heading">Connection details</h2>
+                <p className="eyebrow">{copy.diagnostics}</p>
+                <h2 id="diagnostics-heading">{copy.connectionDetails}</h2>
               </div>
               <span className={`status ${connection.connected ? "status-connected" : "status-disconnected"}`}>
-                {connection.connected ? "Connected" : "Disconnected"}
+                {connection.connected ? copy.connected : copy.disconnected}
               </span>
             </div>
             <dl className="diagnostics-grid">
-              <div><dt>Protocol</dt><dd>Runtime Macro v1</dd></div>
-              <div><dt>Transport</dt><dd>USB HID</dd></div>
-              <div><dt>Device</dt><dd>{connection.device?.productName ?? "—"}</dd></div>
-              <div><dt>VID / PID</dt><dd>{connection.device ? `${formatHex(connection.device.vendorId)} / ${formatHex(connection.device.productId)}` : "—"}</dd></div>
-              <div><dt>Interface</dt><dd>{connection.device?.interfaceNumber ?? "—"}</dd></div>
-              <div><dt>Usage</dt><dd>{connection.device ? `${formatHex(connection.device.usagePage)} / ${formatHex(connection.device.usage)}` : "—"}</dd></div>
-              <div><dt>Slot count</dt><dd>{slots.length}</dd></div>
-              <div><dt>Last operation</dt><dd>{lastOperation ?? "None"}</dd></div>
-              <div><dt>Last error code</dt><dd>{lastErrorCode ?? "None"}</dd></div>
+              <div><dt>{copy.protocol}</dt><dd>Runtime Macro v1</dd></div>
+              <div><dt>{copy.transport}</dt><dd>USB HID</dd></div>
+              <div><dt>{copy.device}</dt><dd>{connection.device?.productName ?? "—"}</dd></div>
+              <div><dt>{copy.vidPid}</dt><dd>{connection.device ? `${formatHex(connection.device.vendorId)} / ${formatHex(connection.device.productId)}` : "—"}</dd></div>
+              <div><dt>{copy.interface}</dt><dd>{connection.device?.interfaceNumber ?? "—"}</dd></div>
+              <div><dt>{copy.usage}</dt><dd>{connection.device ? `${formatHex(connection.device.usagePage)} / ${formatHex(connection.device.usage)}` : "—"}</dd></div>
+              <div><dt>{copy.slotCountLabel}</dt><dd>{slots.length}</dd></div>
+              <div><dt>{copy.lastOperation}</dt><dd>{lastOperation ?? copy.none}</dd></div>
+              <div><dt>{copy.lastErrorCode}</dt><dd>{lastErrorCode ?? copy.none}</dd></div>
             </dl>
             <p className="field-help diagnostics-help">
-              Diagnostics never include macro content, HID paths, serial numbers, or raw reports.
+              {copy.diagnosticsHelp}
             </p>
           </section>
         ) : null}
 
         <div className="workspace">
-          <aside className="slot-list" aria-label="Macro slots">
+          <aside className="slot-list" aria-label={copy.macroSlotsAria}>
             {slots.length === 0 ? (
               <p className="muted-copy slot-list-empty">
-                {connection.connected ? "The device returned no slots." : "Connect a device to load slots."}
+                {connection.connected ? copy.noSlotsReturned : copy.connectToLoadSlots}
               </p>
             ) : (
               slots.map((slot) => {
@@ -1718,11 +1810,11 @@ function App() {
                   >
                     <span className="slot-index">{formatSlotNumber(slot.slot)}</span>
                     <span className="slot-copy">
-                      <strong>{slot.draftLabel || defaultLabel(slot.slot)}</strong>
-                      <span>{displayedLength === 0 ? "Empty" : `${displayedLength} bytes`}</span>
+                      <strong>{slot.draftLabel || defaultLabel(slot.slot, locale)}</strong>
+                      <span>{displayedLength === 0 ? copy.empty : copy.bytes(displayedLength)}</span>
                     </span>
                     {dirty ? (
-                      <span className="dirty-dot" aria-label="Unsaved changes" />
+                      <span className="dirty-dot" aria-label={copy.unsavedChanges} />
                     ) : null}
                   </button>
                 );
@@ -1733,30 +1825,30 @@ function App() {
           <section className="inspector" aria-labelledby="inspector-heading">
             {!selectedState ? (
               <div className="inspector-empty">
-                <p className="eyebrow">Inspector</p>
-                <h2 id="inspector-heading">Select a slot</h2>
-                <p className="muted-copy">Choose a slot to view and edit its macro.</p>
+                <p className="eyebrow">{copy.inspector}</p>
+                <h2 id="inspector-heading">{copy.selectSlot}</h2>
+                <p className="muted-copy">{copy.chooseSlotHelp}</p>
               </div>
             ) : (
               <>
                 <div className="inspector-heading">
                   <div>
-                    <p className="eyebrow">Slot {formatSlotNumber(selectedState.slot)}</p>
-                    <h2 id="inspector-heading">{selectedState.draftLabel || defaultLabel(selectedState.slot)}</h2>
+                    <p className="eyebrow">{copy.slotLabel(formatSlotNumber(selectedState.slot))}</p>
+                    <h2 id="inspector-heading">{selectedState.draftLabel || defaultLabel(selectedState.slot, locale)}</h2>
                   </div>
                   <span className={`edit-status status-${selectedDirty ? "modified" : selectedState.status}`}>
                     {selectedState.status === "saving"
-                      ? "Saving…"
+                      ? copy.saving
                       : selectedState.status === "saved"
-                        ? "✓ Saved"
+                        ? copy.saved
                         : selectedDirty
-                          ? "● Unsaved changes"
-                          : "Last saved"}
+                          ? copy.unsavedChanges
+                          : copy.lastSaved}
                   </span>
                 </div>
 
                 <label className="field-label" htmlFor="slot-label">
-                  Name
+                  {copy.name}
                 </label>
                 <input
                   id="slot-label"
@@ -1767,40 +1859,41 @@ function App() {
                   maxLength={64}
                   disabled={!selectedState.loaded || mutationInProgress}
                   autoComplete="off"
+                  placeholder={defaultLabel(selectedState.slot, locale)}
                 />
-                <p className="field-help">Local label · not written to the keyboard</p>
+                <p className="field-help">{copy.localLabelHelp}</p>
 
                 <div className="field-heading">
                   <label className="field-label" htmlFor="macro-editor">
-                    Macro
+                    {copy.macro}
                   </label>
-                  <span className="byte-count">{selectedByteLength} bytes</span>
+                  <span className="byte-count">{copy.bytes(selectedByteLength)}</span>
                 </div>
 
                 {selectedState.loading ? (
-                  <div className="editor-placeholder" aria-live="polite">Loading slot…</div>
+                  <div className="editor-placeholder" aria-live="polite">{copy.loadingSlot}</div>
                 ) : selectedState.error && selectedState.lastAction === "load" ? (
                   <div className="editor-placeholder editor-error" role="alert">
-                    <span>{errorMessage(selectedState.error)}</span>
+                    <span>{translateCommandError(selectedState.error.code, locale)}</span>
                     <button
                       className="text-button"
                       type="button"
                       onClick={() => retrySlotAction(selectedState)}
                       disabled={busy || mutationInProgress || !connection.connected}
                     >
-                      Retry
+                      {copy.retry}
                     </button>
                   </div>
                 ) : !selectedState.revealed && selectedState.draftText.length === 0 ? (
                   <div className="empty-editor">
-                    <p>No macro configured</p>
+                    <p>{copy.noMacroConfigured}</p>
                     <button
                       className="button-secondary"
                       type="button"
                       onClick={addMacro}
                       disabled={!selectedState.loaded || mutationInProgress || !connection.connected}
                     >
-                      Add macro
+                      {copy.addMacro}
                     </button>
                   </div>
                 ) : (
@@ -1815,7 +1908,7 @@ function App() {
                       readOnly={!selectedState.revealed || mutationInProgress || !connection.connected}
                       spellCheck={false}
                       autoComplete="off"
-                      aria-label="Macro content"
+                      aria-label={copy.macroContent}
                       aria-describedby="macro-help"
                     />
                     <button
@@ -1826,35 +1919,35 @@ function App() {
                         updateSelectedSlot((slot) => ({ ...slot, revealed: !slot.revealed }));
                       }}
                       disabled={mutationInProgress || !connection.connected}
-                      aria-label={selectedState.revealed ? "Hide macro content" : "Reveal macro content"}
+                      aria-label={selectedState.revealed ? copy.hideMacroContent : copy.revealMacroContent}
                       aria-pressed={selectedState.revealed}
                     >
-                      {selectedState.revealed ? "Hide" : "Reveal"}
+                      {selectedState.revealed ? copy.hide : copy.reveal}
                     </button>
                   </div>
                 )}
                 <p id="macro-help" className="field-help control-help">
-                  Reveal to edit. Enter inserts ↵ · Tab inserts ⇥ · use the button below for ⌫.
+                  {copy.macroControlHelp}
                 </p>
                 {selectedState.revealed ? (
-                  <div className="control-actions" aria-label="Insert control character">
-                    <button className="text-button" type="button" onClick={() => insertControlToken("↵")} disabled={mutationInProgress || !connection.connected}>Insert LF</button>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("⇥")} disabled={mutationInProgress || !connection.connected}>Insert Tab</button>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("⌫")} disabled={mutationInProgress || !connection.connected}>Insert Backspace</button>
+                  <div className="control-actions" aria-label={copy.insertControlCharacter}>
+                    <button className="text-button" type="button" onClick={() => insertControlToken("↵")} disabled={mutationInProgress || !connection.connected}>{copy.insertLf}</button>
+                    <button className="text-button" type="button" onClick={() => insertControlToken("⇥")} disabled={mutationInProgress || !connection.connected}>{copy.insertTab}</button>
+                    <button className="text-button" type="button" onClick={() => insertControlToken("⌫")} disabled={mutationInProgress || !connection.connected}>{copy.insertBackspace}</button>
                   </div>
                 ) : null}
-                {inputError ? <p className="field-error" role="alert">{inputError}</p> : null}
+                {inputErrorMessage ? <p className="field-error" role="alert">{inputErrorMessage}</p> : null}
 
                 {selectedState.error && selectedState.lastAction !== "load" ? (
                   <div className="inline-message message-error slot-error" role="alert">
-                    <span>{errorMessage(selectedState.error)}</span>
+                    <span>{translateCommandError(selectedState.error.code, locale)}</span>
                     <button
                       className="text-button"
                       type="button"
                       onClick={() => retrySlotAction(selectedState)}
                       disabled={busy || mutationInProgress || !connection.connected}
                     >
-                      Retry
+                      {copy.retry}
                     </button>
                   </div>
                 ) : null}
@@ -1872,7 +1965,7 @@ function App() {
                         mutationInProgress
                       }
                     >
-                      Clear macro…
+                      {copy.clearMacro}
                     </button>
                   </div>
                   <button
@@ -1881,26 +1974,61 @@ function App() {
                     onClick={() => void saveSlot()}
                     disabled={!canSave}
                   >
-                    {selectedState.status === "saving" ? "Saving…" : "Save"}
+                    {selectedState.status === "saving" ? copy.saving : copy.save}
                   </button>
                 </div>
 
                 {clearConfirm === selectedState.slot ? (
                   <div className="confirm-row" role="alert">
-                    <span>Clear this macro?</span>
-                    <button className="button-secondary" type="button" onClick={() => setClearConfirm(null)} disabled={mutationInProgress}>Cancel</button>
-                    <button className="button-danger filled" type="button" onClick={() => void clearSlot(selectedState.slot)} disabled={mutationInProgress}>Clear</button>
+                    <span>{copy.clearThisMacro}</span>
+                    <button className="button-secondary" type="button" onClick={() => setClearConfirm(null)} disabled={mutationInProgress}>{copy.cancel}</button>
+                    <button className="button-danger filled" type="button" onClick={() => void clearSlot(selectedState.slot)} disabled={mutationInProgress}>{copy.clear}</button>
                   </div>
                 ) : null}
 
                 {!connection.connected ? (
-                  <p className="disconnect-note">Device disconnected. Your unsaved changes remain in memory.</p>
+                  <p className="disconnect-note">{copy.disconnectNote}</p>
                 ) : null}
               </>
             )}
           </section>
         </div>
       </section>
+
+      {closeConfirmOpen ? (
+        <div className="modal-backdrop">
+          <section
+            className="close-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="close-dialog-title"
+            aria-describedby="close-dialog-message"
+          >
+            <p className="eyebrow">{copy.closeUnsavedTitle}</p>
+            <h2 id="close-dialog-title">{copy.closeUnsavedTitle}</h2>
+            <p id="close-dialog-message" className="muted-copy">
+              {copy.closeUnsavedMessage}
+            </p>
+            <div className="dialog-actions">
+              <button
+                className="button-secondary"
+                type="button"
+                onClick={cancelCloseRequest}
+                autoFocus
+              >
+                {copy.cancel}
+              </button>
+              <button
+                className="button-danger filled"
+                type="button"
+                onClick={closeWithoutSaving}
+              >
+                {copy.closeWithoutSaving}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

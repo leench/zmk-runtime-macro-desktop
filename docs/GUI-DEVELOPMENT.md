@@ -106,7 +106,7 @@ Slots
 - 显示 byte 数，不显示容易误导的 Unicode 字符数；
 - 粘贴非法字符时指出位置和原因；
 - 支持 `Ctrl/Cmd + S`；
-- 切换 slot 或关闭窗口时，对未保存内容进行确认。
+- 切换 slot 或关闭窗口时，对未保存内容进行确认；slot 切换使用本地化的浏览器确认提示。
 
 示例：
 
@@ -145,7 +145,9 @@ Hello, world! ↵
 - 请求超时，默认 `1000 ms`；
 - 重试次数，默认 `2`；
 - 自动重连开关；
-- 中文/英文界面。
+- 界面语言：`跟随系统`、`中文`、`English`。
+
+语言偏好使用独立的 `zmk-runtime-macro-language:v1` localStorage key，不经过后端 command，也不与宏正文共用存储。`跟随系统` 检查 `navigator.languages` 和 `navigator.language`：任一语言以 `zh` 开头时使用中文，其他语言（包括无法识别的语言）均使用 English fallback。切换后立即更新界面并同步 `<html lang>`；不要求运行时监听系统语言变化。所有应用自有文案（连接、设置、诊断、编辑器、状态、错误和确认）均提供中英文，macro 正文、控制字符 token、协议数据和安全错误 code 不翻译。
 
 诊断信息可以包含协议版本、VID/PID、产品名和脱敏后的接口信息，但默认不记录宏文本、序列号和完整 HID path。
 
@@ -182,7 +184,7 @@ v1 wire protocol 没有 slot name 字段，只有 slot 编号、正文和 byte l
 - 宽窗口下内容最大约 960px，inspector 可读宽度约 680px，多余空间留白，不增加 Dashboard 内容。
 - 设备断开时保留内存中的未保存草稿，禁用 Save/Clear，并提供 Reconnect；不会显示假连接状态。
 - LIST 刷新后，干净 slot 会重新标记为未加载，只有当前选中且非空的 slot 才会发送 GET；真正 dirty 的草稿会在同一安全设备摘要（VID/PID/interface/Usage）重连时保留，切换到不同摘要的设备会清理旧设备草稿。该摘要不使用也不暴露 HID path 或 serial。
-- 未保存保护实际使用 Tauri 2 的 `onCloseRequested`；在普通浏览器开发环境或该 hook 注册失败时回退到 `beforeunload`。切换 slot 使用不含正文的原生确认提示。关闭保护只阻止/放行窗口关闭，不持久化 macro 正文。
+- 未保存保护实际使用 Tauri 2 的 `onCloseRequested`；发现 dirty draft 后同步 `event.preventDefault()`，显示应用内的可访问确认 modal，取消保持窗口，确认调用 `WebviewWindow.destroy()` 绕过再次触发的 close event 并真正关闭窗口。该策略不依赖 Tauri WebView 中不可靠的同步 `window.confirm`，也不会对无 dirty draft 的正常关闭强制 destroy。在普通浏览器开发环境或 hook 注册失败时回退到 `beforeunload`；slot 切换使用不含正文的本地化确认提示。关闭保护只阻止/放行窗口关闭，不持久化 macro 正文。
 
 ### Light Theme tokens
 
@@ -346,7 +348,7 @@ Dark Theme：
 - 新增 `get_settings` 和 `set_settings` Tauri commands，IPC 使用 camelCase 的 `timeoutMs` 和 `retries`。
 - request timeout 默认 `1000 ms`，允许 `100–5000 ms`；retries 默认 `2`，允许 `0–5`。后端 `ClientConfig` 校验边界，设置实际传入下一次创建的 HID protocol session。
 - 当前 session 的配置不会被原地替换；设置面板明确显示 `Timeout and retries apply on next connection.`，保存后重新连接才生效。
-- 仅将 theme、auto reconnect、timeout 和 retries 存入 localStorage；不存储 macro 正文、raw report、HID path 或 serial。
+- 仅将 theme、language preference、auto reconnect、timeout 和 retries 存入 localStorage；不存储 macro 正文、raw report、HID path 或 serial。
 
 ### 低调诊断
 
