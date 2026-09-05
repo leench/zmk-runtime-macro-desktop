@@ -15,9 +15,17 @@ export type DeviceCandidate = {
 
 export type ConnectedDevice = Omit<DeviceCandidate, "id">;
 
+export type AuthState =
+  | "disconnected"
+  | "open"
+  | "locked"
+  | "authenticated"
+  | "credentialInvalid";
+
 export type ConnectionState = {
   connected: boolean;
   device: ConnectedDevice | null;
+  authState: AuthState;
 };
 
 export type SlotMetadata = {
@@ -73,6 +81,28 @@ export function disconnectDevice(): Promise<void> {
 
 export function getConnection(): Promise<ConnectionState> {
   return invoke<ConnectionState>("get_connection");
+}
+
+export function refreshAuthState(): Promise<AuthState> {
+  return invoke<AuthState>("refresh_auth_state");
+}
+
+/** Unlock a protected v2 session. The password is never persisted by the bridge. */
+export function authenticate(password: string): Promise<AuthState> {
+  return invoke<AuthState>("authenticate", { password });
+}
+
+export function unlock(password: string): Promise<AuthState> {
+  return authenticate(password);
+}
+
+/** Set or change the device password; success returns a locked session. */
+export function setPassword(password: string): Promise<AuthState> {
+  return invoke<AuthState>("set_password", { password });
+}
+
+export function lockDevice(): Promise<AuthState> {
+  return invoke<AuthState>("lock_device");
 }
 
 export function listSlots(): Promise<SlotMetadata[]> {

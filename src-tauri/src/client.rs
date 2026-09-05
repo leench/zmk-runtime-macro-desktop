@@ -9,8 +9,8 @@ use crate::protocol::{
     build_lock_request, build_password_set_chunk, normalize_response,
     parse_auth_challenge_response, parse_auth_info_response, read_u16, response_identity_matches,
     validate_empty_success, validate_response, validate_text, AuthInfo, Frame, Opcode, Status,
-    LIST_SLOT, MAX_TEXT_LENGTH, OFFSET_OFFSET, PASSWORD_SET_LENGTH, PAYLOAD_LENGTH_OFFSET,
-    PAYLOAD_OFFSET, PAYLOAD_SIZE, TOTAL_LENGTH_OFFSET,
+    LIST_SLOT, MAX_TEXT_LENGTH, OFFSET_OFFSET, OPCODE_OFFSET, PASSWORD_SET_LENGTH,
+    PAYLOAD_LENGTH_OFFSET, PAYLOAD_OFFSET, PAYLOAD_SIZE, STATUS_OFFSET, TOTAL_LENGTH_OFFSET,
 };
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
@@ -142,8 +142,9 @@ impl<T: Transport> RuntimeMacroClient<T> {
 
             // HID input queues can contain a response left behind by a host
             // timeout. Discard only a response for a different transaction;
-            // a matching response with a bad version or malformed fields must
-            // be reported as a protocol error.
+            // a matching response with malformed fields must be reported as a
+            // protocol error (AUTH_INFO BAD_VERSION is handled as an upgrade
+            // status below).
             if !response_identity_matches(request, &response) {
                 continue;
             }
@@ -153,15 +154,39 @@ impl<T: Transport> RuntimeMacroClient<T> {
 
     fn call(&mut self, request: &Frame) -> Result<Frame, ClientError> {
         let response = self.exchange(request)?;
-        match validate_response(request, &response)? {
+        let status = match validate_response(request, &response) {
+            Ok(status) => status,
+            // Older firmware commonly echoes its own v1 response version when
+            // rejecting the v2 AUTH_INFO probe. Surface the stable upgrade
+            // status instead of making the GUI treat it as a generic protocol
+            // failure. Other operations retain strict version validation.
+            Err(ProtocolError::ResponseFieldMismatch {
+                field: "version",
+                actual: 1,
+                ..
+            }) if request[OPCODE_OFFSET] == Opcode::AuthInfo as u8
+                && response[STATUS_OFFSET] == Status::BadVersion as u8
+                && response[PAYLOAD_LENGTH_OFFSET] == 0
+                && read_u16(&response, OFFSET_OFFSET) == 0
+                && read_u16(&response, TOTAL_LENGTH_OFFSET) == 0
+                && response[PAYLOAD_OFFSET..].iter().all(|byte| *byte == 0) =>
+            {
+                self.auth_session.clear_session();
+                return Err(ClientError::Remote(Status::BadVersion));
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        match status {
             Status::Ok => Ok(response),
             status => {
                 if matches!(
                     status,
                     Status::AuthRequired
                         | Status::AuthFailed
-                        | Status::AuthNoChallenge
                         | Status::AuthNotConfigured
+                        | Status::RateLimited
+                        | Status::AuthNoChallenge
                 ) {
                     self.auth_session.clear_session();
                 }
@@ -1324,6 +1349,48 @@ mod tests {
         );
         assert!(client.is_protected());
         assert!(!client.is_authenticated());
+    }
+
+    #[test]
+    fn auth_info_bad_version_is_reported_without_legacy_fallback() {
+        let mut client = client_with_handler(
+            |request| {
+                let mut response = FakeTransport::response(request, Status::BadVersion, &[], 0, 0);
+                response[VERSION_OFFSET] = 1;
+                vec![Ok(response)]
+            },
+            3,
+        );
+
+        assert_eq!(
+            client.auth_info(),
+            Err(ClientError::Remote(Status::BadVersion))
+        );
+        assert_eq!(client.transport_mut().writes.len(), 1);
+    }
+
+    #[test]
+    fn arbitrary_auth_info_version_mismatch_remains_protocol_error() {
+        let mut client = client_with_handler(
+            |request| {
+                let mut response = FakeTransport::response(request, Status::BadVersion, &[], 0, 0);
+                response[VERSION_OFFSET] = 3;
+                vec![Ok(response)]
+            },
+            3,
+        );
+
+        assert!(matches!(
+            client.auth_info(),
+            Err(ClientError::Protocol(
+                ProtocolError::ResponseFieldMismatch {
+                    field: "version",
+                    expected: crate::protocol::VERSION,
+                    actual: 3,
+                }
+            ))
+        ));
+        assert_eq!(client.transport_mut().writes.len(), 1);
     }
 
     #[test]

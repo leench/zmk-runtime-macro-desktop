@@ -36,6 +36,7 @@ import {
   setSlot as setSlotCommand,
 } from "./bridge";
 import type {
+  AuthState,
   ClientSettings,
   CommandError,
   ConnectedDevice,
@@ -79,7 +80,11 @@ type UserSettings = ClientSettings & {
   autoReconnect: boolean;
 };
 
-const disconnected: ConnectionState = { connected: false, device: null };
+const disconnected: ConnectionState = {
+  connected: false,
+  device: null,
+  authState: "disconnected",
+};
 const MAX_TEXT_BYTES = 256;
 const LABELS_STORAGE_PREFIX = "zmk-runtime-macro-labels:v1";
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -200,6 +205,47 @@ function deviceSummaryKey(device: ConnectedDevice | null): string | null {
     device.usagePage.toString(16),
     device.usage.toString(16),
   ].join(":");
+}
+
+function canManageConnection(connection: ConnectionState): boolean {
+  return (
+    connection.connected &&
+    (connection.authState === "open" || connection.authState === "authenticated")
+  );
+}
+
+function authStateForErrorCode(code: string): AuthState | null {
+  switch (code) {
+    case "auth_required":
+    case "auth_failed":
+    case "rate_limited":
+    case "auth_no_challenge":
+      return "locked";
+    case "auth_not_configured":
+      return "open";
+    case "credential_invalid":
+      return "credentialInvalid";
+    default:
+      return null;
+  }
+}
+
+function shouldReconnectAfterConnectionError(code: string): boolean {
+  // Only a failed transport or malformed protocol response makes a physical
+  // connection worth probing again. Remote statuses are actionable device
+  // state, not an automatic reconnect trigger.
+  return (
+    code === "timeout" || code === "transport_error" || code === "protocol_error"
+  );
+}
+
+function shouldDropConnectionAfterCommandError(code: string): boolean {
+  return (
+    code === "timeout" ||
+    code === "transport_error" ||
+    code === "protocol_error" ||
+    code === "bad_version"
+  );
 }
 
 function sameDevice(
@@ -547,6 +593,7 @@ function App() {
       );
       setInputError(null);
 
+      let connectionEstablished = false;
       try {
         const nextConnection = await connectDeviceCommand(id);
         if (!isCurrent(sequence)) {
@@ -563,8 +610,19 @@ function App() {
         }
         const nextLabels = readLabels(nextConnection.device);
         setConnection(nextConnection);
+        connectionEstablished = true;
         setLabels(nextLabels);
-        await loadSlots(sequence, nextLabels, preserveDirtyDrafts);
+        if (canManageConnection(nextConnection)) {
+          await loadSlots(sequence, nextLabels, preserveDirtyDrafts);
+        } else {
+          // A locked connection is valid, but it must not trigger LIST/GET or
+          // an automatic reconnect loop. Keep only any same-device dirty draft.
+          setSlots((previous) =>
+            previous.map((slot) =>
+              slot.revealed ? { ...slot, revealed: false } : slot,
+            ),
+          );
+        }
         if (isCurrent(sequence)) {
           setError(null);
           setReconnecting(false);
@@ -574,8 +632,32 @@ function App() {
         if (isCurrent(sequence)) {
           const nextError = commandError(caught);
           setError(nextError);
-          setConnection(disconnected);
-          requestReconnect();
+          const nextAuthState = authStateForErrorCode(nextError.code);
+          const dropConnection =
+            !connectionEstablished || shouldDropConnectionAfterCommandError(nextError.code);
+          if (dropConnection) {
+            setConnection(disconnected);
+            if (shouldReconnectAfterConnectionError(nextError.code)) {
+              requestReconnect();
+            } else {
+              autoReconnectSuppressed.current = true;
+              setReconnecting(false);
+            }
+          } else {
+            if (nextAuthState) {
+              setConnection((current) =>
+                current.connected
+                  ? { ...current, authState: nextAuthState }
+                  : current,
+              );
+            }
+            setSlots((previous) =>
+              previous.map((slot) =>
+                slot.revealed ? { ...slot, revealed: false } : slot,
+              ),
+            );
+            setReconnecting(false);
+          }
         }
       } finally {
         if (ownsBusyState && isCurrent(sequence)) {
@@ -633,23 +715,53 @@ function App() {
         const nextLabels = readLabels(nextConnection.device);
         lastDevice.current = nextConnection.device;
         setLabels(nextLabels);
-        try {
-          await loadSlots(sequence, nextLabels);
-        } catch (caught) {
-          if (isCurrent(sequence)) {
-            const nextError = commandError(caught);
-            setConnection(disconnected);
-            setSlots((previous) =>
-              previous.map((slot) =>
-                slot.revealed ? { ...slot, revealed: false } : slot,
-              ),
-            );
-            setError(nextError);
-            requestReconnect();
+        if (canManageConnection(nextConnection)) {
+          try {
+            await loadSlots(sequence, nextLabels);
+          } catch (caught) {
+            if (isCurrent(sequence)) {
+              const nextError = commandError(caught);
+              const nextAuthState = authStateForErrorCode(nextError.code);
+              if (nextAuthState) {
+                setConnection((current) =>
+                  current.connected
+                    ? { ...current, authState: nextAuthState }
+                    : current,
+                );
+                setSlots((previous) =>
+                  previous.map((slot) =>
+                    slot.revealed ? { ...slot, revealed: false } : slot,
+                  ),
+                );
+              } else {
+                if (shouldDropConnectionAfterCommandError(nextError.code)) {
+                  setConnection(disconnected);
+                  requestReconnect();
+                }
+                setSlots((previous) =>
+                  previous.map((slot) =>
+                    slot.revealed ? { ...slot, revealed: false } : slot,
+                  ),
+                );
+              }
+              if (!shouldDropConnectionAfterCommandError(nextError.code)) {
+                setReconnecting(false);
+                reconnectAttempt.current = 0;
+              }
+              setError(nextError);
+            }
+            return;
           }
-          return;
+        } else {
+          setSlots((previous) =>
+            previous.map((slot) =>
+              slot.revealed ? { ...slot, revealed: false } : slot,
+            ),
+          );
         }
         if (isCurrent(sequence)) {
+          // A locked/credential-invalid connection is still physically
+          // connected and must not enter reconnect backoff.
           setReconnecting(false);
           reconnectAttempt.current = 0;
         }
@@ -694,7 +806,12 @@ function App() {
       if (isCurrent(sequence)) {
         const nextError = commandError(caught);
         setError(nextError);
-        requestReconnect();
+        if (shouldReconnectAfterConnectionError(nextError.code)) {
+          requestReconnect();
+        } else {
+          autoReconnectSuppressed.current = true;
+          setReconnecting(false);
+        }
       }
     } finally {
       if (isCurrent(sequence)) {
@@ -744,28 +861,43 @@ function App() {
     setBusy(true);
     setError(null);
     try {
+      if (!canManageConnection(connection)) {
+        return;
+      }
       await loadSlots(sequence);
     } catch (caught) {
       if (isCurrent(sequence)) {
         const nextError = commandError(caught);
+        const nextAuthState = authStateForErrorCode(nextError.code);
         setError(nextError);
-        setConnection(disconnected);
         setSlots((previous) =>
           previous.map((slot) =>
             slot.revealed ? { ...slot, revealed: false } : slot,
           ),
         );
-        requestReconnect();
+        if (nextAuthState) {
+          setConnection((current) =>
+            current.connected
+              ? { ...current, authState: nextAuthState }
+              : current,
+          );
+        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
+          setConnection(disconnected);
+          requestReconnect();
+        }
       }
     } finally {
       if (isCurrent(sequence)) {
         setBusy(false);
       }
     }
-  }, [commandError, isCurrent, loadSlots, requestReconnect]);
+  }, [commandError, connection, isCurrent, loadSlots, requestReconnect]);
 
   const loadSlotContent = useCallback(
     async (slotNumber: number) => {
+      if (!canManageConnection(connection)) {
+        return;
+      }
       const sequence = operation.current;
       const request = ++slotRequest.current;
       setSlots((previous) =>
@@ -820,7 +952,16 @@ function App() {
           return;
         }
         const nextError = commandError(caught);
-        setConnection(disconnected);
+        const nextAuthState = authStateForErrorCode(nextError.code);
+        if (nextAuthState) {
+          setConnection((current) =>
+            current.connected
+              ? { ...current, authState: nextAuthState }
+              : current,
+          );
+        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
+          setConnection(disconnected);
+        }
         setSlots((previous) =>
           previous.map((slot) => {
             if (slot.slot === slotNumber) {
@@ -847,10 +988,12 @@ function App() {
           }),
         );
         setError(nextError);
-        requestReconnect();
+        if (!nextAuthState && shouldDropConnectionAfterCommandError(nextError.code)) {
+          requestReconnect();
+        }
       }
     },
-    [commandError, isCurrent, recordOperation, requestReconnect, selectedSlot],
+    [commandError, connection, isCurrent, recordOperation, requestReconnect, selectedSlot],
   );
 
   const selectedState = useMemo(
@@ -859,7 +1002,7 @@ function App() {
   );
 
   useEffect(() => {
-    if (!connection.connected || selectedSlot === null) {
+    if (!canManageConnection(connection) || selectedSlot === null) {
       return;
     }
     const slot = slots.find((item) => item.slot === selectedSlot);
@@ -875,7 +1018,7 @@ function App() {
       return;
     }
     void loadSlotContent(selectedSlot);
-  }, [connection.connected, loadSlotContent, selectedSlot, slots]);
+  }, [connection, loadSlotContent, selectedSlot, slots]);
 
   const updateSelectedSlot = useCallback(
     (update: (slot: SlotState) => SlotState) => {
@@ -951,7 +1094,7 @@ function App() {
     async (slotNumber = selectedSlot) => {
       if (
         slotNumber === null ||
-        !connection.connected ||
+        !canManageConnection(connection) ||
         mutationBusy
       ) {
         return;
@@ -1015,7 +1158,16 @@ function App() {
           return;
         }
         const nextError = commandError(caught);
-        setConnection(disconnected);
+        const nextAuthState = authStateForErrorCode(nextError.code);
+        if (nextAuthState) {
+          setConnection((current) =>
+            current.connected
+              ? { ...current, authState: nextAuthState }
+              : current,
+          );
+        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
+          setConnection(disconnected);
+        }
         setError(nextError);
         setSlots((previous) =>
           previous.map((item) =>
@@ -1030,7 +1182,9 @@ function App() {
               : item,
           ),
         );
-        requestReconnect();
+        if (!nextAuthState && shouldDropConnectionAfterCommandError(nextError.code)) {
+          requestReconnect();
+        }
       } finally {
         if (mounted.current && mutationRequest.current === request) {
           setMutationBusy(false);
@@ -1042,7 +1196,7 @@ function App() {
 
   const clearSlot = useCallback(
     async (slotNumber: number) => {
-      if (!connection.connected || mutationBusy) {
+      if (!canManageConnection(connection) || mutationBusy) {
         return;
       }
       const slot = slots.find((item) => item.slot === slotNumber);
@@ -1098,7 +1252,16 @@ function App() {
           return;
         }
         const nextError = commandError(caught);
-        setConnection(disconnected);
+        const nextAuthState = authStateForErrorCode(nextError.code);
+        if (nextAuthState) {
+          setConnection((current) =>
+            current.connected
+              ? { ...current, authState: nextAuthState }
+              : current,
+          );
+        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
+          setConnection(disconnected);
+        }
         setError(nextError);
         setSlots((previous) =>
           previous.map((item) =>
@@ -1113,14 +1276,16 @@ function App() {
               : item,
           ),
         );
-        requestReconnect();
+        if (!nextAuthState && shouldDropConnectionAfterCommandError(nextError.code)) {
+          requestReconnect();
+        }
       } finally {
         if (mounted.current && mutationRequest.current === request) {
           setMutationBusy(false);
         }
       }
     },
-    [commandError, connection.connected, mutationBusy, recordOperation, requestReconnect, slots],
+    [commandError, connection, mutationBusy, recordOperation, requestReconnect, slots],
   );
 
   const retrySlotAction = useCallback(
@@ -1439,13 +1604,14 @@ function App() {
   }, [refreshDevices]);
 
   const selectedDevice = devices.find((device) => device.id === selectedId);
+  const canManage = canManageConnection(connection);
   const mutationInProgress = mutationBusy || slots.some((slot) => slot.status === "saving");
   const selectedDirty = selectedState ? isDirty(selectedState) : false;
   const canSave = Boolean(
     selectedState &&
       selectedState.loaded &&
       selectedDirty &&
-      connection.connected &&
+      canManage &&
       !busy &&
       !mutationInProgress,
   );
@@ -1729,7 +1895,7 @@ function App() {
                 {formatHex(connection.device.vendorId)} / {formatHex(connection.device.productId)} · {copy.interfaceNumber(connection.device.interfaceNumber)}
               </span>
             ) : null}
-            {connection.connected ? (
+            {canManage ? (
               <button
                 className="text-button"
                 type="button"
@@ -1772,13 +1938,14 @@ function App() {
               </span>
             </div>
             <dl className="diagnostics-grid">
-              <div><dt>{copy.protocol}</dt><dd>Runtime Macro v1</dd></div>
+              <div><dt>{copy.protocol}</dt><dd>Runtime Macro v2</dd></div>
               <div><dt>{copy.transport}</dt><dd>USB HID</dd></div>
               <div><dt>{copy.device}</dt><dd>{connection.device?.productName ?? "—"}</dd></div>
               <div><dt>{copy.vidPid}</dt><dd>{connection.device ? `${formatHex(connection.device.vendorId)} / ${formatHex(connection.device.productId)}` : "—"}</dd></div>
               <div><dt>{copy.interface}</dt><dd>{connection.device?.interfaceNumber ?? "—"}</dd></div>
               <div><dt>{copy.usage}</dt><dd>{connection.device ? `${formatHex(connection.device.usagePage)} / ${formatHex(connection.device.usage)}` : "—"}</dd></div>
               <div><dt>{copy.slotCountLabel}</dt><dd>{slots.length}</dd></div>
+              <div><dt>{copy.authentication}</dt><dd>{connection.authState}</dd></div>
               <div><dt>{copy.lastOperation}</dt><dd>{lastOperation ?? copy.none}</dd></div>
               <div><dt>{copy.lastErrorCode}</dt><dd>{lastErrorCode ?? copy.none}</dd></div>
             </dl>
@@ -1792,7 +1959,7 @@ function App() {
           <aside className="slot-list" aria-label={copy.macroSlotsAria}>
             {slots.length === 0 ? (
               <p className="muted-copy slot-list-empty">
-                {connection.connected ? copy.noSlotsReturned : copy.connectToLoadSlots}
+                {canManage ? copy.noSlotsReturned : copy.connectToLoadSlots}
               </p>
             ) : (
               slots.map((slot) => {
@@ -1878,7 +2045,7 @@ function App() {
                       className="text-button"
                       type="button"
                       onClick={() => retrySlotAction(selectedState)}
-                      disabled={busy || mutationInProgress || !connection.connected}
+                      disabled={busy || mutationInProgress || !canManage}
                     >
                       {copy.retry}
                     </button>
@@ -1890,7 +2057,7 @@ function App() {
                       className="button-secondary"
                       type="button"
                       onClick={addMacro}
-                      disabled={!selectedState.loaded || mutationInProgress || !connection.connected}
+                      disabled={!selectedState.loaded || mutationInProgress || !canManage}
                     >
                       {copy.addMacro}
                     </button>
@@ -1904,7 +2071,7 @@ function App() {
                       value={selectedState.revealed ? toEditorText(selectedState.draftText) : maskText(selectedState.draftText)}
                       onChange={(event) => updateEditor(event.target.value)}
                       onKeyDown={handleEditorKeyDown}
-                      readOnly={!selectedState.revealed || mutationInProgress || !connection.connected}
+                      readOnly={!selectedState.revealed || mutationInProgress || !canManage}
                       spellCheck={false}
                       autoComplete="off"
                       aria-label={copy.macroContent}
@@ -1917,7 +2084,7 @@ function App() {
                         setInputError(null);
                         updateSelectedSlot((slot) => ({ ...slot, revealed: !slot.revealed }));
                       }}
-                      disabled={mutationInProgress || !connection.connected}
+                      disabled={mutationInProgress || !canManage}
                       aria-label={selectedState.revealed ? copy.hideMacroContent : copy.revealMacroContent}
                       aria-pressed={selectedState.revealed}
                     >
@@ -1930,9 +2097,9 @@ function App() {
                 </p>
                 {selectedState.revealed ? (
                   <div className="control-actions" aria-label={copy.insertControlCharacter}>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("↵")} disabled={mutationInProgress || !connection.connected}>{copy.insertLf}</button>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("⇥")} disabled={mutationInProgress || !connection.connected}>{copy.insertTab}</button>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("⌫")} disabled={mutationInProgress || !connection.connected}>{copy.insertBackspace}</button>
+                    <button className="text-button" type="button" onClick={() => insertControlToken("↵")} disabled={mutationInProgress || !canManage}>{copy.insertLf}</button>
+                    <button className="text-button" type="button" onClick={() => insertControlToken("⇥")} disabled={mutationInProgress || !canManage}>{copy.insertTab}</button>
+                    <button className="text-button" type="button" onClick={() => insertControlToken("⌫")} disabled={mutationInProgress || !canManage}>{copy.insertBackspace}</button>
                   </div>
                 ) : null}
                 {inputErrorMessage ? <p className="field-error" role="alert">{inputErrorMessage}</p> : null}
@@ -1944,7 +2111,7 @@ function App() {
                       className="text-button"
                       type="button"
                       onClick={() => retrySlotAction(selectedState)}
-                      disabled={busy || mutationInProgress || !connection.connected}
+                      disabled={busy || mutationInProgress || !canManage}
                     >
                       {copy.retry}
                     </button>
@@ -1958,7 +2125,7 @@ function App() {
                       type="button"
                       onClick={() => setClearConfirm(selectedState.slot)}
                       disabled={
-                        !connection.connected ||
+                        !canManage ||
                         !selectedState.loaded ||
                         selectedByteLength === 0 ||
                         mutationInProgress

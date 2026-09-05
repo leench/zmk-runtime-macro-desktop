@@ -57,6 +57,7 @@ export type Messages = {
   disconnect: string;
   diagnostics: string;
   connectionDetails: string;
+  authentication: string;
   connected: string;
   disconnected: string;
   protocol: string;
@@ -172,6 +173,7 @@ const english: Messages = {
   disconnect: "Disconnect",
   diagnostics: "Diagnostics",
   connectionDetails: "Connection details",
+  authentication: "Authentication",
   connected: "Connected",
   disconnected: "Disconnected",
   protocol: "Protocol",
@@ -287,6 +289,7 @@ const chinese: Messages = {
   disconnect: "断开连接",
   diagnostics: "诊断",
   connectionDetails: "连接详情",
+  authentication: "认证状态",
   connected: "已连接",
   disconnected: "已断开",
   protocol: "协议",

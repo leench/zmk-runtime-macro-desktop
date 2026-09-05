@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::client::{ClientConfig, RuntimeMacroClient, SlotInfo};
 use crate::error::{ClientError, TransportError};
@@ -10,7 +11,7 @@ use crate::hid::{
     enumerate_devices, new_hid_api, open_device, DeviceDiscoveryError, DeviceRecord, DeviceSummary,
     HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
-use crate::protocol::AuthInfo;
+use crate::protocol::{AuthInfo, Status};
 
 /// A stable, serializable error envelope used by every frontend command.
 ///
@@ -219,11 +220,34 @@ pub struct ConnectedDevice {
     pub usage_metadata: UsageMetadataStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthState {
+    Disconnected,
+    Open,
+    Locked,
+    Authenticated,
+    CredentialInvalid,
+}
+
+impl AuthState {
+    fn from_info(info: &AuthInfo) -> Self {
+        if !info.password_configured {
+            Self::Open
+        } else if info.session_authenticated {
+            Self::Authenticated
+        } else {
+            Self::Locked
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionState {
     pub connected: bool,
     pub device: Option<ConnectedDevice>,
+    pub auth_state: AuthState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -442,6 +466,7 @@ impl SessionFactory for HidSessionFactory {
 struct ConnectedSession {
     device: ConnectedDevice,
     session: Box<dyn MacroSession>,
+    auth_state: AuthState,
 }
 
 pub struct AppState<F: SessionFactory = HidSessionFactory> {
@@ -494,9 +519,10 @@ impl<F: SessionFactory> AppState<F> {
     }
 
     pub fn connect(&mut self, opaque_id: &str) -> Result<ConnectionState, CommandError> {
-        // A failed replacement attempt must never leave the previous session
-        // looking connected to the frontend.
-        self.connection = None;
+        // Switching devices must not leave the previous authentication window
+        // active. LOCK is best-effort because the old transport may already be
+        // gone; dropping the session is unconditional.
+        self.disconnect();
 
         let record = self
             .registry
@@ -509,9 +535,23 @@ impl<F: SessionFactory> AppState<F> {
             .open(&record, self.client_config)
             .map_err(CommandError::from)?;
 
-        // Do not install the session until its first complete LIST succeeds.
-        session.list_slots().map_err(CommandError::from)?;
-        self.connection = Some(ConnectedSession { device, session });
+        // AUTH_INFO is the v2 handshake. Do not install a session until it
+        // succeeds, and never fall back to an unauthenticated v1 LIST.
+        let info = match session.auth_info() {
+            Ok(info) => info,
+            Err(error) => {
+                // The candidate session is not installed, but still gets a
+                // best-effort LOCK before its transport is dropped.
+                let _ = session.lock();
+                return Err(CommandError::from(error));
+            }
+        };
+        let auth_state = AuthState::from_info(&info);
+        self.connection = Some(ConnectedSession {
+            device,
+            session,
+            auth_state,
+        });
         Ok(self.connection_state())
     }
 
@@ -520,18 +560,227 @@ impl<F: SessionFactory> AppState<F> {
             Some(connection) => ConnectionState {
                 connected: true,
                 device: Some(connection.device.clone()),
+                auth_state: connection.auth_state,
             },
             None => ConnectionState {
                 connected: false,
                 device: None,
+                auth_state: AuthState::Disconnected,
             },
         }
     }
 
-    pub fn list_slots(&mut self) -> Result<Vec<SlotMetadata>, CommandError> {
+    pub fn refresh_auth_state(&mut self) -> Result<AuthState, CommandError> {
         if self.connection.is_none() {
             return Err(CommandError::not_connected());
         }
+
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .auth_info();
+        match result {
+            Ok(info) => {
+                let auth_state = AuthState::from_info(&info);
+                self.connection
+                    .as_mut()
+                    .expect("connection was checked above")
+                    .auth_state = auth_state;
+                Ok(auth_state)
+            }
+            Err(error) => {
+                if !self.retain_connection_for_command_error(&error) {
+                    self.connection = None;
+                }
+                Err(CommandError::from(error))
+            }
+        }
+    }
+
+    pub fn authenticate(&mut self, password: &str) -> Result<AuthState, CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .authenticate(password);
+        match result {
+            Ok(()) => {
+                self.connection
+                    .as_mut()
+                    .expect("connection was checked above")
+                    .auth_state = AuthState::Authenticated;
+                Ok(AuthState::Authenticated)
+            }
+            Err(error) => {
+                if !self.retain_connection_for_command_error(&error) {
+                    self.connection = None;
+                }
+                Err(CommandError::from(error))
+            }
+        }
+    }
+
+    pub fn set_password(&mut self, password: &str) -> Result<AuthState, CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .set_password(password);
+        match result {
+            Ok(()) => {
+                // PASSWORD_SET success invalidates the old session and the
+                // client confirms PROTECTED through AUTH_INFO before returning.
+                self.connection
+                    .as_mut()
+                    .expect("connection was checked above")
+                    .auth_state = AuthState::Locked;
+                Ok(AuthState::Locked)
+            }
+            Err(error) => {
+                // CREDENTIAL_INVALID is ambiguous at this boundary: the
+                // PASSWORD_SET object may be rejected while the old session
+                // remains valid, or the client's AUTH_INFO observation may
+                // have found a damaged device credential. Re-read AUTH_INFO
+                // once, returning the original error either way.
+                if matches!(error, ClientError::Remote(Status::CredentialInvalid)) {
+                    self.reconcile_credential_invalid();
+                } else if !self.retain_connection_for_command_error(&error) {
+                    self.connection = None;
+                }
+                Err(CommandError::from(error))
+            }
+        }
+    }
+
+    pub fn lock(&mut self) -> Result<AuthState, CommandError> {
+        let previous_state = self
+            .connection
+            .as_ref()
+            .map(|connection| connection.auth_state)
+            .ok_or_else(CommandError::not_connected)?;
+
+        // The local state is locked before observing the transport result.
+        // This is deliberately unconditional so a failed LOCK cannot leave a
+        // stale authenticated state visible to the frontend.
+        self.connection
+            .as_mut()
+            .expect("connection was checked above")
+            .auth_state = AuthState::Locked;
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .lock();
+        let state_after_lock = match &result {
+            Ok(()) => state_after_lock_result(previous_state),
+            Err(ClientError::Remote(Status::AuthNotConfigured)) => AuthState::Open,
+            Err(ClientError::Remote(Status::CredentialInvalid)) => AuthState::CredentialInvalid,
+            Err(_) => state_after_lock_result(previous_state),
+        };
+        self.connection
+            .as_mut()
+            .expect("connection was checked above")
+            .auth_state = state_after_lock;
+        match result {
+            Ok(()) => Ok(state_after_lock),
+            Err(error) => Err(CommandError::from(error)),
+        }
+    }
+
+    fn reconcile_credential_invalid(&mut self) {
+        if self.connection.is_none() {
+            return;
+        }
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .auth_info();
+        match result {
+            Ok(info) => {
+                let auth_state = AuthState::from_info(&info);
+                self.connection
+                    .as_mut()
+                    .expect("connection was checked above")
+                    .auth_state = auth_state;
+            }
+            Err(error) => {
+                if !self.retain_connection_for_command_error(&error) {
+                    self.connection = None;
+                }
+            }
+        }
+    }
+
+    fn retain_connection_for_auth_error(&mut self, error: &ClientError) -> bool {
+        if let Some(auth_state) = auth_state_for_error(error) {
+            if let Some(connection) = self.connection.as_mut() {
+                connection.auth_state = auth_state;
+                return true;
+            }
+            return false;
+        }
+        self.retain_connection_for_command_error(error)
+    }
+
+    fn ensure_management_access(&self) -> Result<(), CommandError> {
+        let Some(connection) = self.connection.as_ref() else {
+            return Err(CommandError::not_connected());
+        };
+        match connection.auth_state {
+            AuthState::Open | AuthState::Authenticated => Ok(()),
+            AuthState::Locked => Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired,
+            ))),
+            AuthState::CredentialInvalid => Err(CommandError::from(ClientError::Remote(
+                Status::CredentialInvalid,
+            ))),
+            AuthState::Disconnected => Err(CommandError::not_connected()),
+        }
+    }
+
+    fn retain_connection_for_command_error(&mut self, error: &ClientError) -> bool {
+        if let Some(auth_state) = auth_state_for_error(error) {
+            if let Some(connection) = self.connection.as_mut() {
+                connection.auth_state = auth_state;
+                return true;
+            }
+            return false;
+        }
+
+        // A remote status is a valid protocol response and leaves the HID
+        // session usable. Only exhausted transport failures, malformed
+        // protocol responses, and an explicit incompatibility status discard
+        // the session. This also preserves the old credential/session state on
+        // PASSWORD_SET STORAGE_ERROR.
+        match error {
+            ClientError::Transport(_) | ClientError::Protocol(_) => false,
+            ClientError::Remote(Status::BadVersion) => false,
+            ClientError::Remote(_)
+            | ClientError::Auth(_)
+            | ClientError::InvalidConfiguration(_)
+            | ClientError::InvalidSlot(_)
+            | ClientError::InvalidText(_)
+            | ClientError::LengthExceeded { .. } => self.connection.is_some(),
+        }
+    }
+
+    pub fn list_slots(&mut self) -> Result<Vec<SlotMetadata>, CommandError> {
+        self.ensure_management_access()?;
 
         let result = self
             .connection
@@ -542,18 +791,19 @@ impl<F: SessionFactory> AppState<F> {
         match result {
             Ok(slots) => Ok(slots.into_iter().map(SlotMetadata::from).collect()),
             Err(error) => {
-                // A failed LIST means the current session can no longer be
-                // trusted. Drop it before returning the sanitized error.
-                self.connection = None;
+                // Valid remote statuses keep the HID connection so the
+                // frontend can recover authentication without reconnecting;
+                // only transport/protocol failure invalidates it.
+                if !self.retain_connection_for_auth_error(&error) {
+                    self.connection = None;
+                }
                 Err(CommandError::from(error))
             }
         }
     }
 
     pub fn get_slot(&mut self, slot: u8) -> Result<Vec<u8>, CommandError> {
-        if self.connection.is_none() {
-            return Err(CommandError::not_connected());
-        }
+        self.ensure_management_access()?;
 
         let result = self
             .connection
@@ -564,19 +814,18 @@ impl<F: SessionFactory> AppState<F> {
         match result {
             Ok(data) => Ok(data),
             Err(error) => {
-                // A failed read invalidates the live session. The frontend must
-                // not continue to present a connected state after a transport
-                // or protocol failure.
-                self.connection = None;
+                if !self.retain_connection_for_auth_error(&error) {
+                    // A transport/protocol read failure invalidates the live
+                    // session. A remote status remains physically connected.
+                    self.connection = None;
+                }
                 Err(CommandError::from(error))
             }
         }
     }
 
     pub fn set_slot(&mut self, slot: u8, text: &str) -> Result<(), CommandError> {
-        if self.connection.is_none() {
-            return Err(CommandError::not_connected());
-        }
+        self.ensure_management_access()?;
 
         let result = self
             .connection
@@ -587,19 +836,19 @@ impl<F: SessionFactory> AppState<F> {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                // SET may leave RAM changed when persistence reports an error,
-                // so the session is discarded and the UI must ask the user to
-                // reconnect and read the slot again rather than guessing.
-                self.connection = None;
+                if !self.retain_connection_for_auth_error(&error) {
+                    // SET transport/protocol failures invalidate the session;
+                    // STORAGE_ERROR and other remote statuses retain it while
+                    // the caller reports the authoritative device error.
+                    self.connection = None;
+                }
                 Err(CommandError::from(error))
             }
         }
     }
 
     pub fn clear_slot(&mut self, slot: u8) -> Result<(), CommandError> {
-        if self.connection.is_none() {
-            return Err(CommandError::not_connected());
-        }
+        self.ensure_management_access()?;
 
         let result = self
             .connection
@@ -610,14 +859,43 @@ impl<F: SessionFactory> AppState<F> {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.connection = None;
+                if !self.retain_connection_for_auth_error(&error) {
+                    self.connection = None;
+                }
                 Err(CommandError::from(error))
             }
         }
     }
 
     pub fn disconnect(&mut self) {
-        self.connection = None;
+        if let Some(mut connection) = self.connection.take() {
+            // LOCK is best-effort on disconnect. Dropping the session locally
+            // is the authoritative lifecycle action even if the HID write fails.
+            let _ = connection.session.lock();
+        }
+    }
+}
+
+fn state_after_lock_result(previous_state: AuthState) -> AuthState {
+    match previous_state {
+        AuthState::Open => AuthState::Open,
+        AuthState::CredentialInvalid => AuthState::CredentialInvalid,
+        AuthState::Disconnected | AuthState::Locked | AuthState::Authenticated => AuthState::Locked,
+    }
+}
+
+fn auth_state_for_error(error: &ClientError) -> Option<AuthState> {
+    let ClientError::Remote(status) = error else {
+        return None;
+    };
+    match status {
+        Status::AuthRequired
+        | Status::AuthFailed
+        | Status::RateLimited
+        | Status::AuthNoChallenge => Some(AuthState::Locked),
+        Status::AuthNotConfigured => Some(AuthState::Open),
+        Status::CredentialInvalid => Some(AuthState::CredentialInvalid),
+        _ => None,
     }
 }
 
@@ -718,6 +996,72 @@ pub async fn get_connection(
 }
 
 #[tauri::command]
+pub async fn refresh_auth_state(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AuthState, CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.refresh_auth_state()
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
+pub async fn authenticate(
+    password: String,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AuthState, CommandError> {
+    // Wrap the command-owned password before entering the blocking task. It
+    // is never logged, serialized, persisted, or included in an error.
+    let password = Zeroizing::new(password);
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.authenticate(password.as_str())
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
+pub async fn set_password(
+    password: String,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AuthState, CommandError> {
+    let password = Zeroizing::new(password);
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.set_password(password.as_str())
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
+pub async fn lock_device(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AuthState, CommandError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.lock()
+    })
+    .await
+    .map_err(|_| CommandError::state_unavailable())?
+}
+
+#[tauri::command]
 pub async fn list_slots(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<SlotMetadata>, CommandError> {
@@ -811,9 +1155,17 @@ mod tests {
         get_result: Result<Vec<u8>, ClientError>,
         set_result: Result<(), ClientError>,
         clear_result: Result<(), ClientError>,
+        auth_info_result: Result<AuthInfo, ClientError>,
+        auth_info_followup_result: Option<Result<AuthInfo, ClientError>>,
+        authenticate_result: Result<(), ClientError>,
+        password_result: Result<(), ClientError>,
+        lock_result: Result<(), ClientError>,
         open_error: Option<DeviceDiscoveryError>,
         open_count: Arc<StdMutex<usize>>,
         open_configs: Arc<StdMutex<Vec<ClientConfig>>>,
+        list_calls: Arc<StdMutex<usize>>,
+        auth_info_calls: Arc<StdMutex<usize>>,
+        lock_calls: Arc<StdMutex<usize>>,
         get_calls: Arc<StdMutex<Vec<u8>>>,
         set_calls: SetCalls,
         clear_calls: Arc<StdMutex<Vec<u8>>>,
@@ -824,7 +1176,14 @@ mod tests {
         get_result: Result<Vec<u8>, ClientError>,
         set_result: Result<(), ClientError>,
         clear_result: Result<(), ClientError>,
+        auth_info_result: Result<AuthInfo, ClientError>,
+        auth_info_followup_result: Option<Result<AuthInfo, ClientError>>,
+        authenticate_result: Result<(), ClientError>,
+        password_result: Result<(), ClientError>,
+        lock_result: Result<(), ClientError>,
         list_count: Arc<StdMutex<usize>>,
+        auth_info_calls: Arc<StdMutex<usize>>,
+        lock_calls: Arc<StdMutex<usize>>,
         get_calls: Arc<StdMutex<Vec<u8>>>,
         set_calls: SetCalls,
         clear_calls: Arc<StdMutex<Vec<u8>>>,
@@ -850,6 +1209,30 @@ mod tests {
             self.clear_calls.lock().unwrap().push(slot);
             self.clear_result.clone()
         }
+
+        fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
+            let mut calls = self.auth_info_calls.lock().unwrap();
+            *calls += 1;
+            if *calls > 1 {
+                if let Some(result) = &self.auth_info_followup_result {
+                    return result.clone();
+                }
+            }
+            self.auth_info_result.clone()
+        }
+
+        fn authenticate(&mut self, _password: &str) -> Result<(), ClientError> {
+            self.authenticate_result.clone()
+        }
+
+        fn set_password(&mut self, _password: &str) -> Result<(), ClientError> {
+            self.password_result.clone()
+        }
+
+        fn lock(&mut self) -> Result<(), ClientError> {
+            *self.lock_calls.lock().unwrap() += 1;
+            self.lock_result.clone()
+        }
     }
 
     impl SessionFactory for FakeFactory {
@@ -868,7 +1251,14 @@ mod tests {
                 get_result: self.get_result.clone(),
                 set_result: self.set_result.clone(),
                 clear_result: self.clear_result.clone(),
-                list_count: Arc::clone(&self.open_count),
+                auth_info_result: self.auth_info_result.clone(),
+                auth_info_followup_result: self.auth_info_followup_result.clone(),
+                authenticate_result: self.authenticate_result.clone(),
+                password_result: self.password_result.clone(),
+                lock_result: self.lock_result.clone(),
+                list_count: Arc::clone(&self.list_calls),
+                auth_info_calls: Arc::clone(&self.auth_info_calls),
+                lock_calls: Arc::clone(&self.lock_calls),
                 get_calls: Arc::clone(&self.get_calls),
                 set_calls: Arc::clone(&self.set_calls),
                 clear_calls: Arc::clone(&self.clear_calls),
@@ -884,9 +1274,23 @@ mod tests {
                 get_result: Ok(Vec::new()),
                 set_result: Ok(()),
                 clear_result: Ok(()),
+                auth_info_result: Ok(AuthInfo {
+                    password_configured: false,
+                    session_authenticated: false,
+                    kdf_id: crate::auth::KDF_ID,
+                    iterations: crate::auth::DEFAULT_ITERATIONS,
+                    salt: [0; crate::auth::SALT_SIZE],
+                }),
+                auth_info_followup_result: None,
+                authenticate_result: Ok(()),
+                password_result: Ok(()),
+                lock_result: Ok(()),
                 open_error: None,
                 open_count: Arc::clone(&count),
                 open_configs: Arc::new(StdMutex::new(Vec::new())),
+                list_calls: Arc::new(StdMutex::new(0)),
+                auth_info_calls: Arc::new(StdMutex::new(0)),
+                lock_calls: Arc::new(StdMutex::new(0)),
                 get_calls: Arc::new(StdMutex::new(Vec::new())),
                 set_calls: Arc::new(StdMutex::new(Vec::new())),
                 clear_calls: Arc::new(StdMutex::new(Vec::new())),
@@ -1039,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_installs_session_only_after_list_succeeds() {
+    fn connect_installs_session_only_after_auth_info_succeeds() {
         let (factory, count) = factory(Ok(vec![SlotInfo {
             slot: 0,
             length: 12,
@@ -1055,7 +1459,539 @@ mod tests {
         let connection = state.connect(&candidate.id).unwrap();
         assert!(connection.connected);
         assert_eq!(state.connection_state(), connection);
-        assert_eq!(*count.lock().unwrap(), 2);
+        assert_eq!(*count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn auth_state_dto_is_minimal_and_stable() {
+        assert_eq!(
+            serde_json::to_string(&AuthState::Disconnected).unwrap(),
+            "\"disconnected\""
+        );
+        assert_eq!(serde_json::to_string(&AuthState::Open).unwrap(), "\"open\"");
+        assert_eq!(
+            serde_json::to_string(&AuthState::Locked).unwrap(),
+            "\"locked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthState::Authenticated).unwrap(),
+            "\"authenticated\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthState::CredentialInvalid).unwrap(),
+            "\"credentialInvalid\""
+        );
+
+        let state = ConnectionState {
+            connected: true,
+            device: None,
+            auth_state: AuthState::Authenticated,
+        };
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert!(serialized.contains("\"authState\":\"authenticated\""));
+        assert!(!serialized.contains("salt"));
+        assert!(!serialized.contains("iterations"));
+        assert!(!serialized.contains("kdf"));
+    }
+
+    #[test]
+    fn connect_probes_auth_info_before_any_macro_list() {
+        let (mut factory, _) = factory(Err(ClientError::Transport(TransportError::Fatal(
+            "private list detail".to_string(),
+        ))));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5a; crate::auth::SALT_SIZE],
+        });
+        let list_calls = Arc::clone(&factory.list_calls);
+        let auth_info_calls = Arc::clone(&factory.auth_info_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"auth-first",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+
+        let connection = state.connect(&candidate.id).unwrap();
+        assert_eq!(connection.auth_state, AuthState::Locked);
+        assert_eq!(*auth_info_calls.lock().unwrap(), 1);
+        assert_eq!(*list_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn bad_version_rejects_connection_without_v1_list_fallback() {
+        let (mut factory, _) = factory(Ok(vec![SlotInfo { slot: 0, length: 1 }]));
+        factory.auth_info_result = Err(ClientError::Remote(Status::BadVersion));
+        let list_calls = Arc::clone(&factory.list_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"legacy",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+
+        assert_eq!(
+            state.connect(&candidate.id),
+            Err(CommandError::from(ClientError::Remote(Status::BadVersion)))
+        );
+        assert_eq!(*list_calls.lock().unwrap(), 0);
+        assert_eq!(state.connection_state().auth_state, AuthState::Disconnected);
+    }
+
+    #[test]
+    fn authentication_gate_failures_keep_connection_and_lock_state() {
+        for status in [
+            Status::AuthFailed,
+            Status::RateLimited,
+            Status::AuthNoChallenge,
+        ] {
+            let (mut factory, _) = factory(Ok(Vec::new()));
+            factory.auth_info_result = Ok(AuthInfo {
+                password_configured: true,
+                session_authenticated: false,
+                kdf_id: crate::auth::KDF_ID,
+                iterations: crate::auth::DEFAULT_ITERATIONS,
+                salt: [0x5b; crate::auth::SALT_SIZE],
+            });
+            factory.authenticate_result = Err(ClientError::Remote(status));
+            let mut state = AppState::new(factory);
+            let candidate = state.refresh_records(vec![record(
+                b"auth-failure",
+                RUNTIME_MACRO_USAGE_PAGE,
+                RUNTIME_MACRO_USAGE,
+                2,
+            )])[0]
+                .clone();
+            state.connect(&candidate.id).unwrap();
+
+            assert_eq!(
+                state.authenticate("input"),
+                Err(CommandError::from(ClientError::Remote(status)))
+            );
+            assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+            assert!(state.connection_state().connected);
+        }
+    }
+
+    #[test]
+    fn refresh_auth_state_updates_public_state_without_exposing_auth_info() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5f; crate::auth::SALT_SIZE],
+        });
+        factory.auth_info_followup_result =
+            Some(Err(ClientError::Remote(Status::CredentialInvalid)));
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"auth-refresh",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        assert_eq!(
+            state.refresh_auth_state(),
+            Err(CommandError::from(ClientError::Remote(
+                Status::CredentialInvalid
+            )))
+        );
+        assert_eq!(
+            state.connection_state().auth_state,
+            AuthState::CredentialInvalid
+        );
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn locked_management_access_gate_blocks_macro_operations() {
+        let (mut factory, _) = factory(Ok(vec![SlotInfo { slot: 0, length: 1 }]));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5c; crate::auth::SALT_SIZE],
+        });
+        let list_calls = Arc::clone(&factory.list_calls);
+        let get_calls = Arc::clone(&factory.get_calls);
+        let set_calls = Arc::clone(&factory.set_calls);
+        let clear_calls = Arc::clone(&factory.clear_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"auth-required",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        assert_eq!(
+            state.list_slots(),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired
+            )))
+        );
+        assert_eq!(
+            state.get_slot(0),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired
+            )))
+        );
+        assert_eq!(
+            state.set_slot(0, "input"),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired
+            )))
+        );
+        assert_eq!(
+            state.clear_slot(0),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired
+            )))
+        );
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert!(state.connection_state().connected);
+        assert_eq!(*list_calls.lock().unwrap(), 0);
+        assert!(get_calls.lock().unwrap().is_empty());
+        assert!(set_calls.lock().unwrap().is_empty());
+        assert!(clear_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_authenticated_session_keeps_connection_and_locks_after_list() {
+        let (mut factory, _) = factory(Err(ClientError::Remote(Status::AuthRequired)));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x60; crate::auth::SALT_SIZE],
+        });
+        let list_calls = Arc::clone(&factory.list_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"expired-list",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        let connected = state.connect(&candidate.id).unwrap();
+        assert_eq!(connected.auth_state, AuthState::Authenticated);
+
+        assert_eq!(
+            state.list_slots(),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired
+            )))
+        );
+        assert_eq!(*list_calls.lock().unwrap(), 1);
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn expired_authenticated_session_keeps_connection_and_locks_after_get() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.get_result = Err(ClientError::Remote(Status::AuthRequired));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x61; crate::auth::SALT_SIZE],
+        });
+        let get_calls = Arc::clone(&factory.get_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"expired-get",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        assert_eq!(
+            state.get_slot(0),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthRequired
+            )))
+        );
+        assert_eq!(get_calls.lock().unwrap().as_slice(), &[0]);
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn locked_connection_can_authenticate_and_become_authenticated() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x62; crate::auth::SALT_SIZE],
+        });
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"unlock",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+
+        assert_eq!(state.authenticate("input"), Ok(AuthState::Authenticated));
+        assert_eq!(
+            state.connection_state().auth_state,
+            AuthState::Authenticated
+        );
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn password_set_success_locks_and_storage_error_preserves_auth_state() {
+        let (mut success_factory, _) = factory(Ok(Vec::new()));
+        success_factory.password_result = Ok(());
+        let mut success_state = AppState::new(success_factory);
+        let candidate = success_state.refresh_records(vec![record(
+            b"password-success",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        success_state.connect(&candidate.id).unwrap();
+        assert_eq!(success_state.set_password("input"), Ok(AuthState::Locked));
+        assert_eq!(
+            success_state.connection_state().auth_state,
+            AuthState::Locked
+        );
+        assert!(success_state.connection_state().connected);
+
+        let (mut storage_factory, _) = factory(Ok(Vec::new()));
+        storage_factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5d; crate::auth::SALT_SIZE],
+        });
+        storage_factory.password_result = Err(ClientError::Remote(Status::StorageError));
+        let mut storage_state = AppState::new(storage_factory);
+        let candidate = storage_state.refresh_records(vec![record(
+            b"password-storage",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        storage_state.connect(&candidate.id).unwrap();
+        assert_eq!(
+            storage_state.connection_state().auth_state,
+            AuthState::Authenticated
+        );
+        assert_eq!(
+            storage_state.set_password("input"),
+            Err(CommandError::from(ClientError::Remote(
+                Status::StorageError
+            )))
+        );
+        assert_eq!(
+            storage_state.connection_state().auth_state,
+            AuthState::Authenticated
+        );
+        assert!(storage_state.connection_state().connected);
+
+        let (mut rejected_factory, _) = factory(Ok(Vec::new()));
+        rejected_factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5e; crate::auth::SALT_SIZE],
+        });
+        rejected_factory.auth_info_followup_result = Some(Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5e; crate::auth::SALT_SIZE],
+        }));
+        rejected_factory.password_result = Err(ClientError::Remote(Status::CredentialInvalid));
+        let rejected_auth_info_calls = Arc::clone(&rejected_factory.auth_info_calls);
+        let mut rejected_state = AppState::new(rejected_factory);
+        let candidate = rejected_state.refresh_records(vec![record(
+            b"password-invalid-old-valid",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        rejected_state.connect(&candidate.id).unwrap();
+        assert_eq!(
+            rejected_state.set_password("input"),
+            Err(CommandError::from(ClientError::Remote(
+                Status::CredentialInvalid
+            )))
+        );
+        assert_eq!(*rejected_auth_info_calls.lock().unwrap(), 2);
+        assert_eq!(
+            rejected_state.connection_state().auth_state,
+            AuthState::Authenticated
+        );
+        assert!(rejected_state.connection_state().connected);
+
+        let (mut damaged_factory, _) = factory(Ok(Vec::new()));
+        damaged_factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x5f; crate::auth::SALT_SIZE],
+        });
+        damaged_factory.auth_info_followup_result =
+            Some(Err(ClientError::Remote(Status::CredentialInvalid)));
+        damaged_factory.password_result = Err(ClientError::Remote(Status::CredentialInvalid));
+        let mut damaged_state = AppState::new(damaged_factory);
+        let candidate = damaged_state.refresh_records(vec![record(
+            b"password-invalid-damaged",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        damaged_state.connect(&candidate.id).unwrap();
+        assert_eq!(
+            damaged_state.set_password("input"),
+            Err(CommandError::from(ClientError::Remote(
+                Status::CredentialInvalid
+            )))
+        );
+        assert_eq!(
+            damaged_state.connection_state().auth_state,
+            AuthState::CredentialInvalid
+        );
+        assert!(damaged_state.connection_state().connected);
+    }
+
+    #[test]
+    fn lock_is_local_first_and_disconnect_or_switch_best_effort_lock() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x63; crate::auth::SALT_SIZE],
+        });
+        factory.lock_result = Err(ClientError::Transport(TransportError::Timeout));
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let mut state = AppState::new(factory);
+        let candidates = state.refresh_records(vec![
+            record(b"first", RUNTIME_MACRO_USAGE_PAGE, RUNTIME_MACRO_USAGE, 1),
+            record(b"second", RUNTIME_MACRO_USAGE_PAGE, RUNTIME_MACRO_USAGE, 2),
+        ]);
+        state.connect(&candidates[0].id).unwrap();
+
+        assert_eq!(
+            state.lock(),
+            Err(CommandError::from(ClientError::Transport(
+                TransportError::Timeout
+            )))
+        );
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert!(state.connection_state().connected);
+
+        state.connect(&candidates[1].id).unwrap();
+        assert_eq!(*lock_calls.lock().unwrap(), 2);
+        assert!(state.connection_state().connected);
+        state.disconnect();
+        assert_eq!(*lock_calls.lock().unwrap(), 3);
+        assert_eq!(state.connection_state().auth_state, AuthState::Disconnected);
+    }
+
+    #[test]
+    fn lock_restores_open_and_credential_invalid_states_from_remote_statuses() {
+        let (mut open_factory, _) = factory(Ok(Vec::new()));
+        open_factory.lock_result = Err(ClientError::Remote(Status::AuthNotConfigured));
+        let mut open_state = AppState::new(open_factory);
+        let candidate = open_state.refresh_records(vec![record(
+            b"lock-open",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        open_state.connect(&candidate.id).unwrap();
+        assert_eq!(open_state.connection_state().auth_state, AuthState::Open);
+        assert_eq!(
+            open_state.lock(),
+            Err(CommandError::from(ClientError::Remote(
+                Status::AuthNotConfigured
+            )))
+        );
+        assert_eq!(open_state.connection_state().auth_state, AuthState::Open);
+        assert!(open_state.connection_state().connected);
+
+        let (mut credential_factory, _) = factory(Ok(Vec::new()));
+        credential_factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: true,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x64; crate::auth::SALT_SIZE],
+        });
+        credential_factory.auth_info_followup_result =
+            Some(Err(ClientError::Remote(Status::CredentialInvalid)));
+        credential_factory.lock_result = Err(ClientError::Remote(Status::CredentialInvalid));
+        let mut credential_state = AppState::new(credential_factory);
+        let candidate = credential_state.refresh_records(vec![record(
+            b"lock-credential-invalid",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        credential_state.connect(&candidate.id).unwrap();
+        assert_eq!(
+            credential_state.refresh_auth_state(),
+            Err(CommandError::from(ClientError::Remote(
+                Status::CredentialInvalid
+            )))
+        );
+        assert_eq!(
+            credential_state.connection_state().auth_state,
+            AuthState::CredentialInvalid
+        );
+        assert_eq!(
+            credential_state.lock(),
+            Err(CommandError::from(ClientError::Remote(
+                Status::CredentialInvalid
+            )))
+        );
+        assert_eq!(
+            credential_state.connection_state().auth_state,
+            AuthState::CredentialInvalid
+        );
+        assert!(credential_state.connection_state().connected);
     }
 
     #[test]
@@ -1077,15 +2013,18 @@ mod tests {
             ConnectionState {
                 connected: false,
                 device: None,
+                auth_state: AuthState::Disconnected,
             }
         );
     }
 
     #[test]
-    fn list_failure_does_not_leave_a_session_and_errors_are_sanitized() {
-        let (factory, _) = factory(Err(ClientError::Transport(TransportError::Fatal(
+    fn auth_info_failure_does_not_leave_a_session_and_errors_are_sanitized() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.auth_info_result = Err(ClientError::Transport(TransportError::Fatal(
             "private backend detail".to_string(),
-        ))));
+        )));
+        let lock_calls = Arc::clone(&factory.lock_calls);
         let mut state = AppState::new(factory);
         let candidate = state.refresh_records(vec![record(
             b"failure",
@@ -1099,6 +2038,7 @@ mod tests {
         assert_eq!(error.message, "Communication with the HID device failed.");
         assert!(!error.message.contains("private backend detail"));
         assert!(!state.connection_state().connected);
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
     }
 
     #[test]
@@ -1179,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn get_set_and_clear_failures_drop_the_session_and_preserve_safe_errors() {
+    fn transport_failure_drops_but_remote_status_preserves_the_session() {
         let (mut get_factory, _) = factory(Ok(Vec::new()));
         get_factory.get_result = Err(ClientError::Transport(TransportError::Fatal(
             "private fixture backend detail".to_string(),
@@ -1213,7 +2153,7 @@ mod tests {
             set_state.set_slot(0, "fixture").unwrap_err().code,
             "storage_error"
         );
-        assert!(!set_state.connection_state().connected);
+        assert!(set_state.connection_state().connected);
 
         let (mut clear_factory, _) = factory(Ok(Vec::new()));
         clear_factory.clear_result = Err(ClientError::Remote(Status::BadSlot));
@@ -1227,7 +2167,7 @@ mod tests {
             .clone();
         clear_state.connect(&clear_candidate.id).unwrap();
         assert_eq!(clear_state.clear_slot(0).unwrap_err().code, "bad_slot");
-        assert!(!clear_state.connection_state().connected);
+        assert!(clear_state.connection_state().connected);
     }
 
     #[test]

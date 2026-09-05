@@ -12,7 +12,7 @@
 
 GUI 只负责配置已有固件功能，不修改 ZMK 主仓库。宏管理使用 v2 wire protocol；检测到旧 v1 固件时只显示不兼容提示，不执行未认证的宏管理。
 
-当前状态：阶段 1–5 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表、宏编辑 UI、自动重连、连接设置和低调诊断；阶段 6 的跨平台打包配置已实现，待各平台 runner 验证。另，v2 认证协议/密码学后端基础、可测试认证 session 和 fake HID golden tests 已完成，认证 command/UI 接入仍需后续阶段推进。
+当前状态：阶段 1–5 已完成协议、HID 通信、设备发现、连接状态、slot 元数据列表、宏编辑 UI、自动重连、连接设置和低调诊断；阶段 6 的跨平台打包配置已实现，待各平台 runner 验证。v2 认证协议/密码学后端基础、可测试认证 session、fake HID golden tests，以及 Tauri authentication command 和前端 auth-state bridge 已完成；解锁/设置密码视觉 UI 留待后续阶段，当前不做 Legacy v1 管理或静默降级。
 
 ## 2. 固件和协议约束
 
@@ -43,6 +43,16 @@ GUI 的界面语言可以使用中文或英文，但宏内容本身不支持中�
 - fake HID golden tests 覆盖 canonical frame、认证状态/错误、NFC/KDF/proof、challenge/nonce、超时、限速、认证失败、storage failure 和 password-set ACK 边界。
 
 协议文档规定的 5 分钟认证窗口、30 秒 challenge 生命周期和限速计时由固件维护；桌面端只根据 `AUTH_INFO` 与认证错误状态更新本地 session，不在客户端猜测设备时间。
+
+### 阶段 2：认证 command 与连接状态接入
+
+阶段 2 将阶段 1 的 v2 client 接入 Tauri command 边界，且不改变协议或密码学实现：
+
+- 打开 HID 后先执行 `AUTH_INFO`；只有成功的 v2 `AUTH_INFO` 才安装 session。收到 `BAD_VERSION` 时报告不兼容，不回退到 v1 `LIST`；
+- 连接状态 DTO 只暴露 `disconnected`、`open`、`locked`、`authenticated` 或最小的 credential-invalid 状态，不暴露 salt、iterations、K、nonce、proof 或密码；
+- `AUTH_REQUIRED`、`AUTH_FAILED`、`RATE_LIMITED`、`AUTH_NO_CHALLENGE` 只将已连接 session 转为 locked；transport/protocol failure 才按现有策略丢弃 session；`PASSWORD_SET` 成功后转为 locked，`STORAGE_ERROR` 保留原 credential/session 语义；
+- device switch 和 disconnect 尝试 best-effort `LOCK`；显式 `LOCK` 先在本地标记 locked，即使 HID 返回错误；password command 输入在 command 边界进入 zeroizing storage，并通过 `spawn_blocking` 执行 HID/KDF；
+- React 只识别 `authState`：locked 时不发送 `LIST`/`GET`、不触发自动重连，并保留 dirty draft；解锁页、密码 modal 和完整视觉改版不属于本阶段。
 
 ## 3. 推荐技术栈
 
@@ -83,7 +93,7 @@ Runtime Macro                         [刷新设备] [已连接 ▾]
 - 支持手动刷新、断开、重新连接；
 - 通过定时枚举检测 USB 拔插，首版不依赖平台专用热插拔 API；
 - 界面展示和诊断只保留脱敏产品名、VID/PID 和 interface number；serial/HID path 仅作为当前进程内部精确选择凭据，不展示、不记录；
-- 阶段 2 只负责枚举和候选选择，不进行探测式广播 `LIST`；用户选定并建立连接后，由阶段 3 连接流程发送 `LIST`，确认所选接口确为 runtime macro 协议。
+- 枚举阶段不进行探测式广播 `LIST`；用户选定候选后，连接流程先发送 v2 `AUTH_INFO`。只有认证信息交换成功才安装 session；受保护且未认证时保持物理连接为 locked，不发送 `LIST`/`GET`，收到 `BAD_VERSION` 只报告不兼容，不回退到 v1。
 
 连接失败时需要区分：没有设备、多个候选设备、权限拒绝、设备忙、协议不兼容和 USB 传输失败。
 
