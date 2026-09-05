@@ -1,10 +1,12 @@
 import { CircleSlash2, LoaderCircle } from "lucide-react";
 import type { Messages } from "../i18n";
+import { SlotPreview } from "./SlotPreview";
 
 type SlotListItem = {
   slot: number;
   length: number;
   label: string;
+  text: string | null;
   loaded: boolean;
   dirty: boolean;
   loading: boolean;
@@ -16,11 +18,22 @@ type SlotListProps = {
   slots: SlotListItem[];
   selectedSlot: number | null;
   disabled: boolean;
+  previewCharacterCount: number;
+  hoverRevealDelay: number;
   onSelect: (slot: number) => void;
   onMoveSelection: (offset: number) => void;
 };
 
-export function SlotList({ copy, slots, selectedSlot, disabled, onSelect, onMoveSelection }: SlotListProps) {
+export function SlotList({
+  copy,
+  slots,
+  selectedSlot,
+  disabled,
+  previewCharacterCount,
+  hoverRevealDelay,
+  onSelect,
+  onMoveSelection,
+}: SlotListProps) {
   return (
     <nav
       aria-label={copy.macroSlotsAria}
@@ -48,26 +61,42 @@ export function SlotList({ copy, slots, selectedSlot, disabled, onSelect, onMove
             const empty = item.loaded && item.length === 0;
             return (
               <li key={item.slot}>
-                <button
-                  type="button"
-                  onClick={() => onSelect(item.slot)}
-                  disabled={disabled}
-                  aria-current={selected ? "true" : undefined}
-                  className={`flex min-h-[60px] w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors duration-150 ease-out disabled:cursor-not-allowed disabled:opacity-50 ${selected ? "border-accent bg-accent-soft" : "border-transparent hover:bg-surface-2"}`}
+                <div
+                  className={`flex min-h-[60px] w-full items-center gap-2 rounded-xl border px-3 py-2.5 transition-colors duration-150 ease-out ${selected ? "border-accent bg-accent-soft" : "border-transparent hover:bg-surface-2"}`}
                 >
-                  <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-[12px] font-semibold ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-muted"}`}>
-                    {String(item.slot + 1).padStart(2, "0")}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] font-semibold text-ink">{item.label || copy.defaultSlotLabel(String(item.slot + 1))}</span>
-                    <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-ink-subtle">
-                      {empty ? <CircleSlash2 className="h-3.5 w-3.5" aria-hidden="true" /> : null}
-                      {item.loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
-                      <span>{empty ? copy.empty : item.error ? copy.slotError : item.loaded ? copy.bytes(item.length) : copy.loadingSlot}</span>
+                  <button
+                    type="button"
+                    onClick={() => onSelect(item.slot)}
+                    disabled={disabled}
+                    aria-current={selected ? "true" : undefined}
+                    className="flex min-w-0 flex-1 items-center gap-3 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-[12px] font-semibold ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-muted"}`}>
+                      {String(item.slot + 1).padStart(2, "0")}
                     </span>
-                  </span>
-                  {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-warning" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
-                </button>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[13px] font-semibold text-ink">{item.label || copy.defaultSlotLabel(String(item.slot + 1))}</span>
+                      <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-ink-subtle">
+                        {empty ? <CircleSlash2 className="h-3.5 w-3.5" aria-hidden="true" /> : null}
+                        {item.loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
+                        <span>{empty ? copy.empty : item.error ? copy.slotError : item.loaded ? copy.bytes(item.length) : copy.loadingSlot}</span>
+                      </span>
+                    </span>
+                    {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-warning" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
+                  </button>
+                  <SlotPreview
+                    copy={copy}
+                    text={item.text}
+                    length={item.length}
+                    loaded={item.loaded}
+                    loading={item.loading}
+                    error={item.error}
+                    selected={selected}
+                    disabled={disabled}
+                    previewCharacterCount={previewCharacterCount}
+                    hoverRevealDelay={hoverRevealDelay}
+                  />
+                </div>
               </li>
             );
           })}

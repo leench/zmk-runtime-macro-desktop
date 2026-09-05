@@ -30,6 +30,8 @@ type MacroWorkbenchProps = {
   lastOperation: string | null;
   lastErrorCode: string | null;
   configuredBytes: number;
+  previewCharacterCount: number;
+  hoverRevealDelay: number;
   onThemeChange: (theme: ThemeMode) => void;
   onRefresh: () => void;
   onRefreshDevices: () => void;
@@ -82,6 +84,8 @@ export function MacroWorkbench({
   lastOperation,
   lastErrorCode,
   configuredBytes,
+  previewCharacterCount,
+  hoverRevealDelay,
   onThemeChange,
   onRefresh,
   onRefreshDevices,
@@ -117,6 +121,7 @@ export function MacroWorkbench({
     slot: slot.slot,
     length: slot.length,
     label: slot.draftLabel || copy.defaultSlotLabel(String(slot.slot + 1).padStart(2, "0")),
+    text: slot.loaded && !slot.loading && !slot.error ? slot.draftText : null,
     loaded: slot.loaded,
     dirty: slot.loaded && (slot.draftText !== slot.savedText || slot.draftLabel !== slot.savedLabel),
     loading: slot.loading,
@@ -179,7 +184,16 @@ export function MacroWorkbench({
         ) : null}
 
         <div className="flex min-h-0 flex-1 overflow-hidden">
-          <SlotList copy={copy} slots={slotItems} selectedSlot={selectedSlot} disabled={busy} onSelect={onSelectSlot} onMoveSelection={onMoveSelection} />
+          <SlotList
+            copy={copy}
+            slots={slotItems}
+            selectedSlot={selectedSlot}
+            disabled={busy}
+            previewCharacterCount={previewCharacterCount}
+            hoverRevealDelay={hoverRevealDelay}
+            onSelect={onSelectSlot}
+            onMoveSelection={onMoveSelection}
+          />
           {selectedState ? (
             <MacroEditor
               copy={copy}

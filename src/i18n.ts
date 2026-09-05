@@ -165,6 +165,20 @@ export type MessageTable = {
   millisecondsRange: (min: number, max: number) => string;
   transportRetriesRange: (max: number) => string;
   settingsHelp: string;
+  previewCharacterCount: string;
+  previewCharacterCountHelp: string;
+  hoverRevealDelay: string;
+  hoverRevealDelayHelp: string;
+  hoverRevealDisabled: string;
+  hoverRevealImmediate: string;
+  hoverRevealSeconds: (seconds: number) => string;
+  increasePreviewCharacterCount: string;
+  decreasePreviewCharacterCount: string;
+  increaseHoverRevealDelay: string;
+  decreaseHoverRevealDelay: string;
+  previewUnavailable: string;
+  revealSlotPreview: string;
+  hideSlotPreview: string;
   saveSettings: string;
   settingsSaved: string;
   settingsUnavailable: string;
@@ -335,6 +349,20 @@ const english: MessageTable = {
   millisecondsRange: (min, max) => `Milliseconds · ${min}–${max}`,
   transportRetriesRange: (max) => `Transport retries · 0–${max}`,
   settingsHelp: "Timeout and retries apply on the next connection. Macro content is never stored in preferences.",
+  previewCharacterCount: "Preview character count",
+  previewCharacterCountHelp: "Show up to five leading characters from each loaded slot.",
+  hoverRevealDelay: "Hover reveal delay",
+  hoverRevealDelayHelp: "Reveal a loaded macro while the pointer remains over its preview.",
+  hoverRevealDisabled: "Disable",
+  hoverRevealImmediate: "Immediate",
+  hoverRevealSeconds: (seconds) => `${seconds} second${seconds === 1 ? "" : "s"}`,
+  increasePreviewCharacterCount: "Increase preview character count",
+  decreasePreviewCharacterCount: "Decrease preview character count",
+  increaseHoverRevealDelay: "Increase hover reveal delay",
+  decreaseHoverRevealDelay: "Decrease hover reveal delay",
+  previewUnavailable: "Preview unavailable",
+  revealSlotPreview: "Reveal macro preview",
+  hideSlotPreview: "Hide macro preview",
   saveSettings: "Save settings",
   settingsSaved: "✓ Settings saved",
   settingsUnavailable: "Settings could not be loaded.",
@@ -503,6 +531,20 @@ const chinese: MessageTable = {
   millisecondsRange: (min, max) => `毫秒 · ${min}–${max}`,
   transportRetriesRange: (max) => `传输重试 · 0–${max}`,
   settingsHelp: "超时和重试次数将在下次连接时生效。宏正文不会存入偏好设置。",
+  previewCharacterCount: "列表预览字符数",
+  previewCharacterCountHelp: "显示每个已加载插槽开头的最多五个字符。",
+  hoverRevealDelay: "悬停显示延迟",
+  hoverRevealDelayHelp: "指针停留在预览区域时显示已加载的宏。",
+  hoverRevealDisabled: "禁用",
+  hoverRevealImmediate: "立即",
+  hoverRevealSeconds: (seconds) => `${seconds} 秒`,
+  increasePreviewCharacterCount: "增加列表预览字符数",
+  decreasePreviewCharacterCount: "减少列表预览字符数",
+  increaseHoverRevealDelay: "增加悬停显示延迟",
+  decreaseHoverRevealDelay: "减少悬停显示延迟",
+  previewUnavailable: "暂无预览",
+  revealSlotPreview: "显示宏预览",
+  hideSlotPreview: "隐藏宏预览",
   saveSettings: "保存设置",
   settingsSaved: "✓ 设置已保存",
   settingsUnavailable: "无法加载设置。",

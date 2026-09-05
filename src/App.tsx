@@ -43,6 +43,7 @@ import { DeviceSelect } from "./pages/DeviceSelect";
 import { MacroWorkbench } from "./pages/MacroWorkbench";
 import { Unlock } from "./pages/Unlock";
 import { PasswordSetupModal } from "./components/PasswordSetupModal";
+import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
 import type { Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
 import type { SlotAction, SlotState } from "./types/workbench";
@@ -51,14 +52,28 @@ import { MAX_TEXT_BYTES, macroBytes, textFromTokens, tokensFromText } from "./ut
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
 const SETTINGS_STORAGE_KEY = "zmk-runtime-macro-settings:v1";
+const PRIVACY_PREVIEW_STORAGE_KEY = "zmk-runtime-macro-privacy-preview:v1";
 const LABELS_STORAGE_PREFIX = "zmk-runtime-macro-labels:v1";
 const MIN_TIMEOUT_MS = 100;
+const MIN_PREVIEW_CHARACTER_COUNT = 0;
+const MAX_PREVIEW_CHARACTER_COUNT = 5;
+const MIN_HOVER_REVEAL_DELAY = -1;
+const MAX_HOVER_REVEAL_DELAY = 5;
 const MAX_TIMEOUT_MS = 5_000;
 const MAX_RETRIES = 5;
 const DEFAULT_CLIENT_SETTINGS: ClientSettings = { timeoutMs: 1_000, retries: 2, appliesNextConnection: true };
 
 type SettingsDraft = ClientSettings;
+type PrivacyPreviewSettings = {
+  previewCharacterCount: number;
+  hoverRevealDelay: number;
+};
 type SettingsError = SettingsValidationKey | CommandError;
+
+const DEFAULT_PRIVACY_PREVIEW_SETTINGS: PrivacyPreviewSettings = {
+  previewCharacterCount: MIN_PREVIEW_CHARACTER_COUNT,
+  hoverRevealDelay: MIN_HOVER_REVEAL_DELAY,
+};
 
 function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -95,6 +110,37 @@ function writeSettings(settings: SettingsDraft): void {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ timeoutMs: settings.timeoutMs, retries: settings.retries }));
   } catch {
     // Preferences are optional and never affect device data.
+  }
+}
+
+function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
+}
+
+function readPrivacyPreviewSettings(): PrivacyPreviewSettings {
+  try {
+    const raw = localStorage.getItem(PRIVACY_PREVIEW_STORAGE_KEY);
+    if (!raw) return DEFAULT_PRIVACY_PREVIEW_SETTINGS;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return DEFAULT_PRIVACY_PREVIEW_SETTINGS;
+    const value = parsed as Record<string, unknown>;
+    return {
+      previewCharacterCount: clampInteger(value.previewCharacterCount, MIN_PREVIEW_CHARACTER_COUNT, MAX_PREVIEW_CHARACTER_COUNT, DEFAULT_PRIVACY_PREVIEW_SETTINGS.previewCharacterCount),
+      hoverRevealDelay: clampInteger(value.hoverRevealDelay, MIN_HOVER_REVEAL_DELAY, MAX_HOVER_REVEAL_DELAY, DEFAULT_PRIVACY_PREVIEW_SETTINGS.hoverRevealDelay),
+    };
+  } catch {
+    return DEFAULT_PRIVACY_PREVIEW_SETTINGS;
+  }
+}
+
+function writePrivacyPreviewSettings(settings: PrivacyPreviewSettings): void {
+  try {
+    localStorage.setItem(PRIVACY_PREVIEW_STORAGE_KEY, JSON.stringify({
+      previewCharacterCount: settings.previewCharacterCount,
+      hoverRevealDelay: settings.hoverRevealDelay,
+    }));
+  } catch {
+    // Preview preferences are optional and never affect device data.
   }
 }
 
@@ -222,6 +268,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<SettingsDraft>(() => readSettings());
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(() => readSettings());
+  const [privacySettings, setPrivacySettings] = useState<PrivacyPreviewSettings>(() => readPrivacyPreviewSettings());
+  const [privacyDraft, setPrivacyDraft] = useState<PrivacyPreviewSettings>(() => readPrivacyPreviewSettings());
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<SettingsError | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
@@ -716,9 +764,16 @@ function App() {
     recordOperation("Settings");
     try {
       const nextSettings = await setSettingsCommand(settingsDraft.timeoutMs, settingsDraft.retries);
+      const nextPrivacy = {
+        previewCharacterCount: clampInteger(privacyDraft.previewCharacterCount, MIN_PREVIEW_CHARACTER_COUNT, MAX_PREVIEW_CHARACTER_COUNT, DEFAULT_PRIVACY_PREVIEW_SETTINGS.previewCharacterCount),
+        hoverRevealDelay: clampInteger(privacyDraft.hoverRevealDelay, MIN_HOVER_REVEAL_DELAY, MAX_HOVER_REVEAL_DELAY, DEFAULT_PRIVACY_PREVIEW_SETTINGS.hoverRevealDelay),
+      };
       setSettings(nextSettings);
       setSettingsDraft(nextSettings);
       writeSettings(nextSettings);
+      setPrivacySettings(nextPrivacy);
+      setPrivacyDraft(nextPrivacy);
+      writePrivacyPreviewSettings(nextPrivacy);
       setSettingsSaved(true);
       window.setTimeout(() => setSettingsSaved(false), 2_000);
     } catch (caught) {
@@ -726,7 +781,7 @@ function App() {
     } finally {
       setSettingsBusy(false);
     }
-  }, [commandError, recordOperation, settingsDraft]);
+  }, [commandError, privacyDraft, recordOperation, settingsDraft]);
 
   const updateTheme = useCallback((nextTheme: ThemeMode) => {
     setTheme(nextTheme);
@@ -894,10 +949,12 @@ function App() {
           lastOperation={lastOperation}
           lastErrorCode={lastErrorCode}
           configuredBytes={configuredBytes}
+          previewCharacterCount={privacySettings.previewCharacterCount}
+          hoverRevealDelay={privacySettings.hoverRevealDelay}
           onThemeChange={updateTheme}
           onRefresh={() => void refreshSlots()}
           onRefreshDevices={() => void refreshDevices()}
-          onSettings={() => { setSettingsDraft(settings); setSettingsError(null); setSettingsOpen(true); }}
+          onSettings={() => { setSettingsDraft(settings); setPrivacyDraft(privacySettings); setSettingsError(null); setSettingsOpen(true); }}
           onDiagnostics={() => setDiagnosticsOpen((value) => !value)}
           onSetPassword={() => { setPasswordModalMode("setup"); setErrorCode(null); }}
           onChangePassword={() => { setPasswordModalMode("change"); setErrorCode(null); }}
@@ -970,6 +1027,32 @@ function App() {
               <div className="grid grid-cols-2 gap-4">
                 <label className="block" htmlFor="timeout-setting"><span className="text-sm font-medium text-ink">{copy.requestTimeout}</span><input id="timeout-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={MIN_TIMEOUT_MS} max={MAX_TIMEOUT_MS} step={1} value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs} onChange={(event) => { setSettingsDraft((value) => ({ ...value, timeoutMs: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small></label>
                 <label className="block" htmlFor="retries-setting"><span className="text-sm font-medium text-ink">{copy.retries}</span><input id="retries-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={0} max={MAX_RETRIES} step={1} value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries} onChange={(event) => { setSettingsDraft((value) => ({ ...value, retries: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.transportRetriesRange(MAX_RETRIES)}</small></label>
+              </div>
+              <div className="grid grid-cols-1 gap-5 border-t border-line pt-5 sm:grid-cols-2">
+                <PreviewSettingStepper
+                  id="preview-character-count"
+                  label={copy.previewCharacterCount}
+                  value={privacyDraft.previewCharacterCount}
+                  displayValue={String(privacyDraft.previewCharacterCount)}
+                  min={MIN_PREVIEW_CHARACTER_COUNT}
+                  max={MAX_PREVIEW_CHARACTER_COUNT}
+                  help={copy.previewCharacterCountHelp}
+                  increaseLabel={copy.increasePreviewCharacterCount}
+                  decreaseLabel={copy.decreasePreviewCharacterCount}
+                  onChange={(value) => setPrivacyDraft((current) => ({ ...current, previewCharacterCount: value }))}
+                />
+                <PreviewSettingStepper
+                  id="hover-reveal-delay"
+                  label={copy.hoverRevealDelay}
+                  value={privacyDraft.hoverRevealDelay}
+                  displayValue={privacyDraft.hoverRevealDelay < 0 ? copy.hoverRevealDisabled : privacyDraft.hoverRevealDelay === 0 ? copy.hoverRevealImmediate : copy.hoverRevealSeconds(privacyDraft.hoverRevealDelay)}
+                  min={MIN_HOVER_REVEAL_DELAY}
+                  max={MAX_HOVER_REVEAL_DELAY}
+                  help={copy.hoverRevealDelayHelp}
+                  increaseLabel={copy.increaseHoverRevealDelay}
+                  decreaseLabel={copy.decreaseHoverRevealDelay}
+                  onChange={(value) => setPrivacyDraft((current) => ({ ...current, hoverRevealDelay: value }))}
+                />
               </div>
             </div>
             <p className="mt-5 text-xs leading-relaxed text-ink-subtle">{copy.settingsHelp}</p>
