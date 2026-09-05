@@ -1720,7 +1720,6 @@ function App() {
       <section className="macro-section" aria-labelledby="slots-heading">
         <div className="section-heading">
           <div>
-            <p className="eyebrow">{copy.configuration}</p>
             <h1 id="slots-heading">{copy.macroSlots}</h1>
           </div>
           <div className="section-actions">

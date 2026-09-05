@@ -243,7 +243,7 @@ Dark Theme 的层级来自三层石墨色表面，不使用发光边框；Accent
 
 ### Spacing 和窗口尺寸
 
-基础 spacing system 固定为 `4 / 8 / 12 / 16 / 24 / 32`。窗口默认 `860 × 620`，最小 `720 × 520`，允许 resize 和最大化；不使用无边框自定义标题栏。window padding 为 20–24px（窄窗口 16px），顶部栏约 56px，section 间距 24px，slot row 52px，普通输入 36px，macro editor 最小 150px（约 132–160px 可视高度），按钮和 icon button 32px，Inspector 内部间距 16px，label 与输入间距 8px。
+基础 spacing system 固定为 `4 / 8 / 12 / 16 / 24 / 32`。窗口默认 `860 × 620`，最小 `720 × 520`，允许 resize 和最大化；不使用无边框自定义标题栏。window padding 为 20–24px（窄窗口 16px），顶部栏压缩为约 48px，section 间距 20–24px，slot row 48px，普通输入 34–36px，macro editor 最小 142px（约 144px 可视高度），按钮和 icon button 30–32px，Inspector 内部间距 14–18px，label 与输入间距 8px。
 
 较宽窗口把内容限制在约 960px；slot list 保持约 216px，inspector 保持可读宽度，不能因为空间增加而加入卡片或统计。
 
@@ -252,7 +252,9 @@ Dark Theme 的层级来自三层石墨色表面，不使用发光边框；Accent
 - **Text Input：** 36px 高、4px 圆角、1px Border、Elevated Surface；下方说明本机 label 不写入键盘。
 - **Password/Macro Input：** 隐藏时显示 bullets 和 byte count，不能编辑正文；Reveal 后用等宽 token editor 编辑。不要把正文放入 placeholder、title、aria-label 或错误文本。
 - **Primary Button：** 仅 Save 使用 Accent 实色，32px 高，不能做成营销 CTA；只有存在 dirty 修改时强调。
-- **Secondary Button：** Refresh、Reconnect、Add 使用透明或 Surface 加细边框。
+- **Secondary Button：** Refresh、Reconnect、Add 使用透明或 Surface 加低对比细边框；顶部工具按钮默认无边框，仅 hover/active 时显出 Surface。
+- **Workspace：** slot list 与 inspector 共用连续 Surface；slot 行使用轻 separator、左侧 2px selected 指示和浅层 Elevated Surface，不使用独立卡片。
+- **Connection Chip：** 顶部 Connected/Checking/Disconnected 使用小圆点、24px 高和低对比圆角 chip；状态色只用于语义，不铺满区域。
 - **Destructive Action：** `Clear macro…` 为低调文字按钮，原位展开 `Clear this macro? Cancel Clear` 二次确认，不使用大红实心按钮。
 - **Status Indicator：** 6px 圆点加文字，如 `● Connected`、`● Unsaved changes`、`✓ Saved`，不用大胶囊。
 - **Divider：** 1px Border，slot 行连续排列，不加阴影。
@@ -331,6 +333,10 @@ Dark Theme：
 5. **过大字体、圆角和留白：** 不要使用 32px 标题、16px 圆角或宽松卡片导致一屏只剩两个 slot；保持精确而紧凑的信息密度。
 
 核心原则：**像一个精密、克制、可靠的桌面硬件配置工具，而不是一个网页 Dashboard。**
+
+### 当前实现的视觉精修
+
+当前 UI 在不改变设备连接、slot 编辑或状态交互的前提下，采用 48px 紧凑顶部栏、单一 `Macro Slots` 标题、连续 slot 列表和单一 inspector/form。顶部工具按钮保持 ghost 层级，Connected 使用低调 status chip；Save 保持唯一实色主动作，Clear 保持文字式危险次级动作。Light、Dark 和 System-dark 复用相同的 spacing、圆角与层级规则，仅调整表面和文字 token。
 
 ## 4.7 阶段 5：错误体验、自动重连、设置和诊断
 
