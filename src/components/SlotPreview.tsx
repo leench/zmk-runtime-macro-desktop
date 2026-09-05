@@ -48,9 +48,7 @@ export function SlotPreview({
     timer.current = clearTimer(timer.current);
   }, []);
 
-  if (totalTokens === 0) {
-    return available ? null : <span className="max-w-[148px] shrink-0 truncate px-1.5 py-1 text-[11px] text-ink-subtle">{copy.previewUnavailable}</span>;
-  }
+  if (totalTokens === 0) return null;
 
   const maskCount = Math.max(0, totalTokens - previewCount);
   const values = revealed && available
@@ -98,7 +96,7 @@ export function SlotPreview({
       disabled={disabled || !available}
       aria-pressed={revealed}
       aria-label={revealed ? copy.hideSlotPreview : copy.revealSlotPreview}
-      className="min-w-0 max-w-[148px] shrink-0 truncate rounded-md px-1.5 py-1 font-mono text-[11px] tracking-[0.12em] text-ink-muted transition-colors hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-70"
+      className={`min-w-0 max-w-[148px] shrink-0 truncate rounded-lg px-1.5 py-1 font-mono text-base transition-colors hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-70 ${selected ? "text-accent" : "text-ink-muted"}`}
     >
       <span aria-hidden="true" className="inline-flex max-w-full overflow-hidden">
         {values.map((value, index) => (

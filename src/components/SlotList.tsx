@@ -37,7 +37,7 @@ export function SlotList({
   return (
     <nav
       aria-label={copy.macroSlotsAria}
-      className="w-[336px] shrink-0 overflow-y-auto border-r border-line bg-surface px-4 py-[18px]"
+      className="flex w-[336px] shrink-0 flex-col border-r border-line bg-surface"
       onKeyDown={(event) => {
         if (event.key === "ArrowDown") {
           event.preventDefault();
@@ -48,41 +48,50 @@ export function SlotList({
         }
       }}
     >
-      <div className="mb-2.5 flex items-center justify-between px-1">
-        <h2 className="m-0 text-[13px] font-semibold text-ink">{copy.macroSlots}</h2>
-        <span className="font-mono text-[11px] text-ink-subtle">{copy.slotCount(slots.length)}</span>
+      <div className="flex items-baseline justify-between px-7 py-6">
+        <h2 className="text-xl font-semibold text-ink">{copy.macroSlots}</h2>
+        <span className="text-xs text-ink-subtle">{copy.slotCount(slots.length)}</span>
       </div>
+
       {slots.length === 0 ? (
-        <p className="px-1 text-[13px] leading-6 text-ink-muted">{copy.noSlotsReturned}</p>
+        <p className="px-7 text-[13px] leading-6 text-ink-muted">{copy.noSlotsReturned}</p>
       ) : (
-        <ul className="m-0 list-none space-y-1 p-0">
+        <ul className="flex-1 overflow-y-auto px-3 pb-5">
           {slots.map((item) => {
             const selected = selectedSlot === item.slot;
             const empty = item.loaded && item.length === 0;
             return (
               <li key={item.slot}>
                 <div
-                  className={`flex min-h-[60px] w-full items-center gap-2 rounded-xl border px-3 py-2.5 transition-colors duration-150 ease-out ${selected ? "border-accent bg-accent-soft" : "border-transparent hover:bg-surface-2"}`}
+                  className={`relative mb-1 flex w-full items-center gap-4 rounded-xl px-4 py-3.5 text-left transition-colors duration-150 ease-out ${selected ? "bg-accent-soft" : "hover:bg-surface-2"}`}
                 >
                   <button
                     type="button"
                     onClick={() => onSelect(item.slot)}
                     disabled={disabled}
                     aria-current={selected ? "true" : undefined}
-                    className="flex min-w-0 flex-1 items-center gap-3 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                    className="flex min-w-0 flex-1 items-center gap-4 text-left disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-[12px] font-semibold ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-muted"}`}>
+                    <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-sm ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-subtle"}`}>
                       {String(item.slot + 1).padStart(2, "0")}
                     </span>
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[13px] font-semibold text-ink">{item.label || copy.defaultSlotLabel(String(item.slot + 1))}</span>
-                      <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-ink-subtle">
-                        {empty ? <CircleSlash2 className="h-3.5 w-3.5" aria-hidden="true" /> : null}
-                        {item.loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
-                        <span>{empty ? copy.empty : item.error ? copy.slotError : item.loaded ? copy.bytes(item.length) : copy.loadingSlot}</span>
+                      <span className={`flex items-center gap-2 truncate font-mono text-base ${empty ? "text-ink-subtle" : selected ? "text-accent" : "text-ink"}`}>
+                        {empty ? (
+                          <>
+                            <CircleSlash2 className="h-4 w-4" aria-hidden="true" />
+                            <span className="font-sans text-sm">{copy.empty}</span>
+                          </>
+                        ) : (
+                          item.label || copy.defaultSlotLabel(String(item.slot + 1))
+                        )}
+                      </span>
+                      <span className="mt-0.5 block truncate text-xs font-normal text-ink-subtle">
+                        {item.loading ? <LoaderCircle className="mr-1 inline-block h-3.5 w-3.5 animate-spin align-[-2px]" aria-hidden="true" /> : null}
+                        {item.error ? copy.slotError : item.loaded ? copy.bytes(item.length) : copy.loadingSlot}
                       </span>
                     </span>
-                    {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-warning" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
+                    {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-accent" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
                   </button>
                   <SlotPreview
                     copy={copy}
