@@ -13,11 +13,12 @@
     "windows": [
       {
         "title": "ZMK Runtime Macro",
-        "width": 860,
-        "height": 620,
-        "minWidth": 720,
-        "minHeight": 520,
-        "resizable": true
+        "width": 1344,
+        "height": 896,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "resizable": true,
+        "decorations": false
       }
     ],
     "security": {

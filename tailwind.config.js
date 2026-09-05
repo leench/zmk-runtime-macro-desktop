@@ -1,0 +1,50 @@
+export default {
+  content: [
+    './index.html',
+    './src/**/*.{js,ts,jsx,tsx}',
+  ],
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        canvas: 'var(--canvas)',
+        surface: 'var(--surface)',
+        'surface-2': 'var(--surface-2)',
+        'surface-3': 'var(--surface-3)',
+        line: 'var(--line)',
+        'line-strong': 'var(--line-strong)',
+        ink: 'var(--ink)',
+        'ink-muted': 'var(--ink-muted)',
+        'ink-subtle': 'var(--ink-subtle)',
+        accent: 'var(--accent)',
+        'accent-ink': 'var(--accent-ink)',
+        'accent-soft': 'var(--accent-soft)',
+        success: 'var(--success)',
+        'success-soft': 'var(--success-soft)',
+        danger: 'var(--danger)',
+        'danger-soft': 'var(--danger-soft)',
+        warning: 'var(--warning)',
+        'warning-soft': 'var(--warning-soft)',
+      },
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
+      },
+      fontSize: {
+        xs: ['0.8125rem', { lineHeight: '1.15rem' }],
+        sm: ['0.875rem', { lineHeight: '1.25rem' }],
+        base: ['0.9375rem', { lineHeight: '1.45rem' }],
+        lg: ['1.0625rem', { lineHeight: '1.6rem' }],
+        xl: ['1.1875rem', { lineHeight: '1.7rem' }],
+        '2xl': ['1.4375rem', { lineHeight: '1.9rem' }],
+        '3xl': ['1.75rem', { lineHeight: '2.2rem' }],
+      },
+      borderRadius: {
+        lg: '0.625rem',
+        xl: '0.875rem',
+        '2xl': '1.125rem',
+      },
+    },
+  },
+  plugins: [],
+};

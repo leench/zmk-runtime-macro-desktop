@@ -1,0 +1,93 @@
+/* MagicPatterns visual tokens and Tailwind entrypoint. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas: #f4f6f8;
+  --surface: #ffffff;
+  --surface-2: #f0f2f6;
+  --surface-3: #e7eaf0;
+  --line: #e2e6ec;
+  --line-strong: #cdd3dd;
+  --ink: #171b22;
+  --ink-muted: #5b6675;
+  --ink-subtle: #8c96a5;
+  --accent: #3452c9;
+  --accent-ink: #ffffff;
+  --accent-soft: #eaeffb;
+  --success: #1f8b48;
+  --success-soft: #e7f5ec;
+  --danger: #c4423d;
+  --danger-soft: #fceceb;
+  --warning: #a26b25;
+  --warning-soft: #fff4e2;
+  --focus-ring: #6d8be8;
+}
+
+html[data-theme="dark"] {
+  --canvas: #14171c;
+  --surface: #1b1f26;
+  --surface-2: #22272f;
+  --surface-3: #2c323b;
+  --line: #2b313a;
+  --line-strong: #3b434f;
+  --ink: #eef1f5;
+  --ink-muted: #a2acbb;
+  --ink-subtle: #737f8e;
+  --accent: #9aafff;
+  --accent-ink: #10131a;
+  --accent-soft: #232b40;
+  --success: #5cc98a;
+  --success-soft: #1c2a22;
+  --danger: #e98b87;
+  --danger-soft: #2c1f1f;
+  --warning: #e3b36d;
+  --warning-soft: #332918;
+  --focus-ring: #a8bcff;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-theme="system"] {
+    --canvas: #14171c;
+    --surface: #1b1f26;
+    --surface-2: #22272f;
+    --surface-3: #2c323b;
+    --line: #2b313a;
+    --line-strong: #3b434f;
+    --ink: #eef1f5;
+    --ink-muted: #a2acbb;
+    --ink-subtle: #737f8e;
+    --accent: #9aafff;
+    --accent-ink: #10131a;
+    --accent-soft: #232b40;
+    --success: #5cc98a;
+    --success-soft: #1c2a22;
+    --danger: #e98b87;
+    --danger-soft: #2c1f1f;
+    --warning: #e3b36d;
+    --warning-soft: #332918;
+    --focus-ring: #a8bcff;
+  }
+}
+
+@layer base {
+  * { box-sizing: border-box; }
+  html, body, #root { width: 100%; height: 100%; min-width: 320px; margin: 0; }
+  body {
+    overflow: hidden;
+    background-color: var(--canvas);
+    color: var(--ink);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, select { font: inherit; }
+  button { cursor: pointer; }
+  button:disabled, input:disabled, select:disabled { cursor: not-allowed; }
+  *:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+  ::-webkit-scrollbar { width: 12px; height: 12px; }
+  ::-webkit-scrollbar-thumb { background-color: var(--line-strong); border: 3px solid transparent; background-clip: content-box; border-radius: 999px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+}

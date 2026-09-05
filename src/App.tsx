@@ -1,13 +1,31 @@
-import {
-  type ChangeEvent,
-  type KeyboardEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent } from "react";
+import { AlertCircle, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  asCommandError,
+  authenticate,
+  clearSlot as clearSlotCommand,
+  connectDevice as connectDeviceCommand,
+  disconnectDevice as disconnectDeviceCommand,
+  getConnection,
+  getSettings,
+  getSlot,
+  listDevices,
+  listSlots,
+  lockDevice,
+  setPassword as setPasswordCommand,
+  setSettings as setSettingsCommand,
+  setSlot as setSlotCommand,
+  type AuthState,
+  type ClientSettings,
+  type CommandError,
+  type ConnectedDevice,
+  type ConnectionState,
+  type DeviceCandidate,
+  type SlotBytes,
+  type SlotMetadata,
+} from "./bridge";
 import {
   getMessages,
   isLanguagePreference,
@@ -19,271 +37,115 @@ import {
   writeLanguagePreference,
   type InputErrorKey,
   type LanguagePreference,
-  type Locale,
   type SettingsValidationKey,
 } from "./i18n";
-import {
-  asCommandError,
-  clearSlot as clearSlotCommand,
-  connectDevice as connectDeviceCommand,
-  disconnectDevice as disconnectDeviceCommand,
-  getConnection,
-  getSettings,
-  getSlot,
-  listDevices,
-  listSlots,
-  setSettings as setSettingsCommand,
-  setSlot as setSlotCommand,
-} from "./bridge";
-import type {
-  AuthState,
-  ClientSettings,
-  CommandError,
-  ConnectedDevice,
-  ConnectionState,
-  DeviceCandidate,
-  SlotBytes,
-  SlotMetadata,
-} from "./bridge";
-import "./App.css";
+import { DeviceSelect } from "./pages/DeviceSelect";
+import { MacroWorkbench } from "./pages/MacroWorkbench";
+import { Unlock } from "./pages/Unlock";
+import { PasswordSetupModal } from "./components/PasswordSetupModal";
+import type { Platform } from "./components/TitleBar";
+import type { ThemeMode } from "./types/ui";
+import type { SlotAction, SlotState } from "./types/workbench";
+import { MAX_TEXT_BYTES, macroBytes, textFromTokens, tokensFromText } from "./utils/macro";
 
-type ThemeMode = "system" | "light" | "dark";
-type OperationName =
-  | "Discover"
-  | "Connect"
-  | "Disconnect"
-  | "LIST"
-  | "GET"
-  | "SET"
-  | "CLEAR"
-  | "Settings";
-type RefreshSource = "manual" | "automatic";
-type SlotStatus = "idle" | "saving" | "saved" | "error";
-type SlotAction = "load" | "save" | "clear";
-
-type SlotState = {
-  slot: number;
-  length: number;
-  savedText: string;
-  draftText: string;
-  savedLabel: string;
-  draftLabel: string;
-  loaded: boolean;
-  loading: boolean;
-  revealed: boolean;
-  status: SlotStatus;
-  error: CommandError | null;
-  lastAction: SlotAction | null;
-};
-
-type UserSettings = ClientSettings & {
-  autoReconnect: boolean;
-};
-
-const disconnected: ConnectionState = {
-  connected: false,
-  device: null,
-  authState: "disconnected",
-};
-const MAX_TEXT_BYTES = 256;
-const LABELS_STORAGE_PREFIX = "zmk-runtime-macro-labels:v1";
+const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
 const SETTINGS_STORAGE_KEY = "zmk-runtime-macro-settings:v1";
-const DEFAULT_CLIENT_SETTINGS: ClientSettings = {
-  timeoutMs: 1_000,
-  retries: 2,
-  appliesNextConnection: true,
-};
+const LABELS_STORAGE_PREFIX = "zmk-runtime-macro-labels:v1";
 const MIN_TIMEOUT_MS = 100;
 const MAX_TIMEOUT_MS = 5_000;
 const MAX_RETRIES = 5;
-const RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
-const MAX_RECONNECT_ATTEMPTS = 8;
-const CONTROL_TOKENS: Record<string, string> = {
-  "↵": "\n",
-  "⇥": "\t",
-  "⌫": "\b",
-};
-const CONTROL_CHARACTERS: Record<string, string> = {
-  "\n": "↵",
-  "\t": "⇥",
-  "\b": "⌫",
-};
+const DEFAULT_CLIENT_SETTINGS: ClientSettings = { timeoutMs: 1_000, retries: 2, appliesNextConnection: true };
 
-function formatHex(value: number): string {
-  return `0x${value.toString(16).padStart(4, "0")}`;
+type SettingsDraft = ClientSettings;
+type SettingsError = SettingsValidationKey | CommandError;
+
+function inTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-function formatSlotNumber(slot: number): string {
-  return String(slot + 1).padStart(2, "0");
-}
-
-function defaultLabel(slot: number, locale: Locale): string {
-  const formattedSlot = formatSlotNumber(slot);
-  return locale === "zh-CN" ? `插槽 ${formattedSlot}` : `Slot ${formattedSlot}`;
-}
-
-function textByteLength(text: string): number {
-  return new TextEncoder().encode(text).length;
-}
-
-function toEditorText(text: string): string {
-  let visible = "";
-  for (const character of text) {
-    visible += CONTROL_CHARACTERS[character] ?? character;
+function readTheme(): ThemeMode {
+  try {
+    const value = localStorage.getItem(THEME_STORAGE_KEY);
+    return value === "light" || value === "dark" || value === "system" ? value : "system";
+  } catch {
+    return "system";
   }
-  return visible;
 }
 
-function normalizeEditorText(value: string): string {
-  return value
-    .replace(/\n/g, "↵")
-    .replace(/\t/g, "⇥")
-    .replace(/\u0008/g, "⌫");
-}
-
-function parseEditorText(value: string):
-  | { text: string; error: null }
-  | { text: null; error: InputErrorKey } {
-  const normalized = normalizeEditorText(value);
-  let text = "";
-  for (const character of normalized) {
-    if (CONTROL_TOKENS[character]) {
-      text += CONTROL_TOKENS[character];
-      continue;
-    }
-    if (character >= " " && character <= "~") {
-      text += character;
-      continue;
-    }
+function readSettings(): SettingsDraft {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return DEFAULT_CLIENT_SETTINGS;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return DEFAULT_CLIENT_SETTINGS;
+    const value = parsed as Record<string, unknown>;
     return {
-      text: null,
-      error: "unsupportedText",
+      timeoutMs: typeof value.timeoutMs === "number" && Number.isInteger(value.timeoutMs) ? value.timeoutMs : DEFAULT_CLIENT_SETTINGS.timeoutMs,
+      retries: typeof value.retries === "number" && Number.isInteger(value.retries) ? value.retries : DEFAULT_CLIENT_SETTINGS.retries,
+      appliesNextConnection: true,
     };
+  } catch {
+    return DEFAULT_CLIENT_SETTINGS;
   }
-
-  if (textByteLength(text) > MAX_TEXT_BYTES) {
-    return {
-      text: null,
-      error: "textTooLong",
-    };
-  }
-  return { text, error: null };
 }
 
-function decodeSlotBytes(bytes: SlotBytes): string {
+function writeSettings(settings: SettingsDraft): void {
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ timeoutMs: settings.timeoutMs, retries: settings.retries }));
+  } catch {
+    // Preferences are optional and never affect device data.
+  }
+}
+
+function deviceSummaryKey(device: ConnectedDevice | DeviceCandidate | null): string | null {
+  if (!device) return null;
+  return [device.vendorId, device.productId, device.interfaceNumber, device.usagePage, device.usage].join(":");
+}
+
+function isDirty(slot: SlotState): boolean {
+  return slot.loaded && (slot.savedText !== slot.draftText || slot.savedLabel !== slot.draftLabel);
+}
+
+function canManage(connection: ConnectionState): boolean {
+  return connection.connected && (connection.authState === "open" || connection.authState === "authenticated");
+}
+
+function authStateForErrorCode(code: string): AuthState | null {
+  if (code === "auth_required" || code === "auth_failed" || code === "rate_limited" || code === "auth_no_challenge") return "locked";
+  if (code === "auth_not_configured") return "open";
+  if (code === "credential_invalid") return "credentialInvalid";
+  return null;
+}
+
+function dropsConnection(code: string): boolean {
+  return code === "timeout" || code === "transport_error" || code === "protocol_error" || code === "bad_version";
+}
+
+function decodeSlotBytes(bytes: SlotBytes): string | null {
+  if (bytes.length > MAX_TEXT_BYTES) return null;
   let text = "";
   for (const byte of bytes) {
-    if (
-      !Number.isInteger(byte) ||
-      byte < 0 ||
-      byte > 0xff ||
-      (!(byte >= 0x20 && byte <= 0x7e) &&
-        byte !== 0x08 &&
-        byte !== 0x09 &&
-        byte !== 0x0a)
-    ) {
-      throw new Error("The device returned unsupported slot text.");
+    if (!Number.isInteger(byte) || byte < 0 || byte > 0xff || !(byte >= 0x20 && byte <= 0x7e) && byte !== 0x08 && byte !== 0x09 && byte !== 0x0a) {
+      return null;
     }
     text += String.fromCharCode(byte);
   }
   return text;
 }
 
-function maskText(text: string): string {
-  return "•".repeat(textByteLength(text));
-}
-
-function deviceSummaryKey(device: ConnectedDevice | null): string | null {
-  if (!device) {
-    return null;
-  }
-  return [
-    device.vendorId.toString(16),
-    device.productId.toString(16),
-    device.interfaceNumber,
-    device.usagePage.toString(16),
-    device.usage.toString(16),
-  ].join(":");
-}
-
-function canManageConnection(connection: ConnectionState): boolean {
-  return (
-    connection.connected &&
-    (connection.authState === "open" || connection.authState === "authenticated")
-  );
-}
-
-function authStateForErrorCode(code: string): AuthState | null {
-  switch (code) {
-    case "auth_required":
-    case "auth_failed":
-    case "rate_limited":
-    case "auth_no_challenge":
-      return "locked";
-    case "auth_not_configured":
-      return "open";
-    case "credential_invalid":
-      return "credentialInvalid";
-    default:
-      return null;
-  }
-}
-
-function shouldReconnectAfterConnectionError(code: string): boolean {
-  // Only a failed transport or malformed protocol response makes a physical
-  // connection worth probing again. Remote statuses are actionable device
-  // state, not an automatic reconnect trigger.
-  return (
-    code === "timeout" || code === "transport_error" || code === "protocol_error"
-  );
-}
-
-function shouldDropConnectionAfterCommandError(code: string): boolean {
-  return (
-    code === "timeout" ||
-    code === "transport_error" ||
-    code === "protocol_error" ||
-    code === "bad_version"
-  );
-}
-
-function sameDevice(
-  first: ConnectedDevice | null,
-  second: ConnectedDevice | null,
-): boolean {
-  const firstKey = deviceSummaryKey(first);
-  return firstKey !== null && firstKey === deviceSummaryKey(second);
-}
-
-function labelsStorageKey(device: ConnectedDevice): string {
-  return [LABELS_STORAGE_PREFIX, deviceSummaryKey(device)].join(":");
-}
-
 function readLabels(device: ConnectedDevice | null): Record<number, string> {
-  if (!device) {
-    return {};
-  }
+  const key = deviceSummaryKey(device);
+  if (!key) return {};
   try {
-    const raw = localStorage.getItem(labelsStorageKey(device));
-    if (!raw) {
-      return {};
-    }
+    const raw = localStorage.getItem(`${LABELS_STORAGE_PREFIX}:${key}`);
+    if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return {};
-    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
     const labels: Record<number, string> = {};
     for (const [slot, label] of Object.entries(parsed)) {
-      const slotNumber = Number(slot);
-      if (
-        Number.isInteger(slotNumber) &&
-        slotNumber >= 0 &&
-        slotNumber <= 254 &&
-        typeof label === "string"
-      ) {
-        labels[slotNumber] = label.slice(0, 64);
-      }
+      const index = Number(slot);
+      if (Number.isInteger(index) && index >= 0 && index <= 254 && typeof label === "string") labels[index] = label.slice(0, 64);
     }
     return labels;
   } catch {
@@ -291,1086 +153,561 @@ function readLabels(device: ConnectedDevice | null): Record<number, string> {
   }
 }
 
-function writeLabels(
-  device: ConnectedDevice | null,
-  labels: Record<number, string>,
-): void {
-  if (!device) {
-    return;
-  }
+function writeLabels(device: ConnectedDevice | null, labels: Record<number, string>): void {
+  const key = deviceSummaryKey(device);
+  if (!key) return;
   try {
     const safeLabels: Record<number, string> = {};
-    for (const [slot, label] of Object.entries(labels)) {
-      safeLabels[Number(slot)] = label.slice(0, 64);
-    }
-    localStorage.setItem(labelsStorageKey(device), JSON.stringify(safeLabels));
+    for (const [slot, label] of Object.entries(labels)) safeLabels[Number(slot)] = label.slice(0, 64);
+    localStorage.setItem(`${LABELS_STORAGE_PREFIX}:${key}`, JSON.stringify(safeLabels));
   } catch {
-    // A local label is useful but not required for the device operation.
+    // A local label is optional and is never sent to the device.
   }
 }
 
-function readTheme(): ThemeMode {
-  try {
-    const value = localStorage.getItem(THEME_STORAGE_KEY);
-    if (value === "system" || value === "light" || value === "dark") {
-      return value;
-    }
-  } catch {
-    // Fall back to the system theme when storage is unavailable.
+function makeSlotState(metadata: SlotMetadata, labels: Record<number, string>, previous?: SlotState, preserveDirty = true): SlotState {
+  if (previous && preserveDirty && isDirty(previous)) {
+    return { ...previous, length: metadata.length, revealed: false, loading: false, error: null, lastAction: null };
   }
-  return "system";
-}
-
-function readUserSettings(): UserSettings {
-  const defaults: UserSettings = {
-    ...DEFAULT_CLIENT_SETTINGS,
-    autoReconnect: true,
-  };
-  try {
-    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
-    if (!raw) {
-      return defaults;
-    }
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return defaults;
-    }
-    const candidate = parsed as Record<string, unknown>;
-    const timeoutMs = candidate.timeoutMs;
-    const retries = candidate.retries;
-    const autoReconnect = candidate.autoReconnect;
-    return {
-      ...defaults,
-      ...(typeof timeoutMs === "number" &&
-      Number.isInteger(timeoutMs) &&
-      timeoutMs >= MIN_TIMEOUT_MS &&
-      timeoutMs <= MAX_TIMEOUT_MS
-        ? { timeoutMs }
-        : {}),
-      ...(typeof retries === "number" &&
-      Number.isInteger(retries) &&
-      retries >= 0 &&
-      retries <= MAX_RETRIES
-        ? { retries }
-        : {}),
-      ...(typeof autoReconnect === "boolean" ? { autoReconnect } : {}),
-    };
-  } catch {
-    return defaults;
-  }
-}
-
-function writeUserSettings(settings: UserSettings): void {
-  try {
-    localStorage.setItem(
-      SETTINGS_STORAGE_KEY,
-      JSON.stringify({
-        timeoutMs: settings.timeoutMs,
-        retries: settings.retries,
-        autoReconnect: settings.autoReconnect,
-      }),
-    );
-  } catch {
-    // Local preferences are optional and never affect device operations.
-  }
-}
-
-function validateUserSettings(settings: UserSettings): SettingsValidationKey | null {
-  if (
-    !Number.isInteger(settings.timeoutMs) ||
-    settings.timeoutMs < MIN_TIMEOUT_MS ||
-    settings.timeoutMs > MAX_TIMEOUT_MS
-  ) {
-    return "timeout";
-  }
-  if (
-    !Number.isInteger(settings.retries) ||
-    settings.retries < 0 ||
-    settings.retries > MAX_RETRIES
-  ) {
-    return "retries";
-  }
-  return null;
-}
-
-function isTextDirty(slot: SlotState): boolean {
-  return slot.loaded && slot.draftText !== slot.savedText;
-}
-
-function isLabelDirty(slot: SlotState): boolean {
-  return slot.loaded && slot.draftLabel !== slot.savedLabel;
-}
-
-function isDirty(slot: SlotState): boolean {
-  return isTextDirty(slot) || isLabelDirty(slot);
-}
-
-function createSlotState(
-  metadata: SlotMetadata,
-  labels: Record<number, string>,
-  previous?: SlotState,
-  preserveDirtyDraft = true,
-): SlotState {
-  const label = labels[metadata.slot] ?? "";
-  if (previous && preserveDirtyDraft && isTextDirty(previous)) {
-    return {
-      ...previous,
-      length: metadata.length,
-      error: null,
-      lastAction: null,
-    };
-  }
-
-  const preservedLabel =
-    previous && preserveDirtyDraft && isLabelDirty(previous)
-      ? {
-          savedLabel: previous.savedLabel,
-          draftLabel: previous.draftLabel,
-        }
-      : { savedLabel: label, draftLabel: label };
-  const empty = metadata.length === 0;
+  const label = labels[metadata.slot] ?? previous?.savedLabel ?? "";
   return {
     slot: metadata.slot,
     length: metadata.length,
     savedText: "",
     draftText: "",
-    ...preservedLabel,
-    loaded: empty,
+    savedLabel: label,
+    draftLabel: label,
+    loaded: metadata.length === 0,
     loading: false,
     revealed: false,
     status: "idle",
     error: null,
     lastAction: null,
+    savedAt: previous?.savedAt ?? null,
   };
 }
 
-type SettingsError = SettingsValidationKey | CommandError;
+function platformForHost(): Platform {
+  if (typeof navigator === "undefined") return "linux";
+  const value = `${navigator.platform} ${navigator.userAgent}`.toLowerCase();
+  if (value.includes("mac")) return "macos";
+  if (value.includes("win")) return "windows";
+  return "linux";
+}
 
 function App() {
   const [theme, setTheme] = useState<ThemeMode>(readTheme);
-  const [languagePreference, setLanguagePreference] = useState<LanguagePreference>(
-    readLanguagePreference,
-  );
-  const locale: Locale = resolveLocale(languagePreference);
+  const [languagePreference, setLanguagePreference] = useState<LanguagePreference>(readLanguagePreference);
+  const locale = resolveLocale(languagePreference);
   const copy = getMessages(locale);
+  const platform = useMemo(platformForHost, []);
+
   const [devices, setDevices] = useState<DeviceCandidate[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [connection, setConnection] = useState<ConnectionState>(disconnected);
   const [slots, setSlots] = useState<SlotState[]>([]);
   const [selectedSlot, setSelectedSlot] = useState<number | null>(null);
   const [labels, setLabels] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(true);
-  const [mutationBusy, setMutationBusy] = useState(false);
-  const [error, setError] = useState<CommandError | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [inputError, setInputError] = useState<InputErrorKey | null>(null);
   const [clearConfirm, setClearConfirm] = useState<number | null>(null);
-  const [settings, setSettings] = useState<UserSettings>(() => readUserSettings());
-  const [settingsDraft, setSettingsDraft] = useState<UserSettings>(() => readUserSettings());
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [switchConfirm, setSwitchConfirm] = useState<number | null>(null);
+  const [deviceSwitchConfirm, setDeviceSwitchConfirm] = useState<string | null>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [passwordModalMode, setPasswordModalMode] = useState<"setup" | "change" | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<SettingsDraft>(() => readSettings());
+  const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(() => readSettings());
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<SettingsError | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [reconnecting, setReconnecting] = useState(false);
-  const [lastOperation, setLastOperation] = useState<OperationName | null>(null);
+  const [lastOperation, setLastOperation] = useState<string | null>(null);
   const [lastErrorCode, setLastErrorCode] = useState<string | null>(null);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
-  const operation = useRef(0);
-  const lastDevice = useRef<ConnectedDevice | null>(null);
-  const dirtyRef = useRef(false);
-  const slotRequest = useRef(0);
   const mounted = useRef(false);
-  const initialised = useRef(false);
-  const settingsInitialised = useRef(false);
-  const settingsLoad = useRef<Promise<void> | null>(null);
-  const editorRef = useRef<HTMLTextAreaElement | null>(null);
-  const mutationRequest = useRef(0);
-  const reconnectTimer = useRef<number | null>(null);
-  const reconnectAttempt = useRef(0);
-  const autoReconnectSuppressed = useRef(false);
-  const autoReconnectRef = useRef(settings.autoReconnect);
-  const connectionRef = useRef(connection.connected);
-  const refreshDevicesRef = useRef<((source?: RefreshSource) => Promise<void>) | null>(null);
-  const closeConfirmOpenRef = useRef(false);
-
-  autoReconnectRef.current = settings.autoReconnect;
-  connectionRef.current = connection.connected;
+  const operation = useRef(0);
+  const deviceKey = useRef<string | null>(null);
+  const selectedSlotRef = useRef<number | null>(selectedSlot);
+  const connectionRef = useRef<ConnectionState>(connection);
+  const dirtyRef = useRef(false);
+  const closeConfirmRef = useRef(false);
+  selectedSlotRef.current = selectedSlot;
+  connectionRef.current = connection;
   dirtyRef.current = slots.some(isDirty);
 
-  const isCurrent = useCallback((sequence: number) => {
-    return mounted.current && operation.current === sequence;
-  }, []);
-
-  const recordOperation = useCallback((name: OperationName) => {
-    setLastOperation(name);
-  }, []);
+  const recordOperation = useCallback((name: string) => setLastOperation(name), []);
 
   const commandError = useCallback((caught: unknown): CommandError => {
     const error = asCommandError(caught);
     setLastErrorCode(error.code);
+    setErrorCode(error.code);
     return error;
   }, []);
 
-  const clearReconnectTimer = useCallback(() => {
-    if (reconnectTimer.current !== null) {
-      window.clearTimeout(reconnectTimer.current);
-      reconnectTimer.current = null;
-    }
+  const hideRevealed = useCallback(() => {
+    setSlots((previous) => previous.map((slot) => slot.revealed ? { ...slot, revealed: false } : slot));
   }, []);
 
-  const requestReconnect = useCallback(() => {
-    if (autoReconnectRef.current && !autoReconnectSuppressed.current) {
-      setReconnecting(true);
-    }
-  }, []);
-
-  const applySlotList = useCallback(
-    (
-      metadata: SlotMetadata[],
-      nextLabels: Record<number, string>,
-      preserveDirtyDrafts = true,
-    ) => {
-      setSlots((previous) =>
-        metadata.map((item) =>
-          createSlotState(
-            item,
-            nextLabels,
-            preserveDirtyDrafts
-              ? previous.find((slot) => slot.slot === item.slot)
-              : undefined,
-            preserveDirtyDrafts,
-          ),
-        ),
-      );
-      setSelectedSlot((current) =>
-        current !== null && metadata.some((item) => item.slot === current)
-          ? current
-          : metadata[0]?.slot ?? null,
-      );
-    },
-    [],
-  );
-
-  const loadSlots = useCallback(
-    async (
-      sequence: number,
-      nextLabels = labels,
-      preserveDirtyDrafts = true,
-    ) => {
-      recordOperation("LIST");
-      const metadata = await listSlots();
-      if (!isCurrent(sequence)) {
-        return;
-      }
-      applySlotList(metadata, nextLabels, preserveDirtyDrafts);
-    },
-    [applySlotList, isCurrent, labels, recordOperation],
-  );
-
-  const connectDevice = useCallback(
-    async (id: string, existingSequence?: number) => {
-      const sequence = existingSequence ?? ++operation.current;
-      const ownsBusyState = existingSequence === undefined;
-      if (ownsBusyState) {
-        autoReconnectSuppressed.current = false;
-        reconnectAttempt.current = 0;
-        clearReconnectTimer();
-        setBusy(true);
-        setChecking(true);
-        setReconnecting(false);
-        setError(null);
-      }
-      recordOperation("Connect");
-      setSelectedId(id);
-      setClearConfirm(null);
+  const applyErrorState = useCallback((error: CommandError) => {
+    const nextAuthState = authStateForErrorCode(error.code);
+    if (nextAuthState) {
+      setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+      hideRevealed();
+    } else if (dropsConnection(error.code)) {
       setConnection(disconnected);
-      setSlots((previous) =>
-        previous.map((slot) =>
-          slot.revealed ? { ...slot, revealed: false } : slot,
-        ),
-      );
-      setInputError(null);
+      hideRevealed();
+    }
+  }, [hideRevealed]);
 
-      let connectionEstablished = false;
-      try {
-        const nextConnection = await connectDeviceCommand(id);
-        if (!isCurrent(sequence)) {
-          return;
-        }
-        const preserveDirtyDrafts = sameDevice(
-          lastDevice.current,
-          nextConnection.device,
-        );
-        lastDevice.current = nextConnection.device;
-        if (!preserveDirtyDrafts) {
+  const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean) => {
+    setSlots((previous) => metadata.map((item) => makeSlotState(item, nextLabels, previous.find((slot) => slot.slot === item.slot), preserveDirty)));
+    setSelectedSlot((current) => current !== null && metadata.some((item) => item.slot === current) ? current : metadata[0]?.slot ?? null);
+    setClearConfirm(null);
+  }, []);
+
+  const loadSlots = useCallback(async (sequence: number, nextLabels: Record<number, string>, preserveDirty: boolean): Promise<boolean> => {
+    recordOperation("LIST");
+    const metadata = await listSlots();
+    if (!mounted.current || operation.current !== sequence) return false;
+    mergeSlotMetadata(metadata, nextLabels, preserveDirty);
+    return true;
+  }, [mergeSlotMetadata, recordOperation]);
+
+  const refreshDevices = useCallback(async () => {
+    const sequence = ++operation.current;
+    setChecking(true);
+    setBusy(true);
+    setRefreshing(true);
+    setErrorCode(null);
+    recordOperation("Discover");
+    try {
+      const [nextDevices, nextConnection] = await Promise.all([listDevices(), getConnection()]);
+      if (!mounted.current || operation.current !== sequence) return;
+      const priorConnected = connectionRef.current.connected;
+      setDevices(nextDevices);
+      setConnection(nextConnection);
+      // A disconnected status carries no device object. Keep the last safe summary
+      // key so a later connection to that device can restore in-memory drafts.
+      const nextKey = nextConnection.connected ? deviceSummaryKey(nextConnection.device) : null;
+      const recoveryKey = nextKey ?? deviceKey.current;
+      const preserveDirty = nextKey !== null && nextKey === deviceKey.current;
+      if (nextConnection.connected && nextKey !== null) {
+        if (!preserveDirty) {
           setSlots([]);
           setSelectedSlot(null);
         }
-        const nextLabels = readLabels(nextConnection.device);
-        setConnection(nextConnection);
-        connectionEstablished = true;
-        setLabels(nextLabels);
-        if (canManageConnection(nextConnection)) {
-          await loadSlots(sequence, nextLabels, preserveDirtyDrafts);
-        } else {
-          // A locked connection is valid, but it must not trigger LIST/GET or
-          // an automatic reconnect loop. Keep only any same-device dirty draft.
-          setSlots((previous) =>
-            previous.map((slot) =>
-              slot.revealed ? { ...slot, revealed: false } : slot,
-            ),
-          );
-        }
-        if (isCurrent(sequence)) {
-          setError(null);
-          setReconnecting(false);
-          reconnectAttempt.current = 0;
-        }
-      } catch (caught) {
-        if (isCurrent(sequence)) {
-          const nextError = commandError(caught);
-          setError(nextError);
-          const nextAuthState = authStateForErrorCode(nextError.code);
-          const dropConnection =
-            !connectionEstablished || shouldDropConnectionAfterCommandError(nextError.code);
-          if (dropConnection) {
-            setConnection(disconnected);
-            if (shouldReconnectAfterConnectionError(nextError.code)) {
-              requestReconnect();
-            } else {
-              autoReconnectSuppressed.current = true;
-              setReconnecting(false);
-            }
-          } else {
-            if (nextAuthState) {
-              setConnection((current) =>
-                current.connected
-                  ? { ...current, authState: nextAuthState }
-                  : current,
-              );
-            }
-            setSlots((previous) =>
-              previous.map((slot) =>
-                slot.revealed ? { ...slot, revealed: false } : slot,
-              ),
-            );
-            setReconnecting(false);
-          }
-        }
-      } finally {
-        if (ownsBusyState && isCurrent(sequence)) {
-          setBusy(false);
-          setChecking(false);
-        }
+        deviceKey.current = nextKey;
       }
-    },
-    [clearReconnectTimer, commandError, isCurrent, loadSlots, recordOperation, requestReconnect],
-  );
-
-  const refreshDevices = useCallback(async (source: RefreshSource = "manual") => {
-    if (
-      source === "automatic" &&
-      (!autoReconnectRef.current || autoReconnectSuppressed.current)
-    ) {
-      return;
-    }
-    const sequence = ++operation.current;
-    if (source === "manual") {
-      autoReconnectSuppressed.current = false;
-      reconnectAttempt.current = 0;
-      clearReconnectTimer();
-    }
-    setBusy(true);
-    setChecking(true);
-    setReconnecting(source === "automatic");
-    if (source === "manual") {
-      setError(null);
-    }
-    recordOperation("Discover");
-
-    try {
-      const [nextDevices, nextConnection] = await Promise.all([
-        listDevices(),
-        getConnection(),
-      ]);
-      if (!isCurrent(sequence)) {
-        return;
+      const nextLabels = readLabels(nextConnection.device);
+      setLabels(nextLabels);
+      setSelectedId((current) => {
+        if (current && nextDevices.some((device) => device.id === current)) return current;
+        const matching = nextDevices.find((device) => deviceSummaryKey(device) === recoveryKey);
+        return matching?.id ?? nextDevices[0]?.id ?? "";
+      });
+      if (nextConnection.connected && canManage(nextConnection)) {
+        await loadSlots(sequence, nextLabels, preserveDirty);
+        if (nextConnection.authState === "open" && !priorConnected) setSetupOpen(true);
+      } else {
+        hideRevealed();
       }
-
-      setDevices(nextDevices);
-      setConnection(nextConnection);
-      setSelectedId((current) =>
-        nextDevices.some((device) => device.id === current) ? current : "",
-      );
-      if (!nextConnection.connected) {
-        setSlots((previous) =>
-          previous.map((slot) =>
-            slot.revealed ? { ...slot, revealed: false } : slot,
-          ),
-        );
-      }
-      if (nextConnection.connected) {
-        const nextLabels = readLabels(nextConnection.device);
-        lastDevice.current = nextConnection.device;
-        setLabels(nextLabels);
-        if (canManageConnection(nextConnection)) {
-          try {
-            await loadSlots(sequence, nextLabels);
-          } catch (caught) {
-            if (isCurrent(sequence)) {
-              const nextError = commandError(caught);
-              const nextAuthState = authStateForErrorCode(nextError.code);
-              if (nextAuthState) {
-                setConnection((current) =>
-                  current.connected
-                    ? { ...current, authState: nextAuthState }
-                    : current,
-                );
-                setSlots((previous) =>
-                  previous.map((slot) =>
-                    slot.revealed ? { ...slot, revealed: false } : slot,
-                  ),
-                );
-              } else {
-                if (shouldDropConnectionAfterCommandError(nextError.code)) {
-                  setConnection(disconnected);
-                  requestReconnect();
-                }
-                setSlots((previous) =>
-                  previous.map((slot) =>
-                    slot.revealed ? { ...slot, revealed: false } : slot,
-                  ),
-                );
-              }
-              if (!shouldDropConnectionAfterCommandError(nextError.code)) {
-                setReconnecting(false);
-                reconnectAttempt.current = 0;
-              }
-              setError(nextError);
-            }
-            return;
-          }
-        } else {
-          setSlots((previous) =>
-            previous.map((slot) =>
-              slot.revealed ? { ...slot, revealed: false } : slot,
-            ),
-          );
-        }
-        if (isCurrent(sequence)) {
-          // A locked/credential-invalid connection is still physically
-          // connected and must not enter reconnect backoff.
-          setReconnecting(false);
-          reconnectAttempt.current = 0;
-        }
-      }
-
-      const exactDevices = nextDevices.filter(
-        (device) => device.usageMetadata === "exact",
-      );
       if (!nextConnection.connected && nextDevices.length === 0) {
-        const noDeviceError: CommandError = {
-          code: "no_device",
-          message: "No compatible Runtime Macro HID device was found.",
-        };
-        setLastErrorCode(noDeviceError.code);
-        setError(noDeviceError);
-      } else if (
-        !nextConnection.connected &&
-        nextDevices.length > 0 &&
-        exactDevices.length === 0
-      ) {
-        autoReconnectSuppressed.current = true;
-        setReconnecting(false);
-        const metadataError: CommandError = {
-          code: "usage_metadata_missing",
-          message: "HID Usage metadata is unavailable; choose a device explicitly.",
-        };
-        setLastErrorCode(metadataError.code);
-        setError(metadataError);
-      } else if (!nextConnection.connected && exactDevices.length === 1) {
-        await connectDevice(exactDevices[0].id, sequence);
-      } else if (!nextConnection.connected && exactDevices.length > 1) {
-        autoReconnectSuppressed.current = true;
-        setReconnecting(false);
-        const ambiguousError: CommandError = {
-          code: "ambiguous_devices",
-          message: "Multiple compatible HID devices were found; choose one explicitly.",
-        };
-        setLastErrorCode(ambiguousError.code);
-        setError(ambiguousError);
+        setLastErrorCode("no_device");
+        setErrorCode("no_device");
       }
     } catch (caught) {
-      if (isCurrent(sequence)) {
-        const nextError = commandError(caught);
-        setError(nextError);
-        if (shouldReconnectAfterConnectionError(nextError.code)) {
-          requestReconnect();
-        } else {
-          autoReconnectSuppressed.current = true;
-          setReconnecting(false);
-        }
+      if (mounted.current && operation.current === sequence) {
+        const error = commandError(caught);
+        applyErrorState(error);
       }
     } finally {
-      if (isCurrent(sequence)) {
-        setBusy(false);
+      if (mounted.current && operation.current === sequence) {
         setChecking(false);
+        setBusy(false);
+        setRefreshing(false);
       }
     }
-  }, [clearReconnectTimer, commandError, connectDevice, isCurrent, loadSlots, recordOperation, requestReconnect]);
+  }, [applyErrorState, commandError, hideRevealed, loadSlots, recordOperation]);
 
-  refreshDevicesRef.current = refreshDevices;
+  const connectDevice = useCallback(async (id: string) => {
+    const sequence = ++operation.current;
+    setSelectedId(id);
+    setChecking(true);
+    setBusy(true);
+    setErrorCode(null);
+    setClearConfirm(null);
+    setSwitchConfirm(null);
+    setDeviceSwitchConfirm(null);
+    setSetupOpen(false);
+    setPasswordModalMode(null);
+    setConnection(disconnected);
+    hideRevealed();
+    recordOperation("Connect");
+    try {
+      const nextConnection = await connectDeviceCommand(id);
+      if (!mounted.current || operation.current !== sequence) return;
+      const nextKey = nextConnection.connected ? deviceSummaryKey(nextConnection.device) : null;
+      const preserveDirty = nextKey !== null && nextKey === deviceKey.current;
+      // Do not discard drafts until the replacement connection succeeds and its
+      // safe summary is known to differ from the retained device.
+      if (nextConnection.connected && nextKey !== null) {
+        if (!preserveDirty) {
+          setSlots([]);
+          setSelectedSlot(null);
+        }
+        deviceKey.current = nextKey;
+      }
+      const nextLabels = readLabels(nextConnection.device);
+      setLabels(nextLabels);
+      setConnection(nextConnection);
+      if (canManage(nextConnection)) {
+        const listed = await loadSlots(sequence, nextLabels, preserveDirty);
+        if (listed && nextConnection.authState === "open") setSetupOpen(true);
+      }
+    } catch (caught) {
+      if (mounted.current && operation.current === sequence) {
+        const error = commandError(caught);
+        setConnection(disconnected);
+        hideRevealed();
+        if (error.code === "bad_version") setErrorCode("bad_version");
+      }
+    } finally {
+      if (mounted.current && operation.current === sequence) {
+        setChecking(false);
+        setBusy(false);
+      }
+    }
+  }, [commandError, hideRevealed, loadSlots, recordOperation]);
+
+  const requestDeviceConnect = useCallback((id: string) => {
+    const candidate = devices.find((item) => item.id === id);
+    const candidateKey = deviceSummaryKey(candidate ?? null);
+    if (dirtyRef.current && candidateKey !== deviceKey.current) {
+      setDeviceSwitchConfirm(id);
+      return;
+    }
+    void connectDevice(id);
+  }, [connectDevice, devices]);
 
   const disconnectDevice = useCallback(async () => {
     const sequence = ++operation.current;
-    autoReconnectSuppressed.current = true;
-    reconnectAttempt.current = 0;
-    clearReconnectTimer();
-    setReconnecting(false);
     setBusy(true);
-    setError(null);
+    setErrorCode(null);
+    setSetupOpen(false);
+    setPasswordModalMode(null);
     recordOperation("Disconnect");
     try {
       await disconnectDeviceCommand();
-      if (!isCurrent(sequence)) {
-        return;
-      }
+      if (!mounted.current || operation.current !== sequence) return;
       setConnection(disconnected);
-      setSlots((previous) =>
-        previous.map((slot) =>
-          slot.revealed ? { ...slot, revealed: false } : slot,
-        ),
-      );
       setSelectedId("");
       setClearConfirm(null);
+      setSwitchConfirm(null);
+      setDeviceSwitchConfirm(null);
+      hideRevealed();
     } catch (caught) {
-      if (isCurrent(sequence)) {
-        setError(commandError(caught));
-      }
+      if (mounted.current && operation.current === sequence) commandError(caught);
     } finally {
-      if (isCurrent(sequence)) {
-        setBusy(false);
-      }
+      if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [clearReconnectTimer, commandError, isCurrent, recordOperation]);
+  }, [commandError, hideRevealed, recordOperation]);
 
   const refreshSlots = useCallback(async () => {
+    if (!canManage(connectionRef.current)) return;
     const sequence = ++operation.current;
     setBusy(true);
-    setError(null);
+    setRefreshing(true);
+    setErrorCode(null);
     try {
-      if (!canManageConnection(connection)) {
-        return;
-      }
-      await loadSlots(sequence);
+      const loaded = await loadSlots(sequence, labels, true);
+      if (loaded && mounted.current && operation.current === sequence) hideRevealed();
     } catch (caught) {
-      if (isCurrent(sequence)) {
-        const nextError = commandError(caught);
-        const nextAuthState = authStateForErrorCode(nextError.code);
-        setError(nextError);
-        setSlots((previous) =>
-          previous.map((slot) =>
-            slot.revealed ? { ...slot, revealed: false } : slot,
-          ),
-        );
-        if (nextAuthState) {
-          setConnection((current) =>
-            current.connected
-              ? { ...current, authState: nextAuthState }
-              : current,
-          );
-        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
-          setConnection(disconnected);
-          requestReconnect();
-        }
+      if (mounted.current && operation.current === sequence) {
+        const error = commandError(caught);
+        applyErrorState(error);
       }
     } finally {
-      if (isCurrent(sequence)) {
+      if (mounted.current && operation.current === sequence) {
         setBusy(false);
+        setRefreshing(false);
       }
     }
-  }, [commandError, connection, isCurrent, loadSlots, requestReconnect]);
+  }, [applyErrorState, commandError, hideRevealed, labels, loadSlots]);
 
-  const loadSlotContent = useCallback(
-    async (slotNumber: number) => {
-      if (!canManageConnection(connection)) {
-        return;
+  const loadSlotContent = useCallback(async (slotNumber: number) => {
+    if (!canManage(connectionRef.current)) return;
+    const sequence = ++operation.current;
+    setBusy(true);
+    setInputError(null);
+    setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, loading: true, error: null, lastAction: null } : slot));
+    recordOperation("GET");
+    try {
+      const bytes = await getSlot(slotNumber);
+      const text = decodeSlotBytes(bytes);
+      if (text === null) {
+        const error: CommandError = { code: "invalid_text", message: "" };
+        setLastErrorCode(error.code);
+        setErrorCode(error.code);
+        throw error;
       }
-      const sequence = operation.current;
-      const request = ++slotRequest.current;
-      setSlots((previous) =>
-        previous.map((slot) =>
-          slot.slot === slotNumber
-            ? {
-                ...slot,
-                loading: true,
-                error: null,
-                lastAction: null,
-              }
-            : slot,
-        ),
-      );
-      setInputError(null);
-      recordOperation("GET");
-
-      try {
-        const bytes = await getSlot(slotNumber);
-        const text = decodeSlotBytes(bytes);
-        if (!isCurrent(sequence)) {
-          return;
-        }
-        if (slotRequest.current !== request || selectedSlot !== slotNumber) {
-          setSlots((previous) =>
-            previous.map((slot) =>
-              slot.slot === slotNumber ? { ...slot, loading: false } : slot,
-            ),
-          );
-          return;
-        }
-        setSlots((previous) =>
-          previous.map((slot) =>
-            slot.slot === slotNumber
-              ? {
-                  ...slot,
-                  length: bytes.length,
-                  savedText: text,
-                  draftText: text,
-                  loaded: true,
-                  loading: false,
-                  revealed: false,
-                  status: "idle",
-                  error: null,
-                  lastAction: null,
-                }
-              : slot,
-          ),
-        );
-      } catch (caught) {
-        if (!isCurrent(sequence)) {
-          return;
-        }
-        const nextError = commandError(caught);
-        const nextAuthState = authStateForErrorCode(nextError.code);
-        if (nextAuthState) {
-          setConnection((current) =>
-            current.connected
-              ? { ...current, authState: nextAuthState }
-              : current,
-          );
-        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
-          setConnection(disconnected);
-        }
-        setSlots((previous) =>
-          previous.map((slot) => {
-            if (slot.slot === slotNumber) {
-              const isCurrentSlotRequest =
-                slotRequest.current === request && selectedSlot === slotNumber;
-              return {
-                ...slot,
-                loading: false,
-                revealed: false,
-                ...(isCurrentSlotRequest
-                  ? {
-                      status: "error" as const,
-                      error: nextError,
-                      lastAction: "load" as const,
-                    }
-                  : {
-                      status: "idle" as const,
-                      error: null,
-                      lastAction: null,
-                    }),
-              };
-            }
-            return slot.revealed ? { ...slot, revealed: false } : slot;
-          }),
-        );
-        setError(nextError);
-        if (!nextAuthState && shouldDropConnectionAfterCommandError(nextError.code)) {
-          requestReconnect();
-        }
+      if (!mounted.current || operation.current !== sequence || selectedSlotRef.current !== slotNumber) return;
+      setErrorCode(null);
+      setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, revealed: false, status: "idle", error: null, lastAction: null, savedAt: slot.savedAt } : slot));
+    } catch (caught) {
+      if (mounted.current && operation.current === sequence) {
+        const error = caught && typeof caught === "object" && "code" in caught ? caught as CommandError : commandError(caught);
+        if (error.code !== "invalid_text") commandError(caught);
+        applyErrorState(error);
+        setSlots((previous) => previous.map((slot) => slot.slot === slotNumber ? { ...slot, loading: false, revealed: false, status: "error", error, lastAction: "load" } : slot));
       }
-    },
-    [commandError, connection, isCurrent, recordOperation, requestReconnect, selectedSlot],
-  );
-
-  const selectedState = useMemo(
-    () => slots.find((slot) => slot.slot === selectedSlot) ?? null,
-    [selectedSlot, slots],
-  );
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, commandError, recordOperation]);
 
   useEffect(() => {
-    if (!canManageConnection(connection) || selectedSlot === null) {
-      return;
-    }
-    const slot = slots.find((item) => item.slot === selectedSlot);
-    if (!slot || slot.loaded || slot.loading || slot.error) {
-      return;
-    }
-    if (slot.length === 0) {
-      setSlots((previous) =>
-        previous.map((item) =>
-          item.slot === selectedSlot ? { ...item, loaded: true } : item,
-        ),
-      );
+    if (!canManage(connection) || selectedSlot === null) return;
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected || selected.loaded || selected.loading || selected.error) return;
+    if (selected.length === 0) {
+      setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, loaded: true } : slot));
       return;
     }
     void loadSlotContent(selectedSlot);
   }, [connection, loadSlotContent, selectedSlot, slots]);
 
-  const updateSelectedSlot = useCallback(
-    (update: (slot: SlotState) => SlotState) => {
-      if (selectedSlot === null) {
-        return;
-      }
-      setSlots((previous) =>
-        previous.map((slot) =>
-          slot.slot === selectedSlot
-            ? update({
-                ...slot,
-                status: "idle",
-                error: null,
-                lastAction: null,
-              })
-            : slot,
-        ),
-      );
-    },
-    [selectedSlot],
-  );
+  const selectSlotImmediately = useCallback((slotNumber: number) => {
+    operation.current += 1;
+    setSelectedSlot(slotNumber);
+    setClearConfirm(null);
+    setSwitchConfirm(null);
+    setInputError(null);
+    hideRevealed();
+  }, [hideRevealed]);
 
-  const updateLabel = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const value = event.target.value.slice(0, 64);
-      updateSelectedSlot((slot) => ({ ...slot, draftLabel: value }));
-    },
-    [updateSelectedSlot],
-  );
+  const selectSlot = useCallback((slotNumber: number) => {
+    if (busy || selectedSlot === slotNumber) return;
+    const current = slots.find((slot) => slot.slot === selectedSlot);
+    if (current && isDirty(current)) {
+      setSwitchConfirm(slotNumber);
+      return;
+    }
+    selectSlotImmediately(slotNumber);
+  }, [busy, selectSlotImmediately, selectedSlot, slots]);
 
-  const updateEditor = useCallback(
-    (value: string) => {
-      const parsed = parseEditorText(value);
-      if (parsed.error || parsed.text === null) {
-        setInputError(parsed.error ?? "parseFailed");
-        return;
-      }
-      setInputError(null);
-      updateSelectedSlot((slot) => ({ ...slot, draftText: parsed.text }));
-    },
-    [updateSelectedSlot],
-  );
+  const updateLabel = useCallback((value: string) => {
+    if (selectedSlot === null) return;
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, draftLabel: value.slice(0, 64), status: "idle", error: null, lastAction: null } : slot));
+  }, [selectedSlot]);
 
-  const insertControlToken = useCallback(
-    (token: string) => {
-      if (!selectedState?.loaded) {
-        return;
-      }
-      const currentValue = toEditorText(selectedState.draftText);
-      const input = editorRef.current;
-      const start = input?.selectionStart ?? currentValue.length;
-      const end = input?.selectionEnd ?? start;
-      const nextValue = currentValue.slice(0, start) + token + currentValue.slice(end);
-      const parsed = parseEditorText(nextValue);
-      if (parsed.error || parsed.text === null) {
-        setInputError(parsed.error ?? "parseFailed");
-        return;
-      }
-      setInputError(null);
-      updateSelectedSlot((slot) => ({ ...slot, draftText: parsed.text }));
-      window.requestAnimationFrame(() => {
-        if (editorRef.current) {
-          const caret = start + token.length;
-          editorRef.current.focus();
-          editorRef.current.setSelectionRange(caret, caret);
-        }
-      });
-    },
-    [selectedState, updateSelectedSlot],
-  );
-
-  const saveSlot = useCallback(
-    async (slotNumber = selectedSlot) => {
-      if (
-        slotNumber === null ||
-        !canManageConnection(connection) ||
-        mutationBusy
-      ) {
-        return;
-      }
-      const slot = slots.find((item) => item.slot === slotNumber);
-      if (!slot || !slot.loaded || !isDirty(slot)) {
-        return;
-      }
-      const request = ++mutationRequest.current;
-      setMutationBusy(true);
-      setClearConfirm(null);
-      setSlots((previous) =>
-        previous.map((item) =>
-          item.slot === slotNumber
-            ? { ...item, status: "saving", error: null, lastAction: null }
-            : item,
-        ),
-      );
-      try {
-        if (slot.draftText !== slot.savedText) {
-          recordOperation("SET");
-          await setSlotCommand(slotNumber, slot.draftText);
-        }
-        if (!mounted.current || mutationRequest.current !== request) {
-          return;
-        }
-        const nextLabels = {
-          ...labels,
-          [slotNumber]: slot.draftLabel,
-        };
-        writeLabels(connection.device, nextLabels);
-        setLabels(nextLabels);
-        setSlots((previous) =>
-          previous.map((item) =>
-            item.slot === slotNumber
-              ? {
-                  ...item,
-                  length: textByteLength(slot.draftText),
-                  savedText: slot.draftText,
-                  savedLabel: slot.draftLabel,
-                  status: "saved",
-                  error: null,
-                  lastAction: null,
-                }
-              : item,
-          ),
-        );
-        window.setTimeout(() => {
-          if (mounted.current) {
-            setSlots((previous) =>
-              previous.map((item) =>
-                item.slot === slotNumber && item.status === "saved"
-                  ? { ...item, status: "idle" }
-                  : item,
-              ),
-            );
-          }
-        }, 2200);
-      } catch (caught) {
-        if (!mounted.current || mutationRequest.current !== request) {
-          return;
-        }
-        const nextError = commandError(caught);
-        const nextAuthState = authStateForErrorCode(nextError.code);
-        if (nextAuthState) {
-          setConnection((current) =>
-            current.connected
-              ? { ...current, authState: nextAuthState }
-              : current,
-          );
-        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
-          setConnection(disconnected);
-        }
-        setError(nextError);
-        setSlots((previous) =>
-          previous.map((item) =>
-            item.slot === slotNumber
-              ? {
-                  ...item,
-                  revealed: false,
-                  status: "error",
-                  error: nextError,
-                  lastAction: "save",
-                }
-              : item,
-          ),
-        );
-        if (!nextAuthState && shouldDropConnectionAfterCommandError(nextError.code)) {
-          requestReconnect();
-        }
-      } finally {
-        if (mounted.current && mutationRequest.current === request) {
-          setMutationBusy(false);
-        }
-      }
-    },
-    [commandError, connection, labels, mutationBusy, recordOperation, requestReconnect, selectedSlot, slots],
-  );
-
-  const clearSlot = useCallback(
-    async (slotNumber: number) => {
-      if (!canManageConnection(connection) || mutationBusy) {
-        return;
-      }
-      const slot = slots.find((item) => item.slot === slotNumber);
-      if (!slot || !slot.loaded || textByteLength(slot.draftText) === 0) {
-        return;
-      }
-      const request = ++mutationRequest.current;
-      setMutationBusy(true);
-      setClearConfirm(null);
-      setSlots((previous) =>
-        previous.map((item) =>
-          item.slot === slotNumber
-            ? { ...item, status: "saving", error: null, lastAction: null }
-            : item,
-        ),
-      );
-      try {
-        recordOperation("CLEAR");
-        await clearSlotCommand(slotNumber);
-        if (!mounted.current || mutationRequest.current !== request) {
-          return;
-        }
-        setSlots((previous) =>
-          previous.map((item) =>
-            item.slot === slotNumber
-              ? {
-                  ...item,
-                  length: 0,
-                  savedText: "",
-                  draftText: "",
-                  loaded: true,
-                  revealed: false,
-                  status: "saved",
-                  error: null,
-                  lastAction: null,
-                }
-              : item,
-          ),
-        );
-        window.setTimeout(() => {
-          if (mounted.current) {
-            setSlots((previous) =>
-              previous.map((item) =>
-                item.slot === slotNumber && item.status === "saved"
-                  ? { ...item, status: "idle" }
-                  : item,
-              ),
-            );
-          }
-        }, 2200);
-      } catch (caught) {
-        if (!mounted.current || mutationRequest.current !== request) {
-          return;
-        }
-        const nextError = commandError(caught);
-        const nextAuthState = authStateForErrorCode(nextError.code);
-        if (nextAuthState) {
-          setConnection((current) =>
-            current.connected
-              ? { ...current, authState: nextAuthState }
-              : current,
-          );
-        } else if (shouldDropConnectionAfterCommandError(nextError.code)) {
-          setConnection(disconnected);
-        }
-        setError(nextError);
-        setSlots((previous) =>
-          previous.map((item) =>
-            item.slot === slotNumber
-              ? {
-                  ...item,
-                  revealed: false,
-                  status: "error",
-                  error: nextError,
-                  lastAction: "clear",
-                }
-              : item,
-          ),
-        );
-        if (!nextAuthState && shouldDropConnectionAfterCommandError(nextError.code)) {
-          requestReconnect();
-        }
-      } finally {
-        if (mounted.current && mutationRequest.current === request) {
-          setMutationBusy(false);
-        }
-      }
-    },
-    [commandError, connection, mutationBusy, recordOperation, requestReconnect, slots],
-  );
-
-  const retrySlotAction = useCallback(
-    (slot: SlotState) => {
-      if (slot.lastAction === "load") {
-        void loadSlotContent(slot.slot);
-      } else if (slot.lastAction === "save") {
-        void saveSlot(slot.slot);
-      } else if (slot.lastAction === "clear") {
-        setClearConfirm(slot.slot);
-      }
-    },
-    [loadSlotContent, saveSlot],
-  );
-
-  const selectSlot = useCallback(
-    (slotNumber: number) => {
-      if (mutationBusy || selectedSlot === slotNumber) {
-        return;
-      }
-      const currentSlot = slots.find((slot) => slot.slot === selectedSlot);
-      if (currentSlot && isDirty(currentSlot)) {
-        const confirmed = window.confirm(copy.switchUnsavedMessage);
-        if (!confirmed) {
-          return;
-        }
-      }
-      slotRequest.current += 1;
-      setSelectedSlot(slotNumber);
-      setClearConfirm(null);
-      setInputError(null);
-    },
-    [copy.switchUnsavedMessage, mutationBusy, selectedSlot, slots],
-  );
-
-  const handleEditorKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLTextAreaElement>) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        void saveSlot();
-        return;
-      }
-      if (event.key === "Enter") {
-        event.preventDefault();
-        insertControlToken("↵");
-      } else if (event.key === "Tab") {
-        event.preventDefault();
-        insertControlToken("⇥");
-      }
-    },
-    [insertControlToken, saveSlot],
-  );
-
-  const addMacro = useCallback(() => {
-    if (!selectedState?.loaded) {
+  const appendText = useCallback((value: string) => {
+    if (selectedSlot === null || !canManage(connectionRef.current)) return;
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected?.loaded) return;
+    if (macroBytes(selected.draftText + value) > MAX_TEXT_BYTES) {
+      setInputError("textTooLong");
       return;
     }
     setInputError(null);
-    updateSelectedSlot((slot) => ({ ...slot, revealed: true }));
-    window.requestAnimationFrame(() => editorRef.current?.focus());
-  }, [selectedState, updateSelectedSlot]);
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, draftText: slot.draftText + value, status: "idle", error: null, lastAction: null } : slot));
+  }, [selectedSlot, slots]);
 
-  const updateSettingsDraft = useCallback((update: Partial<UserSettings>) => {
-    setSettingsDraft((previous) => ({ ...previous, ...update }));
-    setSettingsError(null);
-    setSettingsSaved(false);
-  }, []);
+  const appendKey = useCallback((kind: "char" | "control", label: string) => {
+    if (kind === "char") {
+      appendText(label);
+      return;
+    }
+    const control = label === "LF" ? "\n" : label === "Tab" ? "\t" : "\b";
+    appendText(control);
+  }, [appendText]);
 
-  const updateLanguagePreference = useCallback(
-    (event: ChangeEvent<HTMLSelectElement>) => {
-      const nextPreference = event.target.value;
-      if (!isLanguagePreference(nextPreference)) {
-        return;
+  const removeToken = useCallback((index: number) => {
+    if (selectedSlot === null) return;
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected?.loaded) return;
+    const tokens = tokensFromText(selected.draftText);
+    if (index < 0 || index >= tokens.length) return;
+    tokens.splice(index, 1);
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, draftText: textFromTokens(tokens), status: "idle", error: null, lastAction: null } : slot));
+    setInputError(null);
+  }, [selectedSlot, slots]);
+
+  const moveToken = useCallback((index: number, offset: number) => {
+    if (selectedSlot === null) return;
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected?.loaded) return;
+    const tokens = tokensFromText(selected.draftText);
+    const target = index + offset;
+    if (index < 0 || target < 0 || target >= tokens.length) return;
+    const [token] = tokens.splice(index, 1);
+    tokens.splice(target, 0, token);
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, draftText: textFromTokens(tokens), status: "idle", error: null, lastAction: null } : slot));
+  }, [selectedSlot, slots]);
+
+  const toggleReveal = useCallback(() => {
+    if (selectedSlot === null || !canManage(connectionRef.current)) return;
+    setInputError(null);
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot && slot.loaded ? { ...slot, revealed: !slot.revealed } : slot));
+  }, [selectedSlot]);
+
+  const addMacro = useCallback(() => {
+    if (selectedSlot === null || !canManage(connectionRef.current)) return;
+    setInputError(null);
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot && slot.loaded ? { ...slot, revealed: true } : slot));
+  }, [selectedSlot]);
+
+  const saveSlot = useCallback(async () => {
+    if (selectedSlot === null || busy || !canManage(connectionRef.current)) return;
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected || !selected.loaded || !isDirty(selected)) return;
+    const sequence = ++operation.current;
+    setBusy(true);
+    setClearConfirm(null);
+    setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, status: "saving", error: null, lastAction: null } : slot));
+    try {
+      if (selected.draftText !== selected.savedText) {
+        recordOperation("SET");
+        await setSlotCommand(selected.slot, selected.draftText);
       }
-      setLanguagePreference(nextPreference);
-      writeLanguagePreference(nextPreference);
-    },
-    [],
-  );
+      if (!mounted.current || operation.current !== sequence) return;
+      setErrorCode(null);
+      const nextLabels = { ...labels, [selected.slot]: selected.draftLabel };
+      writeLabels(connectionRef.current.device, nextLabels);
+      setLabels(nextLabels);
+      const now = new Date().toISOString();
+      setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, length: macroBytes(selected.draftText), savedText: selected.draftText, savedLabel: selected.draftLabel, status: "saved", error: null, lastAction: null, savedAt: now } : slot));
+      window.setTimeout(() => {
+        if (mounted.current) setSlots((previous) => previous.map((slot) => slot.slot === selected.slot && slot.status === "saved" ? { ...slot, status: "idle" } : slot));
+      }, 2_000);
+    } catch (caught) {
+      if (mounted.current && operation.current === sequence) {
+        const error = commandError(caught);
+        applyErrorState(error);
+        setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, revealed: false, status: "error", error, lastAction: "save" } : slot));
+      }
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, busy, commandError, labels, recordOperation, selectedSlot, slots]);
+
+  const requestClear = useCallback(() => {
+    if (selectedSlot !== null) setClearConfirm(selectedSlot);
+  }, [selectedSlot]);
+
+  const clearSlot = useCallback(async () => {
+    if (selectedSlot === null || busy || !canManage(connectionRef.current)) return;
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected || !selected.loaded || macroBytes(selected.draftText) === 0) return;
+    const sequence = ++operation.current;
+    setBusy(true);
+    setClearConfirm(null);
+    setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, status: "saving", error: null, lastAction: null } : slot));
+    try {
+      recordOperation("CLEAR");
+      await clearSlotCommand(selected.slot);
+      if (!mounted.current || operation.current !== sequence) return;
+      const now = new Date().toISOString();
+      setErrorCode(null);
+      setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, length: 0, savedText: "", draftText: "", loaded: true, revealed: false, status: "saved", error: null, lastAction: null, savedAt: now } : slot));
+      window.setTimeout(() => {
+        if (mounted.current) setSlots((previous) => previous.map((slot) => slot.slot === selected.slot && slot.status === "saved" ? { ...slot, status: "idle" } : slot));
+      }, 2_000);
+    } catch (caught) {
+      if (mounted.current && operation.current === sequence) {
+        const error = commandError(caught);
+        applyErrorState(error);
+        setSlots((previous) => previous.map((slot) => slot.slot === selected.slot ? { ...slot, revealed: false, status: "error", error, lastAction: "clear" } : slot));
+      }
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, busy, commandError, recordOperation, selectedSlot, slots]);
+
+  const retrySelected = useCallback(() => {
+    const selected = slots.find((slot) => slot.slot === selectedSlot);
+    if (!selected) return;
+    const action: SlotAction | null = selected.lastAction;
+    if (action === "load") void loadSlotContent(selected.slot);
+    else if (action === "save") void saveSlot();
+    else if (action === "clear") setClearConfirm(selected.slot);
+  }, [loadSlotContent, saveSlot, selectedSlot, slots]);
+
+  const authenticateDevice = useCallback(async (password: string): Promise<CommandError | null> => {
+    if (!connectionRef.current.connected) return { code: "not_connected", message: "" };
+    setBusy(true);
+    setErrorCode(null);
+    recordOperation("AUTH");
+    try {
+      const nextAuthState = await authenticate(password);
+      if (!mounted.current) return null;
+      setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+      if (nextAuthState === "authenticated") {
+        const sequence = ++operation.current;
+        await loadSlots(sequence, labels, true);
+      }
+      return null;
+    } catch (caught) {
+      const error = commandError(caught);
+      applyErrorState(error);
+      return error;
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }, [applyErrorState, commandError, labels, loadSlots, recordOperation]);
+
+  const setPassword = useCallback(async (password: string): Promise<CommandError | null> => {
+    if (!connectionRef.current.connected) return { code: "not_connected", message: "" };
+    setBusy(true);
+    setErrorCode(null);
+    recordOperation("PASSWORD_SET");
+    try {
+      const nextAuthState = await setPasswordCommand(password);
+      if (!mounted.current) return null;
+      setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+      hideRevealed();
+      setSetupOpen(false);
+      setPasswordModalMode(null);
+      return null;
+    } catch (caught) {
+      const error = commandError(caught);
+      applyErrorState(error);
+      return error;
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }, [applyErrorState, commandError, hideRevealed, recordOperation]);
+
+  const lockManagement = useCallback(async () => {
+    if (!connectionRef.current.connected || connectionRef.current.authState !== "authenticated" || busy) return;
+    setBusy(true);
+    setErrorCode(null);
+    recordOperation("LOCK");
+    hideRevealed();
+    try {
+      const nextAuthState = await lockDevice();
+      if (!mounted.current) return;
+      setConnection((current) => current.connected ? { ...current, authState: nextAuthState } : current);
+    } catch (caught) {
+      const error = commandError(caught);
+      applyErrorState(error);
+      setConnection((current) => current.connected ? { ...current, authState: error.code === "credential_invalid" ? "credentialInvalid" : "locked" } : current);
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }, [applyErrorState, busy, commandError, hideRevealed, recordOperation]);
 
   const saveSettings = useCallback(async () => {
-    const validation = validateUserSettings(settingsDraft);
-    if (validation) {
-      setSettingsError(validation);
-      setSettingsSaved(false);
+    if (!Number.isInteger(settingsDraft.timeoutMs) || settingsDraft.timeoutMs < MIN_TIMEOUT_MS || settingsDraft.timeoutMs > MAX_TIMEOUT_MS) {
+      setSettingsError("timeout");
+      return;
+    }
+    if (!Number.isInteger(settingsDraft.retries) || settingsDraft.retries < 0 || settingsDraft.retries > MAX_RETRIES) {
+      setSettingsError("retries");
       return;
     }
     setSettingsBusy(true);
@@ -1378,824 +715,296 @@ function App() {
     setSettingsSaved(false);
     recordOperation("Settings");
     try {
-      const nextTransport = await setSettingsCommand(
-        settingsDraft.timeoutMs,
-        settingsDraft.retries,
-      );
-      const nextSettings: UserSettings = {
-        ...nextTransport,
-        autoReconnect: settingsDraft.autoReconnect,
-      };
+      const nextSettings = await setSettingsCommand(settingsDraft.timeoutMs, settingsDraft.retries);
       setSettings(nextSettings);
       setSettingsDraft(nextSettings);
-      writeUserSettings(nextSettings);
+      writeSettings(nextSettings);
       setSettingsSaved(true);
-      window.setTimeout(() => setSettingsSaved(false), 2200);
+      window.setTimeout(() => setSettingsSaved(false), 2_000);
     } catch (caught) {
-      const nextError = commandError(caught);
-      setSettingsError(nextError);
+      setSettingsError(commandError(caught));
     } finally {
       setSettingsBusy(false);
     }
   }, [commandError, recordOperation, settingsDraft]);
 
-  const cancelCloseRequest = useCallback(() => {
-    closeConfirmOpenRef.current = false;
+  const updateTheme = useCallback((nextTheme: ThemeMode) => {
+    setTheme(nextTheme);
+    try { localStorage.setItem(THEME_STORAGE_KEY, nextTheme); } catch { /* optional preference */ }
+  }, []);
+
+  const updateLanguage = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
+    const next = event.target.value;
+    if (!isLanguagePreference(next)) return;
+    setLanguagePreference(next);
+    writeLanguagePreference(next);
+  }, []);
+
+  const cancelClose = useCallback(() => {
+    closeConfirmRef.current = false;
     setCloseConfirmOpen(false);
   }, []);
 
   const closeWithoutSaving = useCallback(() => {
-    closeConfirmOpenRef.current = false;
+    closeConfirmRef.current = false;
     setCloseConfirmOpen(false);
-    if (!("__TAURI_INTERNALS__" in window)) {
-      return;
-    }
+    if (!inTauri()) return;
     void getCurrentWindow().destroy().catch(() => {
       if (mounted.current) {
-        closeConfirmOpenRef.current = true;
+        closeConfirmRef.current = true;
         setCloseConfirmOpen(true);
       }
     });
   }, []);
 
   useEffect(() => {
-    if (!closeConfirmOpen) {
-      return;
-    }
-    const handleCloseKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        cancelCloseRequest();
-      }
-    };
-    window.addEventListener("keydown", handleCloseKeyDown);
-    return () => window.removeEventListener("keydown", handleCloseKeyDown);
-  }, [cancelCloseRequest, closeConfirmOpen]);
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.lang = locale;
+    return () => { delete document.documentElement.dataset.theme; document.documentElement.lang = ""; };
+  }, [locale, theme]);
 
   useEffect(() => {
     mounted.current = true;
+    void refreshDevices();
+    void getSettings().then((backend) => {
+      if (!mounted.current) return;
+      setSettings(backend);
+      setSettingsDraft(backend);
+      writeSettings(backend);
+    }).catch((caught) => {
+      if (mounted.current) setSettingsError(commandError(caught));
+    });
     return () => {
       mounted.current = false;
-      clearReconnectTimer();
     };
-  }, [clearReconnectTimer]);
-
-  useEffect(() => {
-    if (settingsInitialised.current) {
-      return;
-    }
-    settingsInitialised.current = true;
-    const stored = readUserSettings();
-    settingsLoad.current = (async () => {
-      recordOperation("Settings");
-      try {
-        const backend = await getSettings();
-        const transport =
-          backend.timeoutMs !== stored.timeoutMs || backend.retries !== stored.retries
-            ? await setSettingsCommand(stored.timeoutMs, stored.retries)
-            : backend;
-        const nextSettings: UserSettings = {
-          ...transport,
-          autoReconnect: stored.autoReconnect,
-        };
-        setSettings(nextSettings);
-        setSettingsDraft(nextSettings);
-        writeUserSettings(nextSettings);
-      } catch (caught) {
-        setSettingsError(commandError(caught));
-      }
-    })();
-  }, [commandError, recordOperation]);
-
-  useEffect(() => {
-    if (
-      connection.connected ||
-      !settings.autoReconnect ||
-      autoReconnectSuppressed.current
-    ) {
-      clearReconnectTimer();
-      if (!connection.connected) {
-        setReconnecting(false);
-      }
-      return;
-    }
-    if (
-      !mounted.current ||
-      checking ||
-      busy ||
-      reconnectTimer.current !== null
-    ) {
-      return;
-    }
-    if (reconnectAttempt.current >= MAX_RECONNECT_ATTEMPTS) {
-      setReconnecting(false);
-      return;
-    }
-
-    const delay =
-      RECONNECT_DELAYS_MS[
-        Math.min(reconnectAttempt.current, RECONNECT_DELAYS_MS.length - 1)
-      ];
-    setReconnecting(true);
-    reconnectTimer.current = window.setTimeout(() => {
-      reconnectTimer.current = null;
-      if (
-        !mounted.current ||
-        connectionRef.current ||
-        !autoReconnectRef.current ||
-        autoReconnectSuppressed.current
-      ) {
-        setReconnecting(false);
-        return;
-      }
-      reconnectAttempt.current += 1;
-      void refreshDevicesRef.current?.("automatic");
-    }, delay);
-  }, [busy, checking, clearReconnectTimer, connection.connected, settings.autoReconnect]);
+  }, [commandError, refreshDevices]);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (!dirtyRef.current) {
-        return;
-      }
+      if (!dirtyRef.current) return;
       event.preventDefault();
       event.returnValue = "";
     };
-
-    const installBrowserFallback = () => {
+    if (!inTauri()) {
       window.addEventListener("beforeunload", beforeUnload);
-    };
-    const removeBrowserFallback = () => {
-      window.removeEventListener("beforeunload", beforeUnload);
-    };
-
-    if (!("__TAURI_INTERNALS__" in window)) {
-      installBrowserFallback();
-      return removeBrowserFallback;
+      return () => window.removeEventListener("beforeunload", beforeUnload);
     }
-
     let active = true;
     let unlisten: (() => void) | undefined;
     try {
-      const appWindow = getCurrentWindow();
-      void appWindow
-        .onCloseRequested((event) => {
-          if (!dirtyRef.current) {
-            return;
-          }
-          event.preventDefault();
-          if (!closeConfirmOpenRef.current) {
-            closeConfirmOpenRef.current = true;
-            setCloseConfirmOpen(true);
-          }
-        })
-        .then((stopListening) => {
-          if (active) {
-            unlisten = stopListening;
-          } else {
-            stopListening();
-          }
-        })
-        .catch(() => {
-          if (active) {
-            installBrowserFallback();
-          }
-        });
+      void getCurrentWindow().onCloseRequested((event) => {
+        if (!dirtyRef.current) return;
+        event.preventDefault();
+        if (!closeConfirmRef.current) {
+          closeConfirmRef.current = true;
+          setCloseConfirmOpen(true);
+        }
+      }).then((stopListening) => {
+        if (active) unlisten = stopListening;
+        else stopListening();
+      }).catch(() => {
+        if (active) window.addEventListener("beforeunload", beforeUnload);
+      });
     } catch {
-      installBrowserFallback();
+      window.addEventListener("beforeunload", beforeUnload);
     }
-
     return () => {
       active = false;
       unlisten?.();
-      closeConfirmOpenRef.current = false;
-      removeBrowserFallback();
+      window.removeEventListener("beforeunload", beforeUnload);
     };
   }, []);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.lang = locale;
-    return () => {
-      delete document.documentElement.dataset.theme;
-      document.documentElement.lang = "";
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "s" || !connectionRef.current.connected) return;
+      const selected = slots.find((slot) => slot.slot === selectedSlotRef.current);
+      if (!selected || !isDirty(selected)) return;
+      event.preventDefault();
+      void saveSlot();
     };
-  }, [locale, theme]);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [saveSlot, slots]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(THEME_STORAGE_KEY, theme);
-    } catch {
-      // Theme preference is optional.
-    }
-  }, [theme]);
-
-  useEffect(() => {
-    if (initialised.current) {
-      return;
-    }
-    initialised.current = true;
-    void (async () => {
-      await settingsLoad.current;
-      if (mounted.current) {
-        await refreshDevices();
-      }
-    })();
-  }, [refreshDevices]);
-
+  const route = !connection.connected ? "select" : connection.authState === "locked" || connection.authState === "credentialInvalid" ? "unlock" : canManage(connection) ? "workbench" : "select";
   const selectedDevice = devices.find((device) => device.id === selectedId);
-  const canManage = canManageConnection(connection);
-  const mutationInProgress = mutationBusy || slots.some((slot) => slot.status === "saving");
-  const selectedDirty = selectedState ? isDirty(selectedState) : false;
-  const canSave = Boolean(
-    selectedState &&
-      selectedState.loaded &&
-      selectedDirty &&
-      canManage &&
-      !busy &&
-      !mutationInProgress,
-  );
-  const selectedByteLength = selectedState
-    ? selectedState.loaded
-      ? textByteLength(selectedState.draftText)
-      : selectedState.length
-    : 0;
-  const inputErrorMessage = inputError
-    ? translateInputError(inputError, locale)
-    : null;
-  const settingsErrorMessage = settingsError
-    ? typeof settingsError === "string"
-      ? translateSettingsValidation(
-          settingsError,
-          locale,
-          MIN_TIMEOUT_MS,
-          MAX_TIMEOUT_MS,
-          MAX_RETRIES,
-        )
-      : translateCommandError(settingsError.code, locale)
-    : null;
+  const currentCandidateId = devices.find((device) => deviceSummaryKey(device) === deviceSummaryKey(connection.device))?.id;
+  const deviceName = connection.device?.productName || copy.unnamedDevice;
+  const configuredBytes = slots.reduce((total, slot) => total + slot.length, 0);
+  const translatedError = errorCode ? translateCommandError(errorCode, locale) : null;
+  const selectedInputError = inputError ? translateInputError(inputError, locale) : null;
+  const settingsErrorMessage = settingsError ? typeof settingsError === "string" ? translateSettingsValidation(settingsError, locale, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_RETRIES) : translateCommandError(settingsError.code, locale) : null;
+  const statusLabel = checking ? copy.statusChecking : connection.authState === "authenticated" ? copy.statusAuthenticated : copy.statusConnected;
 
   return (
-    <main className="app-shell" data-theme={theme}>
-      <header className="topbar">
-        <div className="brand-lockup">
-          <span className="brand-mark" aria-hidden="true" />
-          <span className="brand-name">{copy.appName}</span>
-        </div>
-        <div className="topbar-actions">
-          <div className="connection-summary" aria-live="polite">
-            {reconnecting ? (
-              <span className="status status-checking">
-                <span className="status-dot" aria-hidden="true" /> {copy.statusReconnecting}
-              </span>
-            ) : checking ? (
-              <span className="status status-checking">
-                <span className="status-dot" aria-hidden="true" /> {copy.statusChecking}
-              </span>
-            ) : connection.connected ? (
-              <>
-                <span className="device-name">
-                  {connection.device?.productName ?? copy.runtimeMacroDevice}
-                </span>
-                <span className="status status-connected">
-                  <span className="status-dot" aria-hidden="true" /> {copy.statusConnected}
-                </span>
-              </>
-            ) : (
-              <span className="status status-disconnected">
-                <span className="status-dot" aria-hidden="true" /> {copy.statusDisconnected}
-              </span>
-            )}
-          </div>
-          <button
-            className="icon-button"
-            type="button"
-            onClick={() => void refreshDevices()}
-            disabled={busy || mutationInProgress}
-            aria-label={connection.connected ? copy.reconnectOrRefresh : copy.reconnectDevice}
-          >
-            {busy ? "…" : "↻"}
-          </button>
-          <button
-            className={`icon-button ${settingsOpen ? "active" : ""}`}
-            type="button"
-            onClick={() => {
-              setSettingsOpen((open) => !open);
-              setSettingsDraft(settings);
-              setSettingsError(null);
-              setSettingsSaved(false);
-            }}
-            aria-label={copy.settings}
-            aria-expanded={settingsOpen}
-          >
-            ⚙
-          </button>
-          <label className="theme-control">
-            <span className="sr-only">{copy.theme}</span>
-            <select
-              value={theme}
-              onChange={(event) => setTheme(event.target.value as ThemeMode)}
-              aria-label={copy.theme}
-            >
-              <option value="system">{copy.themeSystem}</option>
-              <option value="light">{copy.themeLight}</option>
-              <option value="dark">{copy.themeDark}</option>
-            </select>
-          </label>
-        </div>
-      </header>
+    <>
+      {route === "select" ? (
+        <DeviceSelect
+          copy={copy}
+          platform={platform}
+          devices={devices}
+          selectedId={selectedDevice ? selectedDevice.id : selectedId}
+          checking={checking}
+          busy={busy}
+          errorMessage={translatedError}
+          errorCode={errorCode}
+          dirtyDraft={slots.some(isDirty)}
+          onSelect={setSelectedId}
+          onConnect={() => { if (selectedId) requestDeviceConnect(selectedId); }}
+          onRefresh={() => void refreshDevices()}
+        />
+      ) : null}
+
+      {route === "unlock" && connection.device ? (
+        <Unlock
+          copy={copy}
+          locale={locale}
+          platform={platform}
+          device={connection.device}
+          credentialInvalid={connection.authState === "credentialInvalid"}
+          busy={busy}
+          externalErrorCode={errorCode}
+          onBack={() => { void disconnectDevice(); }}
+          onUnlock={authenticateDevice}
+        />
+      ) : null}
+
+      {route === "workbench" && connection.device ? (
+        <MacroWorkbench
+          copy={copy}
+          platform={platform}
+          theme={theme}
+          device={connection.device}
+          devices={devices}
+          currentCandidateId={currentCandidateId}
+          deviceName={deviceName}
+          interfaceLabel={copy.interfaceNumber(connection.device.interfaceNumber)}
+          interfaceNumberLabel={copy.interfaceNumber}
+          connectionStatusLabel={statusLabel}
+          protectedAuthenticated={connection.authState === "authenticated"}
+          isOpen={connection.authState === "open"}
+          slots={slots}
+          selectedSlot={selectedSlot}
+          busy={busy}
+          refreshing={refreshing}
+          clearPending={clearConfirm}
+          errorMessage={translatedError}
+          inputErrorMessage={selectedInputError}
+          lastOperation={lastOperation}
+          lastErrorCode={lastErrorCode}
+          configuredBytes={configuredBytes}
+          onThemeChange={updateTheme}
+          onRefresh={() => void refreshSlots()}
+          onRefreshDevices={() => void refreshDevices()}
+          onSettings={() => { setSettingsDraft(settings); setSettingsError(null); setSettingsOpen(true); }}
+          onDiagnostics={() => setDiagnosticsOpen((value) => !value)}
+          onChangePassword={() => { setPasswordModalMode("change"); setErrorCode(null); }}
+          onLock={() => void lockManagement()}
+          onSwitchDevice={requestDeviceConnect}
+          onDisconnect={() => void disconnectDevice()}
+          onSelectSlot={selectSlot}
+          onMoveSelection={(offset) => {
+            const index = slots.findIndex((slot) => slot.slot === selectedSlot);
+            const next = slots[Math.max(0, Math.min(slots.length - 1, index + offset))];
+            if (next) selectSlot(next.slot);
+          }}
+          onLabelChange={updateLabel}
+          onRevealToggle={toggleReveal}
+          onAdd={addMacro}
+          onInsertText={appendText}
+          onInsertKey={appendKey}
+          onRemoveToken={removeToken}
+          onMoveToken={moveToken}
+          onClearRequest={requestClear}
+          onClearConfirm={() => void clearSlot()}
+          onClearCancel={() => setClearConfirm(null)}
+          onSave={() => void saveSlot()}
+          onRevert={() => {
+            if (selectedSlot === null) return;
+            setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, draftText: slot.savedText, draftLabel: slot.savedLabel, revealed: false, status: "idle", error: null, lastAction: null } : slot));
+            setInputError(null);
+          }}
+          onRetry={retrySelected}
+          onCloseDiagnostics={() => setDiagnosticsOpen(false)}
+          diagnosticsOpen={diagnosticsOpen}
+        />
+      ) : null}
+
+      {route === "workbench" && setupOpen ? (
+        <PasswordSetupModal
+          copy={copy}
+          locale={locale}
+          mode="setup"
+          busy={busy}
+          externalErrorCode={errorCode}
+          onSkip={() => { setSetupOpen(false); setErrorCode(null); }}
+          onClose={() => setSetupOpen(false)}
+          onSubmit={setPassword}
+        />
+      ) : null}
+
+      {route === "workbench" && passwordModalMode === "change" ? (
+        <PasswordSetupModal
+          copy={copy}
+          locale={locale}
+          mode="change"
+          busy={busy}
+          externalErrorCode={errorCode}
+          onClose={() => { setPasswordModalMode(null); setErrorCode(null); }}
+          onSubmit={setPassword}
+        />
+      ) : null}
 
       {settingsOpen ? (
-        <section className="settings-panel" aria-labelledby="settings-heading">
-          <div className="settings-heading">
-            <div>
-              <p className="eyebrow">{copy.preferences}</p>
-              <h2 id="settings-heading">{copy.connectionSettings}</h2>
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-6 py-8 backdrop-blur-[2px]" role="presentation">
+          <section className="w-full max-w-[560px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <div className="flex items-start justify-between gap-4">
+              <div><p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.preferences}</p><h2 id="settings-title" className="mt-1 text-xl font-semibold text-ink">{copy.settings}</h2></div>
+              <button type="button" onClick={() => setSettingsOpen(false)} disabled={settingsBusy} aria-label={copy.close} className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" aria-hidden="true" /></button>
             </div>
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => setSettingsOpen(false)}
-              disabled={settingsBusy}
-            >
-              {copy.close}
-            </button>
-          </div>
-          <label className="setting-toggle">
-            <input
-              type="checkbox"
-              checked={settingsDraft.autoReconnect}
-              onChange={(event) =>
-                updateSettingsDraft({ autoReconnect: event.target.checked })
-              }
-              disabled={settingsBusy}
-            />
-            <span>
-              <strong>{copy.autoReconnect}</strong>
-              <small>{copy.autoReconnectHelp}</small>
-            </span>
-          </label>
-          <div className="settings-grid">
-            <label className="setting-field" htmlFor="language-setting">
-              <span>{copy.language}</span>
-              <select
-                id="language-setting"
-                value={languagePreference}
-                onChange={updateLanguagePreference}
-                disabled={settingsBusy}
-              >
-                <option value="system">{copy.languageFollowSystem}</option>
-                <option value="zh-CN">{copy.languageChinese}</option>
-                <option value="en">{copy.languageEnglish}</option>
-              </select>
-              <small>{copy.languageHelp}</small>
-            </label>
-            <label className="setting-field" htmlFor="timeout-setting">
-              <span>{copy.requestTimeout}</span>
-              <input
-                id="timeout-setting"
-                type="number"
-                min={MIN_TIMEOUT_MS}
-                max={MAX_TIMEOUT_MS}
-                step={1}
-                value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs}
-                onChange={(event) =>
-                  updateSettingsDraft({ timeoutMs: Number(event.target.value) })
-                }
-                disabled={settingsBusy}
-                aria-describedby="settings-help"
-              />
-              <small>{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small>
-            </label>
-            <label className="setting-field" htmlFor="retries-setting">
-              <span>{copy.retries}</span>
-              <input
-                id="retries-setting"
-                type="number"
-                min={0}
-                max={MAX_RETRIES}
-                step={1}
-                value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries}
-                onChange={(event) =>
-                  updateSettingsDraft({ retries: Number(event.target.value) })
-                }
-                disabled={settingsBusy}
-                aria-describedby="settings-help"
-              />
-              <small>{copy.transportRetriesRange(MAX_RETRIES)}</small>
-            </label>
-          </div>
-          <p id="settings-help" className="field-help settings-help">
-            {copy.settingsHelp}
-          </p>
-          {settingsErrorMessage ? (
-            <p className="field-error" role="alert">{settingsErrorMessage}</p>
-          ) : null}
-          <div className="settings-actions">
-            {settingsSaved ? <span className="settings-saved">{copy.saved}</span> : null}
-            <button
-              className="button-primary"
-              type="button"
-              onClick={() => void saveSettings()}
-              disabled={settingsBusy}
-            >
-              {settingsBusy ? copy.saving : copy.saveSettings}
-            </button>
-          </div>
-        </section>
-      ) : null}
-
-      {error ? (
-        <div className="inline-message message-error" role="alert">
-          <span>{translateCommandError(error.code, locale)}</span>
-          {!connection.connected ? (
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => void refreshDevices()}
-              disabled={busy || mutationInProgress}
-            >
-              {copy.reconnect}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-
-      {!connection.connected ? (
-        <section className="device-picker" aria-labelledby="device-picker-heading">
-          <div className="section-heading compact-heading">
-            <div>
-              <p className="eyebrow">{copy.connection}</p>
-              <h1 id="device-picker-heading">{copy.chooseInterface}</h1>
-            </div>
-            <span className={`status ${checking ? "status-checking" : "status-disconnected"}`}>
-              {checking ? copy.statusChecking : copy.notConnected}
-            </span>
-          </div>
-          {devices.length === 0 ? (
-            <p className="muted-copy">
-              {checking
-                ? copy.checkingCompatibleDevices
-                : copy.noCompatibleDevice}
-            </p>
-          ) : (
-            <div className="candidate-list" aria-live="polite">
-              {devices.map((device) => (
-                <button
-                  className={`candidate-row ${selectedId === device.id ? "selected" : ""}`}
-                  key={device.id}
-                  type="button"
-                  onClick={() => setSelectedId(device.id)}
-                  disabled={busy || mutationInProgress}
-                  aria-pressed={selectedId === device.id}
-                >
-                  <span className="candidate-copy">
-                    <strong>{device.productName ?? copy.unnamedDevice}</strong>
-                    <span>
-                      {formatHex(device.vendorId)} / {formatHex(device.productId)} · {copy.interfaceNumber(device.interfaceNumber)}
-                    </span>
-                  </span>
-                  <span className="candidate-meta">
-                    {device.usageMetadata === "exact" ? copy.runtimeMacro : copy.usageMetadataUnavailable}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="picker-actions">
-            <button
-              className="button-primary"
-              type="button"
-              onClick={() => void connectDevice(selectedId)}
-              disabled={busy || mutationInProgress || !selectedDevice}
-            >
-              {copy.connectSelected}
-            </button>
-            <button
-              className="button-secondary"
-              type="button"
-              onClick={() => void refreshDevices()}
-              disabled={busy || mutationInProgress}
-            >
-              {copy.refresh}
-            </button>
-          </div>
-        </section>
-      ) : null}
-
-      <section className="macro-section" aria-labelledby="slots-heading">
-        <div className="section-heading">
-          <div>
-            <h1 id="slots-heading">{copy.macroSlots}</h1>
-          </div>
-          <div className="section-actions">
-            <span className="slot-count">{copy.slotCount(slots.length)}</span>
-            {connection.device ? (
-              <span className="device-detail">
-                {formatHex(connection.device.vendorId)} / {formatHex(connection.device.productId)} · {copy.interfaceNumber(connection.device.interfaceNumber)}
-              </span>
-            ) : null}
-            {canManage ? (
-              <button
-                className="text-button"
-                type="button"
-                onClick={() => void refreshSlots()}
-                disabled={busy || mutationInProgress}
-              >
-                {copy.refreshSlots}
-              </button>
-            ) : null}
-            {connection.connected ? (
-              <button
-                className="text-button"
-                type="button"
-                onClick={() => void disconnectDevice()}
-                disabled={busy || mutationInProgress}
-              >
-                {copy.disconnect}
-              </button>
-            ) : null}
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => setDiagnosticsOpen((open) => !open)}
-              aria-expanded={diagnosticsOpen}
-            >
-              {copy.diagnostics}
-            </button>
-          </div>
-        </div>
-
-        {diagnosticsOpen ? (
-          <section className="diagnostics-panel" aria-labelledby="diagnostics-heading">
-            <div className="diagnostics-heading">
-              <div>
-                <p className="eyebrow">{copy.diagnostics}</p>
-                <h2 id="diagnostics-heading">{copy.connectionDetails}</h2>
+            <div className="mt-6 space-y-5">
+              <label className="block" htmlFor="language-setting"><span className="text-sm font-medium text-ink">{copy.language}</span><select id="language-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink" value={languagePreference} onChange={updateLanguage} disabled={settingsBusy}><option value="system">{copy.languageFollowSystem}</option><option value="zh-CN">{copy.languageChinese}</option><option value="en">{copy.languageEnglish}</option></select><small className="mt-1.5 block text-xs text-ink-subtle">{copy.languageHelp}</small></label>
+              <label className="block" htmlFor="theme-setting"><span className="text-sm font-medium text-ink">{copy.theme}</span><select id="theme-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink" value={theme} onChange={(event) => updateTheme(event.target.value as ThemeMode)} disabled={settingsBusy}><option value="system">{copy.themeSystem}</option><option value="light">{copy.themeLight}</option><option value="dark">{copy.themeDark}</option></select></label>
+              <div className="grid grid-cols-2 gap-4">
+                <label className="block" htmlFor="timeout-setting"><span className="text-sm font-medium text-ink">{copy.requestTimeout}</span><input id="timeout-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={MIN_TIMEOUT_MS} max={MAX_TIMEOUT_MS} step={1} value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs} onChange={(event) => { setSettingsDraft((value) => ({ ...value, timeoutMs: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small></label>
+                <label className="block" htmlFor="retries-setting"><span className="text-sm font-medium text-ink">{copy.retries}</span><input id="retries-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={0} max={MAX_RETRIES} step={1} value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries} onChange={(event) => { setSettingsDraft((value) => ({ ...value, retries: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.transportRetriesRange(MAX_RETRIES)}</small></label>
               </div>
-              <span className={`status ${connection.connected ? "status-connected" : "status-disconnected"}`}>
-                {connection.connected ? copy.connected : copy.disconnected}
-              </span>
             </div>
-            <dl className="diagnostics-grid">
-              <div><dt>{copy.protocol}</dt><dd>Runtime Macro v2</dd></div>
-              <div><dt>{copy.transport}</dt><dd>USB HID</dd></div>
-              <div><dt>{copy.device}</dt><dd>{connection.device?.productName ?? "—"}</dd></div>
-              <div><dt>{copy.vidPid}</dt><dd>{connection.device ? `${formatHex(connection.device.vendorId)} / ${formatHex(connection.device.productId)}` : "—"}</dd></div>
-              <div><dt>{copy.interface}</dt><dd>{connection.device?.interfaceNumber ?? "—"}</dd></div>
-              <div><dt>{copy.usage}</dt><dd>{connection.device ? `${formatHex(connection.device.usagePage)} / ${formatHex(connection.device.usage)}` : "—"}</dd></div>
-              <div><dt>{copy.slotCountLabel}</dt><dd>{slots.length}</dd></div>
-              <div><dt>{copy.authentication}</dt><dd>{connection.authState}</dd></div>
-              <div><dt>{copy.lastOperation}</dt><dd>{lastOperation ?? copy.none}</dd></div>
-              <div><dt>{copy.lastErrorCode}</dt><dd>{lastErrorCode ?? copy.none}</dd></div>
-            </dl>
-            <p className="field-help diagnostics-help">
-              {copy.diagnosticsHelp}
-            </p>
-          </section>
-        ) : null}
-
-        <div className="workspace">
-          <aside className="slot-list" aria-label={copy.macroSlotsAria}>
-            {slots.length === 0 ? (
-              <p className="muted-copy slot-list-empty">
-                {canManage ? copy.noSlotsReturned : copy.connectToLoadSlots}
-              </p>
-            ) : (
-              slots.map((slot) => {
-                const dirty = isDirty(slot);
-                const displayedLength = slot.loaded ? textByteLength(slot.draftText) : slot.length;
-                return (
-                  <button
-                    className={`slot-row ${selectedSlot === slot.slot ? "selected" : ""}`}
-                    key={slot.slot}
-                    type="button"
-                    onClick={() => selectSlot(slot.slot)}
-                    disabled={mutationInProgress}
-                    aria-pressed={selectedSlot === slot.slot}
-                  >
-                    <span className="slot-index">{formatSlotNumber(slot.slot)}</span>
-                    <span className="slot-copy">
-                      <strong>{slot.draftLabel || defaultLabel(slot.slot, locale)}</strong>
-                      <span>{displayedLength === 0 ? copy.empty : copy.bytes(displayedLength)}</span>
-                    </span>
-                    {dirty ? (
-                      <span className="dirty-dot" aria-label={copy.unsavedChanges} />
-                    ) : null}
-                  </button>
-                );
-              })
-            )}
-          </aside>
-
-          <section className="inspector" aria-labelledby="inspector-heading">
-            {!selectedState ? (
-              <div className="inspector-empty">
-                <p className="eyebrow">{copy.inspector}</p>
-                <h2 id="inspector-heading">{copy.selectSlot}</h2>
-                <p className="muted-copy">{copy.chooseSlotHelp}</p>
-              </div>
-            ) : (
-              <>
-                <div className="inspector-heading">
-                  <div>
-                    <p className="eyebrow">{copy.slotLabel(formatSlotNumber(selectedState.slot))}</p>
-                    <h2 id="inspector-heading">{selectedState.draftLabel || defaultLabel(selectedState.slot, locale)}</h2>
-                  </div>
-                  <span className={`edit-status status-${selectedDirty ? "modified" : selectedState.status}`}>
-                    {selectedState.status === "saving"
-                      ? copy.saving
-                      : selectedState.status === "saved"
-                        ? copy.saved
-                        : selectedDirty
-                          ? copy.unsavedChanges
-                          : copy.lastSaved}
-                  </span>
-                </div>
-
-                <label className="field-label" htmlFor="slot-label">
-                  {copy.name}
-                </label>
-                <input
-                  id="slot-label"
-                  className="text-input"
-                  type="text"
-                  value={selectedState.draftLabel}
-                  onChange={updateLabel}
-                  maxLength={64}
-                  disabled={!selectedState.loaded || mutationInProgress}
-                  autoComplete="off"
-                  placeholder={defaultLabel(selectedState.slot, locale)}
-                />
-                <p className="field-help">{copy.localLabelHelp}</p>
-
-                <div className="field-heading">
-                  <label className="field-label" htmlFor="macro-editor">
-                    {copy.macro}
-                  </label>
-                  <span className="byte-count">{copy.bytes(selectedByteLength)}</span>
-                </div>
-
-                {selectedState.loading ? (
-                  <div className="editor-placeholder" aria-live="polite">{copy.loadingSlot}</div>
-                ) : selectedState.error && selectedState.lastAction === "load" ? (
-                  <div className="editor-placeholder editor-error" role="alert">
-                    <span>{translateCommandError(selectedState.error.code, locale)}</span>
-                    <button
-                      className="text-button"
-                      type="button"
-                      onClick={() => retrySlotAction(selectedState)}
-                      disabled={busy || mutationInProgress || !canManage}
-                    >
-                      {copy.retry}
-                    </button>
-                  </div>
-                ) : !selectedState.revealed && selectedState.draftText.length === 0 ? (
-                  <div className="empty-editor">
-                    <p>{copy.noMacroConfigured}</p>
-                    <button
-                      className="button-secondary"
-                      type="button"
-                      onClick={addMacro}
-                      disabled={!selectedState.loaded || mutationInProgress || !canManage}
-                    >
-                      {copy.addMacro}
-                    </button>
-                  </div>
-                ) : (
-                  <div className={`editor-shell ${selectedState.revealed ? "revealed" : "masked"}`}>
-                    <textarea
-                      id="macro-editor"
-                      ref={editorRef}
-                      className="macro-editor"
-                      value={selectedState.revealed ? toEditorText(selectedState.draftText) : maskText(selectedState.draftText)}
-                      onChange={(event) => updateEditor(event.target.value)}
-                      onKeyDown={handleEditorKeyDown}
-                      readOnly={!selectedState.revealed || mutationInProgress || !canManage}
-                      spellCheck={false}
-                      autoComplete="off"
-                      aria-label={copy.macroContent}
-                      aria-describedby="macro-help"
-                    />
-                    <button
-                      className="reveal-button"
-                      type="button"
-                      onClick={() => {
-                        setInputError(null);
-                        updateSelectedSlot((slot) => ({ ...slot, revealed: !slot.revealed }));
-                      }}
-                      disabled={mutationInProgress || !canManage}
-                      aria-label={selectedState.revealed ? copy.hideMacroContent : copy.revealMacroContent}
-                      aria-pressed={selectedState.revealed}
-                    >
-                      {selectedState.revealed ? copy.hide : copy.reveal}
-                    </button>
-                  </div>
-                )}
-                <p id="macro-help" className="field-help control-help">
-                  {copy.macroControlHelp}
-                </p>
-                {selectedState.revealed ? (
-                  <div className="control-actions" aria-label={copy.insertControlCharacter}>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("↵")} disabled={mutationInProgress || !canManage}>{copy.insertLf}</button>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("⇥")} disabled={mutationInProgress || !canManage}>{copy.insertTab}</button>
-                    <button className="text-button" type="button" onClick={() => insertControlToken("⌫")} disabled={mutationInProgress || !canManage}>{copy.insertBackspace}</button>
-                  </div>
-                ) : null}
-                {inputErrorMessage ? <p className="field-error" role="alert">{inputErrorMessage}</p> : null}
-
-                {selectedState.error && selectedState.lastAction !== "load" ? (
-                  <div className="inline-message message-error slot-error" role="alert">
-                    <span>{translateCommandError(selectedState.error.code, locale)}</span>
-                    <button
-                      className="text-button"
-                      type="button"
-                      onClick={() => retrySlotAction(selectedState)}
-                      disabled={busy || mutationInProgress || !canManage}
-                    >
-                      {copy.retry}
-                    </button>
-                  </div>
-                ) : null}
-
-                <div className="inspector-actions">
-                  <div className="secondary-actions">
-                    <button
-                      className="button-danger"
-                      type="button"
-                      onClick={() => setClearConfirm(selectedState.slot)}
-                      disabled={
-                        !canManage ||
-                        !selectedState.loaded ||
-                        selectedByteLength === 0 ||
-                        mutationInProgress
-                      }
-                    >
-                      {copy.clearMacro}
-                    </button>
-                  </div>
-                  <button
-                    className="button-primary"
-                    type="button"
-                    onClick={() => void saveSlot()}
-                    disabled={!canSave}
-                  >
-                    {selectedState.status === "saving" ? copy.saving : copy.save}
-                  </button>
-                </div>
-
-                {clearConfirm === selectedState.slot ? (
-                  <div className="confirm-row" role="alert">
-                    <span>{copy.clearThisMacro}</span>
-                    <button className="button-secondary" type="button" onClick={() => setClearConfirm(null)} disabled={mutationInProgress}>{copy.cancel}</button>
-                    <button className="button-danger filled" type="button" onClick={() => void clearSlot(selectedState.slot)} disabled={mutationInProgress}>{copy.clear}</button>
-                  </div>
-                ) : null}
-
-                {!connection.connected ? (
-                  <p className="disconnect-note">{copy.disconnectNote}</p>
-                ) : null}
-              </>
-            )}
+            <p className="mt-5 text-xs leading-relaxed text-ink-subtle">{copy.settingsHelp}</p>
+            {settingsErrorMessage ? <p className="mt-3 flex items-center gap-1.5 text-sm text-danger" role="alert"><AlertCircle className="h-4 w-4" aria-hidden="true" />{settingsErrorMessage}</p> : null}
+            <div className="mt-6 flex items-center justify-end gap-3">{settingsSaved ? <span className="mr-auto text-sm font-medium text-success">{copy.settingsSaved}</span> : null}<button type="button" onClick={() => setSettingsOpen(false)} disabled={settingsBusy} className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40">{copy.cancel}</button><button type="button" onClick={() => void saveSettings()} disabled={settingsBusy} className="inline-flex h-11 items-center rounded-xl bg-accent px-5 text-sm font-semibold text-accent-ink hover:opacity-90 disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-subtle">{settingsBusy ? copy.saving : copy.saveSettings}</button></div>
           </section>
         </div>
-      </section>
+      ) : null}
+
+      {switchConfirm !== null ? (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-6 py-8 backdrop-blur-[2px]" role="presentation">
+          <section className="w-full max-w-[440px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="switch-dialog-title">
+            <p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.unsavedChanges}</p><h2 id="switch-dialog-title" className="mt-1.5 text-xl font-semibold text-ink">{copy.switchUnsavedTitle}</h2><p className="mt-3 text-sm leading-relaxed text-ink-muted">{copy.switchUnsavedMessage}</p>
+            <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setSwitchConfirm(null)} autoFocus className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2">{copy.cancel}</button><button type="button" onClick={() => selectSlotImmediately(switchConfirm)} className="inline-flex h-11 items-center rounded-xl bg-danger px-4 text-sm font-medium text-white hover:opacity-90">{copy.switchAnyway}</button></div>
+          </section>
+        </div>
+      ) : null}
+
+      {deviceSwitchConfirm !== null ? (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-6 py-8 backdrop-blur-[2px]" role="presentation">
+          <section className="w-full max-w-[440px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="device-switch-dialog-title">
+            <p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.unsavedChanges}</p><h2 id="device-switch-dialog-title" className="mt-1.5 text-xl font-semibold text-ink">{copy.deviceSwitchUnsavedTitle}</h2><p className="mt-3 text-sm leading-relaxed text-ink-muted">{copy.deviceSwitchUnsavedMessage}</p>
+            <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={() => setDeviceSwitchConfirm(null)} autoFocus className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2">{copy.cancel}</button><button type="button" onClick={() => { const id = deviceSwitchConfirm; setDeviceSwitchConfirm(null); void connectDevice(id); }} className="inline-flex h-11 items-center rounded-xl bg-danger px-4 text-sm font-medium text-white hover:opacity-90">{copy.deviceSwitchAnyway}</button></div>
+          </section>
+        </div>
+      ) : null}
 
       {closeConfirmOpen ? (
-        <div className="modal-backdrop">
-          <section
-            className="close-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="close-dialog-title"
-            aria-describedby="close-dialog-message"
-          >
-            <p className="eyebrow">{copy.closeUnsavedTitle}</p>
-            <h2 id="close-dialog-title">{copy.closeUnsavedTitle}</h2>
-            <p id="close-dialog-message" className="muted-copy">
-              {copy.closeUnsavedMessage}
-            </p>
-            <div className="dialog-actions">
-              <button
-                className="button-secondary"
-                type="button"
-                onClick={cancelCloseRequest}
-                autoFocus
-              >
-                {copy.cancel}
-              </button>
-              <button
-                className="button-danger filled"
-                type="button"
-                onClick={closeWithoutSaving}
-              >
-                {copy.closeWithoutSaving}
-              </button>
-            </div>
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-6 py-8 backdrop-blur-[2px]" role="presentation">
+          <section className="w-full max-w-[440px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title" aria-describedby="close-dialog-message">
+            <p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.closeUnsavedTitle}</p><h2 id="close-dialog-title" className="mt-1.5 text-xl font-semibold text-ink">{copy.closeUnsavedTitle}</h2><p id="close-dialog-message" className="mt-3 text-sm leading-relaxed text-ink-muted">{copy.closeUnsavedMessage}</p>
+            <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={cancelClose} autoFocus className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2">{copy.cancel}</button><button type="button" onClick={closeWithoutSaving} className="inline-flex h-11 items-center rounded-xl bg-danger px-4 text-sm font-medium text-white hover:opacity-90">{copy.closeWithoutSaving}</button></div>
           </section>
         </div>
       ) : null}
-    </main>
+    </>
   );
 }
 
