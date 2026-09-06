@@ -61,21 +61,24 @@ export function SlotList({
             const selected = selectedSlot === item.slot;
             const empty = item.loaded && item.length === 0;
             const status = item.error ? copy.slotError : item.loading ? copy.loadingSlot : null;
+            const previewInteractive = !disabled && item.loaded && !item.loading && !item.error && item.text !== null;
             return (
-              <li key={item.slot}>
-                <div
-                  className={`relative mb-1 grid w-full grid-cols-[2.25rem_minmax(0,1fr)_auto] items-center gap-4 rounded-xl px-4 py-3.5 text-left transition-colors duration-150 ease-out ${selected ? "bg-accent-soft" : "hover:bg-surface-2"}`}
+              <li key={item.slot} className="group relative mb-1">
+                <button
+                  type="button"
+                  onClick={() => onSelect(item.slot)}
+                  disabled={disabled}
+                  aria-current={selected ? "true" : undefined}
+                  aria-label={copy.slotLabel(String(item.slot + 1).padStart(2, "0"))}
+                  className={`absolute inset-0 z-0 rounded-xl transition-colors duration-150 ease-out focus-visible:outline-2 focus-visible:outline-offset-[-2px] ${selected ? "bg-accent-soft" : "group-hover:bg-surface-2"} disabled:cursor-not-allowed disabled:opacity-50`}
                 >
-                  <button
-                    type="button"
-                    onClick={() => onSelect(item.slot)}
-                    disabled={disabled}
-                    aria-current={selected ? "true" : undefined}
-                    aria-label={copy.slotLabel(String(item.slot + 1).padStart(2, "0"))}
-                    className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-sm transition-colors ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-subtle"} disabled:cursor-not-allowed disabled:opacity-50`}
-                  >
+                  <span className="sr-only">{copy.slotLabel(String(item.slot + 1).padStart(2, "0"))}</span>
+                </button>
+
+                <div className="relative z-10 pointer-events-none grid w-full grid-cols-[2.25rem_minmax(0,1fr)_auto] items-center gap-4 rounded-xl px-4 py-3.5 text-left">
+                  <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-sm transition-colors ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-subtle"}`}>
                     {String(item.slot + 1).padStart(2, "0")}
-                  </button>
+                  </span>
 
                   <div className="min-w-0">
                     <div className="flex min-w-0 items-center gap-2">
@@ -85,19 +88,24 @@ export function SlotList({
                           <span className="font-sans text-sm">{copy.empty}</span>
                         </span>
                       ) : (
-                        <SlotPreview
-                          copy={copy}
-                          text={item.text}
-                          length={item.length}
-                          loaded={item.loaded}
-                          loading={item.loading}
-                          error={item.error}
-                          selected={selected}
-                          disabled={disabled}
-                          previewCharacterCount={previewCharacterCount}
-                          hoverRevealDelay={hoverRevealDelay}
-                          className="w-full max-w-full justify-start text-left"
-                        />
+                        <span
+                          className={previewInteractive ? "pointer-events-auto" : "pointer-events-none"}
+                          onClick={() => { if (previewInteractive) onSelect(item.slot); }}
+                        >
+                          <SlotPreview
+                            copy={copy}
+                            text={item.text}
+                            length={item.length}
+                            loaded={item.loaded}
+                            loading={item.loading}
+                            error={item.error}
+                            selected={selected}
+                            disabled={disabled}
+                            previewCharacterCount={previewCharacterCount}
+                            hoverRevealDelay={hoverRevealDelay}
+                            className={`${previewInteractive ? "pointer-events-auto" : "pointer-events-none"} w-full max-w-full justify-start text-left`}
+                          />
+                        </span>
                       )}
                       {status ? (
                         <span className="flex min-w-0 shrink-0 items-center gap-1 text-xs text-ink-subtle">
@@ -107,14 +115,9 @@ export function SlotList({
                       ) : null}
                       {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-accent" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => onSelect(item.slot)}
-                      disabled={disabled}
-                      className={`mt-0.5 block max-w-full truncate text-left text-xs font-normal text-ink-subtle transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50 ${selected ? "text-ink-muted" : ""}`}
-                    >
+                    <span className={`mt-0.5 block max-w-full truncate text-xs font-normal text-ink-subtle transition-colors ${selected ? "text-ink-muted" : ""}`}>
                       {item.label || copy.unnamedSlot}
-                    </button>
+                    </span>
                   </div>
 
                   {!empty ? <span className="shrink-0 font-mono text-xs text-ink-subtle">{copy.bytes(item.length)}</span> : <span aria-hidden="true" />}

@@ -20,6 +20,10 @@ For the full project constraints, validation boundaries, and release process, se
 
 ## Screenshots
 
+Device list:
+
+![Device list](docs/screenshots/device-list.png)
+
 Unlock page:
 
 ![Unlock page](docs/screenshots/unlock.png)
