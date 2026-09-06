@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent } from "react";
 import { AlertCircle, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -45,6 +44,7 @@ import { MacroWorkbench } from "./pages/MacroWorkbench";
 import { Unlock } from "./pages/Unlock";
 import { PasswordSetupModal } from "./components/PasswordSetupModal";
 import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
+import { SelectField } from "./components/SelectField";
 import type { Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
 import type { SlotAction, SlotState } from "./types/workbench";
@@ -1080,8 +1080,7 @@ function App() {
     try { localStorage.setItem(THEME_STORAGE_KEY, nextTheme); } catch { /* optional preference */ }
   }, []);
 
-  const updateLanguage = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
-    const next = event.target.value;
+  const updateLanguage = useCallback((next: LanguagePreference) => {
     if (!isLanguagePreference(next)) return;
     setLanguagePreference(next);
     writeLanguagePreference(next);
@@ -1328,8 +1327,41 @@ function App() {
               <button type="button" onClick={() => setSettingsOpen(false)} disabled={settingsBusy} aria-label={copy.close} className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" aria-hidden="true" /></button>
             </div>
             <div className="mt-6 space-y-5">
-              <label className="block" htmlFor="language-setting"><span className="text-sm font-medium text-ink">{copy.language}</span><select id="language-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink focus:border-accent focus:outline-none" value={languagePreference} onChange={updateLanguage} disabled={settingsBusy}><option value="system">{copy.languageFollowSystem}</option><option value="zh-CN">{copy.languageChinese}</option><option value="en">{copy.languageEnglish}</option></select><small className="mt-1.5 block text-xs text-ink-subtle">{copy.languageHelp}</small></label>
-              <label className="block" htmlFor="theme-setting"><span className="text-sm font-medium text-ink">{copy.theme}</span><select id="theme-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink focus:border-accent focus:outline-none" value={theme} onChange={(event) => updateTheme(event.target.value as ThemeMode)} disabled={settingsBusy}><option value="system">{copy.themeSystem}</option><option value="light">{copy.themeLight}</option><option value="dark">{copy.themeDark}</option></select></label>
+              <label className="block" htmlFor="language-setting">
+                <span id="language-setting-label" className="text-sm font-medium text-ink">{copy.language}</span>
+                <div className="mt-2.5">
+                  <SelectField
+                    id="language-setting"
+                    value={languagePreference}
+                    options={[
+                      { value: "system", label: copy.languageFollowSystem },
+                      { value: "zh-CN", label: copy.languageChinese },
+                      { value: "en", label: copy.languageEnglish },
+                    ]}
+                    labelledBy="language-setting-label"
+                    onChange={updateLanguage}
+                    disabled={settingsBusy}
+                  />
+                </div>
+                <small className="mt-1.5 block text-xs text-ink-subtle">{copy.languageHelp}</small>
+              </label>
+              <label className="block" htmlFor="theme-setting">
+                <span id="theme-setting-label" className="text-sm font-medium text-ink">{copy.theme}</span>
+                <div className="mt-2.5">
+                  <SelectField
+                    id="theme-setting"
+                    value={theme}
+                    options={[
+                      { value: "system", label: copy.themeSystem },
+                      { value: "light", label: copy.themeLight },
+                      { value: "dark", label: copy.themeDark },
+                    ]}
+                    labelledBy="theme-setting-label"
+                    onChange={updateTheme}
+                    disabled={settingsBusy}
+                  />
+                </div>
+              </label>
               <div className="grid grid-cols-2 gap-4">
                 <label className="block" htmlFor="timeout-setting"><span className="text-sm font-medium text-ink">{copy.requestTimeout}</span><input id="timeout-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={MIN_TIMEOUT_MS} max={MAX_TIMEOUT_MS} step={1} value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs} onChange={(event) => { setSettingsDraft((value) => ({ ...value, timeoutMs: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small></label>
                 <label className="block" htmlFor="retries-setting"><span className="text-sm font-medium text-ink">{copy.retries}</span><input id="retries-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={0} max={MAX_RETRIES} step={1} value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries} onChange={(event) => { setSettingsDraft((value) => ({ ...value, retries: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.transportRetriesRange(MAX_RETRIES)}</small></label>
