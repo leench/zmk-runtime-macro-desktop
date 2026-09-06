@@ -1,47 +1,60 @@
 # ZMK Runtime Macro Desktop
 
-跨平台桌面 GUI 客户端，用于配置 `zmk-module-runtime-macro` 的 runtime macro slots。
+A cross-platform desktop GUI for configuring runtime macro slots provided by [`zmk-module-runtime-macro`](https://github.com/leench/zmk-module-runtime-macro).
 
-目标平台：
+Supported platforms:
 
 - Linux x86_64
 - macOS Intel / Apple Silicon
 - Windows x64
 
-## 当前状态
+## Current status
 
-当前版本已完成 Tauri 2 + React + TypeScript 桌面 GUI、v2 认证与 HID session、MagicPatterns 视觉迁移、宏编辑、密码设置/修改、认证窗口恢复和插槽隐私预览。GUI 只支持 Runtime Macro v2，不提供 Legacy v1 管理入口；密码不会被记住或持久化。完整约束、验证边界和发布流程见：
+The current version includes a Tauri 2 + React + TypeScript desktop GUI, Runtime Macro v2 authentication and HID sessions, the MagicPatterns visual design, macro editing, password setup and change flows, authentication-session recovery, and slot privacy previews. The GUI supports Runtime Macro v2 only: it does not provide a Legacy v1 management mode, and passwords are never remembered or persisted.
 
-- [`docs/GUI-DEVELOPMENT.md`](docs/GUI-DEVELOPMENT.md)
-- [`docs/RELEASING.md`](docs/RELEASING.md)
+For the full project constraints, validation boundaries, and release process, see the Chinese documentation:
 
-## 开发环境
+- [`docs/GUI-DEVELOPMENT.md`](docs/GUI-DEVELOPMENT.md) — GUI development and protocol constraints (中文)
+- [`docs/RELEASING.md`](docs/RELEASING.md) — release process and platform packaging (中文)
+- [`docs/HARDWARE-VERIFICATION.md`](docs/HARDWARE-VERIFICATION.md) — hardware and platform verification (中文)
 
-需要 Node.js、Rust 和对应平台的 Tauri/WebView 依赖。
+## Screenshots
+
+Unlock page:
+
+![Unlock page](docs/screenshots/unlock.png)
+
+Macro workbench:
+
+![Macro workbench](docs/screenshots/workbench.png)
+
+## Development
+
+You need Node.js, Rust, and the Tauri/WebView dependencies for your platform.
 
 ```sh
 npm install
 npm run dev
 ```
 
-运行 Tauri 桌面开发模式：
+Run the Tauri desktop development app:
 
 ```sh
 npm run tauri dev
 ```
 
-构建前端：
+Build the frontend:
 
 ```sh
 npm run build
 ```
 
-构建桌面安装包：
+Build desktop bundles:
 
 ```sh
 npm run tauri build
 ```
 
-## 相关项目
+## Related project
 
-固件模块和协议文档位于同一工作区的 `zmk-module-runtime-macro` 项目中。GUI 只管理 Runtime Macro v2，不提供 Legacy v1 管理入口；GUI 不依赖 Python CLI 运行，但复用共享的 v2 协议约定。
+The firmware module and shared protocol documentation are maintained in the [`zmk-module-runtime-macro`](https://github.com/leench/zmk-module-runtime-macro) repository. This GUI manages Runtime Macro v2 only, does not provide a Legacy v1 management mode, and does not depend on the Python CLI at runtime.
