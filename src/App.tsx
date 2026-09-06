@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, X } from "lucide-react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   asCommandError,
@@ -53,9 +54,14 @@ import { MAX_TEXT_BYTES, macroBytes, textFromTokens, tokensFromText } from "./ut
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
 const SETTINGS_STORAGE_KEY = "zmk-runtime-macro-settings:v1";
+const PAGE_ZOOM_STORAGE_KEY = "zmk-runtime-macro-page-zoom:v1";
 const PRIVACY_PREVIEW_STORAGE_KEY = "zmk-runtime-macro-privacy-preview:v1";
 const LABELS_STORAGE_PREFIX = "zmk-runtime-macro-labels:v1";
 const MIN_TIMEOUT_MS = 100;
+const MIN_PAGE_ZOOM_PERCENT = 80;
+const MAX_PAGE_ZOOM_PERCENT = 150;
+const PAGE_ZOOM_STEP_PERCENT = 5;
+const DEFAULT_PAGE_ZOOM_PERCENT = 100;
 const MIN_PREVIEW_CHARACTER_COUNT = 0;
 const MAX_PREVIEW_CHARACTER_COUNT = 5;
 const MIN_HOVER_REVEAL_DELAY = -1;
@@ -90,6 +96,38 @@ function readTheme(): ThemeMode {
     return value === "light" || value === "dark" || value === "system" ? value : "system";
   } catch {
     return "system";
+  }
+}
+
+function isValidPageZoomPercent(value: number): boolean {
+  return Number.isFinite(value)
+    && Number.isInteger(value)
+    && value >= MIN_PAGE_ZOOM_PERCENT
+    && value <= MAX_PAGE_ZOOM_PERCENT
+    && value % PAGE_ZOOM_STEP_PERCENT === 0;
+}
+
+function normalizePageZoomPercent(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_PAGE_ZOOM_PERCENT;
+  const stepped = Math.round(value / PAGE_ZOOM_STEP_PERCENT) * PAGE_ZOOM_STEP_PERCENT;
+  return Math.min(MAX_PAGE_ZOOM_PERCENT, Math.max(MIN_PAGE_ZOOM_PERCENT, stepped));
+}
+
+function readPageZoomPercent(): number {
+  try {
+    const raw = localStorage.getItem(PAGE_ZOOM_STORAGE_KEY);
+    if (raw === null) return DEFAULT_PAGE_ZOOM_PERCENT;
+    return normalizePageZoomPercent(Number(raw));
+  } catch {
+    return DEFAULT_PAGE_ZOOM_PERCENT;
+  }
+}
+
+function writePageZoomPercent(value: number): void {
+  try {
+    localStorage.setItem(PAGE_ZOOM_STORAGE_KEY, String(normalizePageZoomPercent(value)));
+  } catch {
+    // Preferences are optional and never affect device data.
   }
 }
 
@@ -288,6 +326,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<SettingsDraft>(() => readSettings());
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(() => readSettings());
+  const [pageZoomPercent, setPageZoomPercent] = useState<number>(() => readPageZoomPercent());
+  const [pageZoomDraft, setPageZoomDraft] = useState<number>(() => readPageZoomPercent());
   const [privacySettings, setPrivacySettings] = useState<PrivacyPreviewSettings>(() => readPrivacyPreviewSettings());
   const [privacyDraft, setPrivacyDraft] = useState<PrivacyPreviewSettings>(() => readPrivacyPreviewSettings());
   const [settingsBusy, setSettingsBusy] = useState(false);
@@ -314,6 +354,7 @@ function App() {
   const missingDevicePollsRef = useRef(0);
   const slotsRef = useRef<SlotState[]>(slots);
   const previewGenerationRef = useRef(0);
+  const pageZoomQueueRef = useRef<Promise<void>>(Promise.resolve());
   const protocolOperationQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   selectedSlotRef.current = selectedSlot;
   connectionRef.current = connection;
@@ -322,6 +363,43 @@ function App() {
   slotsRef.current = slots;
 
   const recordOperation = useCallback((name: string) => setLastOperation(name), []);
+
+  const applyPageZoom = useCallback((percent: number) => {
+    const safePercent = normalizePageZoomPercent(percent);
+    if (!inTauri()) return;
+    pageZoomQueueRef.current = pageZoomQueueRef.current
+      .catch(() => undefined)
+      .then(() => getCurrentWebview().setZoom(safePercent / 100))
+      .catch(() => undefined);
+  }, []);
+
+  const previewPageZoom = useCallback((value: number) => {
+    const safePercent = normalizePageZoomPercent(value);
+    setPageZoomDraft(safePercent);
+    applyPageZoom(safePercent);
+  }, [applyPageZoom]);
+
+  const restorePageZoom = useCallback(() => {
+    setPageZoomDraft(pageZoomPercent);
+    applyPageZoom(pageZoomPercent);
+    setSettingsOpen(false);
+  }, [applyPageZoom, pageZoomPercent]);
+
+  const handlePageZoomInput = useCallback((rawValue: string) => {
+    if (rawValue.trim() === "") {
+      setPageZoomDraft(Number.NaN);
+      return;
+    }
+    const value = Number(rawValue);
+    setPageZoomDraft(value);
+    if (isValidPageZoomPercent(value)) applyPageZoom(value);
+  }, [applyPageZoom]);
+
+  const commitPageZoomDraft = useCallback(() => {
+    const nextPageZoom = Number.isFinite(pageZoomDraft) ? normalizePageZoomPercent(pageZoomDraft) : pageZoomPercent;
+    setPageZoomDraft(nextPageZoom);
+    applyPageZoom(nextPageZoom);
+  }, [applyPageZoom, pageZoomDraft, pageZoomPercent]);
 
   const enqueueProtocolOperation = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
     const queued = protocolOperationQueueRef.current.then(operation, operation);
@@ -1056,6 +1134,7 @@ function App() {
     recordOperation("Settings");
     try {
       const nextSettings = await setSettingsCommand(settingsDraft.timeoutMs, settingsDraft.retries);
+      const nextPageZoom = Number.isFinite(pageZoomDraft) ? normalizePageZoomPercent(pageZoomDraft) : pageZoomPercent;
       const nextPrivacy = {
         previewCharacterCount: clampInteger(privacyDraft.previewCharacterCount, MIN_PREVIEW_CHARACTER_COUNT, MAX_PREVIEW_CHARACTER_COUNT, DEFAULT_PRIVACY_PREVIEW_SETTINGS.previewCharacterCount),
         hoverRevealDelay: normalizeHoverRevealDelay(privacyDraft.hoverRevealDelay),
@@ -1063,6 +1142,10 @@ function App() {
       setSettings(nextSettings);
       setSettingsDraft(nextSettings);
       writeSettings(nextSettings);
+      setPageZoomPercent(nextPageZoom);
+      setPageZoomDraft(nextPageZoom);
+      writePageZoomPercent(nextPageZoom);
+      applyPageZoom(nextPageZoom);
       setPrivacySettings(nextPrivacy);
       setPrivacyDraft(nextPrivacy);
       writePrivacyPreviewSettings(nextPrivacy);
@@ -1073,7 +1156,7 @@ function App() {
     } finally {
       setSettingsBusy(false);
     }
-  }, [commandError, privacyDraft, recordOperation, settingsDraft]);
+  }, [applyPageZoom, commandError, pageZoomDraft, pageZoomPercent, privacyDraft, recordOperation, settingsDraft]);
 
   const updateTheme = useCallback((nextTheme: ThemeMode) => {
     setTheme(nextTheme);
@@ -1113,6 +1196,11 @@ function App() {
     setCloseConfirmOpen(false);
     closeWindowWithBestEffortLock();
   }, [closeWindowWithBestEffortLock]);
+
+  useEffect(() => {
+    writePageZoomPercent(pageZoomPercent);
+    applyPageZoom(pageZoomPercent);
+  }, [applyPageZoom, pageZoomPercent]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1259,7 +1347,7 @@ function App() {
           onThemeChange={updateTheme}
           onRefresh={() => void refreshSlots()}
           onRefreshDevices={() => void refreshDevices()}
-          onSettings={() => { setSettingsDraft(settings); setPrivacyDraft(privacySettings); setSettingsError(null); setSettingsOpen(true); }}
+          onSettings={() => { setSettingsDraft(settings); setPageZoomDraft(pageZoomPercent); setPrivacyDraft(privacySettings); setSettingsError(null); setSettingsOpen(true); }}
           onDiagnostics={() => setDiagnosticsOpen((value) => !value)}
           onSetPassword={() => { setPasswordModalMode("setup"); setErrorCode(null); }}
           onChangePassword={() => { setPasswordModalMode("change"); setErrorCode(null); }}
@@ -1324,7 +1412,7 @@ function App() {
           <section className="w-full max-w-[560px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="settings-title">
             <div className="flex items-start justify-between gap-4">
               <div><p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.preferences}</p><h2 id="settings-title" className="mt-1 text-xl font-semibold text-ink">{copy.settings}</h2></div>
-              <button type="button" onClick={() => setSettingsOpen(false)} disabled={settingsBusy} aria-label={copy.close} className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" aria-hidden="true" /></button>
+              <button type="button" onClick={restorePageZoom} disabled={settingsBusy} aria-label={copy.close} className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" aria-hidden="true" /></button>
             </div>
             <div className="mt-6 space-y-5">
               <label className="block" htmlFor="language-setting">
@@ -1362,6 +1450,24 @@ function App() {
                   />
                 </div>
               </label>
+              <div className="border-t border-line pt-5">
+                <PreviewSettingStepper
+                  id="page-zoom"
+                  label={copy.pageZoom}
+                  value={normalizePageZoomPercent(pageZoomDraft)}
+                  displayValue={`${normalizePageZoomPercent(pageZoomDraft)}%`}
+                  min={MIN_PAGE_ZOOM_PERCENT}
+                  max={MAX_PAGE_ZOOM_PERCENT}
+                  step={PAGE_ZOOM_STEP_PERCENT}
+                  help={copy.pageZoomHelp}
+                  increaseLabel={copy.increasePageZoom}
+                  decreaseLabel={copy.decreasePageZoom}
+                  onChange={previewPageZoom}
+                  inputValue={Number.isFinite(pageZoomDraft) ? String(pageZoomDraft) : ""}
+                  onInputChange={handlePageZoomInput}
+                  onInputBlur={commitPageZoomDraft}
+                />
+              </div>
               <div className="grid grid-cols-2 gap-4">
                 <label className="block" htmlFor="timeout-setting"><span className="text-sm font-medium text-ink">{copy.requestTimeout}</span><input id="timeout-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={MIN_TIMEOUT_MS} max={MAX_TIMEOUT_MS} step={1} value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs} onChange={(event) => { setSettingsDraft((value) => ({ ...value, timeoutMs: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small></label>
                 <label className="block" htmlFor="retries-setting"><span className="text-sm font-medium text-ink">{copy.retries}</span><input id="retries-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={0} max={MAX_RETRIES} step={1} value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries} onChange={(event) => { setSettingsDraft((value) => ({ ...value, retries: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.transportRetriesRange(MAX_RETRIES)}</small></label>
@@ -1396,7 +1502,7 @@ function App() {
             </div>
             <p className="mt-5 text-xs leading-relaxed text-ink-subtle">{copy.settingsHelp}</p>
             {settingsErrorMessage ? <p className="mt-3 flex items-center gap-1.5 text-sm text-danger" role="alert"><AlertCircle className="h-4 w-4" aria-hidden="true" />{settingsErrorMessage}</p> : null}
-            <div className="mt-6 flex items-center justify-end gap-3">{settingsSaved ? <span className="mr-auto text-sm font-medium text-success">{copy.settingsSaved}</span> : null}<button type="button" onClick={() => setSettingsOpen(false)} disabled={settingsBusy} className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40">{copy.cancel}</button><button type="button" onClick={() => void saveSettings()} disabled={settingsBusy} className="inline-flex h-11 items-center rounded-xl bg-accent px-5 text-sm font-semibold text-accent-ink hover:opacity-90 disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-subtle">{settingsBusy ? copy.saving : copy.saveSettings}</button></div>
+            <div className="mt-6 flex items-center justify-end gap-3">{settingsSaved ? <span className="mr-auto text-sm font-medium text-success">{copy.settingsSaved}</span> : null}<button type="button" onClick={restorePageZoom} disabled={settingsBusy} className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40">{copy.cancel}</button><button type="button" onClick={() => void saveSettings()} disabled={settingsBusy} className="inline-flex h-11 items-center rounded-xl bg-accent px-5 text-sm font-semibold text-accent-ink hover:opacity-90 disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-subtle">{settingsBusy ? copy.saving : copy.saveSettings}</button></div>
           </section>
         </div>
       ) : null}

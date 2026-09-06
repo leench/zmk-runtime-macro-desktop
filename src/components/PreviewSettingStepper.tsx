@@ -12,6 +12,9 @@ type PreviewSettingStepperProps = {
   increaseLabel: string;
   decreaseLabel: string;
   onChange: (value: number) => void;
+  inputValue?: string;
+  onInputChange?: (value: string) => void;
+  onInputBlur?: () => void;
 };
 
 function stepValue(value: number, direction: -1 | 1, min: number, max: number, step: number): number {
@@ -37,6 +40,9 @@ export function PreviewSettingStepper({
   increaseLabel,
   decreaseLabel,
   onChange,
+  inputValue,
+  onInputChange,
+  onInputBlur,
 }: PreviewSettingStepperProps) {
   const decreaseDisabled = value <= min;
   const increaseDisabled = value >= max;
@@ -46,7 +52,23 @@ export function PreviewSettingStepper({
       <div className="flex items-center justify-between gap-3">
         <span id={`${id}-label`} className="text-sm font-medium text-ink">{label}</span>
         <div className="flex shrink-0 items-center gap-2">
-          <output id={`${id}-value`} className="min-w-[4.5rem] text-right font-mono text-sm text-ink" aria-live="polite">{displayValue}</output>
+          {inputValue === undefined ? (
+            <output id={`${id}-value`} className="min-w-[4.5rem] text-right font-mono text-sm text-ink" aria-live="polite">{displayValue}</output>
+          ) : (
+            <input
+              id={`${id}-value`}
+              type="number"
+              inputMode="numeric"
+              min={min}
+              max={max}
+              step={step}
+              value={inputValue}
+              onChange={(event) => onInputChange?.(event.target.value)}
+              onBlur={onInputBlur}
+              aria-labelledby={`${id}-label`}
+              className="h-8 w-[4.5rem] rounded-lg border border-line-strong bg-surface px-2 text-right font-mono text-sm text-ink"
+            />
+          )}
           <span className="flex flex-col overflow-hidden rounded-lg border border-line-strong bg-surface">
             <button
               type="button"

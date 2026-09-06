@@ -49,7 +49,11 @@ discover -> explicit device selection -> connect -> AUTH_INFO
   BAD_VERSION  -> 旧固件不支持认证，请升级（不 fallback）
 ```
 
-设备列表只展示安全摘要：产品名（如果 HID 提供）、VID/PID、interface number 和 Usage 元数据状态。列表不推测或展示 `requiresPassword`，是否受保护只有连接后的 `AUTH_INFO` 才能决定。没有设备、Usage 元数据缺失、多个候选、设备忙/权限拒绝、传输错误和协议不兼容都使用本地化的安全提示；不展示 HID path、serial、raw report 或后端原始错误字符串。
+设备列表只展示安全摘要：产品名（如果 HID 提供）、VID/PID、interface number 和 Usage 元数据状态。列表不推测或展示 `requiresPassword`，是否受保护只有连接后的 `AUTH_INFO` 才能决定。没有设备、多个候选、设备忙/权限拒绝、传输错误和协议不兼容都使用本地化的安全提示；不展示 HID path、serial、raw report 或后端原始错误字符串。
+
+#### 蓝牙设备发现边界（方案 1）
+
+桌面端自动候选只接受 USB transport 且具有 Runtime Macro 的精确 HID Usage：Usage Page `0xff60`、Usage `0x61`。所有非 USB 记录（包括 Bluetooth 和 Unknown）即使报告精确 Usage 也必须过滤，不能通过尝试 `AUTH_INFO` 来猜测。部分 `hidapi` Bluetooth HID backend 会把普通键盘的 Usage 元数据报告为 `0/0`；这类记录同样不能证明存在 Runtime Macro 管理通道。该改动只修复误发现，不实现桌面应用直接通过蓝牙连接；当前 Runtime Macro 管理通道仍是 USB HID，直接 BLE 传输列为后续方案。
 
 认证行为：
 
@@ -70,7 +74,7 @@ discover -> explicit device selection -> connect -> AUTH_INFO
 - inspector 默认遮罩正文，只有用户主动 Reveal 才显示 token。列表预览仅使用已加载的内存内容，并按隐私设置显示；完整正文不进入标题、状态、tooltip、title、aria label、error、toast、诊断或 localStorage。切换 slot、设备、disconnect、Lock 或 auth 过期都会隐藏已显示内容；
 - 本机 label 只保存在按 VID/PID/interface/Usage 组成的安全摘要 key 下，不写入固件，不与正文共用数据；完全不保存宏正文；
 - light/dark/system 使用同一套 spacing 和组件层级：中性 canvas、连续 surface、1px divider、低调圆角、有限阴影；不使用渐变、霓虹、玻璃拟态、巨大 Hero、统计图表或过度圆角；主题切换使用设计中的 Sun/Moon 图标；
-- MagicPatterns 使用的 Inter 与 JetBrains Mono 字体作为视觉基准，并保留 system fallback；slot 编号、byte count、VID/PID 和协议值使用等宽数字；Tauri WebView 初始页面缩放为 `110%`；窗口默认 `1344 × 896`、最小 `1024 × 640`，允许 resize 和最大化。除真实功能、v2 协议、安全约束或 Tauri 平台行为冲突外，不调整设计源的视觉细节。
+- MagicPatterns 使用的 Inter 与 JetBrains Mono 字体作为视觉基准，并保留 system fallback；slot 编号、byte count、VID/PID 和协议值使用等宽数字；页面缩放默认 `100%`，设置页支持 `80–150%`、`5%` 步进的实时调整，并保存为本机偏好；窗口默认 `1344 × 896`、最小 `1024 × 640`，允许 resize 和最大化。无装饰窗口使用透明背景和 CSS 裁剪实现 `18px` 外层圆角；macOS 依赖 Tauri 的 `macOSPrivateApi`，因此不适用于 Mac App Store 分发。除真实功能、v2 协议、安全约束或 Tauri 平台行为冲突外，不调整设计源的视觉细节。
 
 ### 4.3 Slot 列表与隐私预览
 
@@ -103,7 +107,7 @@ discover -> explicit device selection -> connect -> AUTH_INFO
 当前实现保留中文/English 与 System/Light/Dark，并包含 v2 密码管理和隐私预览设置：
 
 - language 偏好单独存放在 `zmk-runtime-macro-language:v1`；跟随系统根据 `navigator.languages`/`navigator.language` 的 `zh-*` 选择中文，其余使用 English；
-- theme、timeout、retries 和隐私预览的两个数值可以存入本机偏好；密码、K、正文、raw report、HID path 和 serial 不得存储；
+- theme、页面缩放（`80–150%`，默认 `100%`）、timeout、retries 和隐私预览的两个数值可以存入本机偏好；页面缩放在设置控件输入或步进后立即调用当前 Tauri WebView 的 `setZoom`，取消设置会恢复打开设置前的已保存值；密码、K、正文、raw report、HID path 和 serial 不得存储；
 - timeout 默认 1000 ms（100–5000），retries 默认 2（0–5），后端标记为下一次连接生效；
 - 诊断默认折叠，只显示 Runtime Macro v2、USB HID、脱敏设备摘要、动态 slot count、最近白名单操作和安全 error code；不显示正文、凭据、path、serial 或 raw report。
 
@@ -127,7 +131,7 @@ Runtime Macro protocol v2 / hidapi
 主窗口使用 `decorations: false` 以承载自绘 TitleBar。`src-tauri/capabilities/default.json` 仅授予当前实现需要的窗口能力：
 
 - `core:event:allow-listen`、`core:event:allow-unlisten`（关闭请求监听）；
-- `core:webview:allow-set-webview-zoom`（MagicPatterns 对齐所需的 110% 页面缩放）；
+- `core:webview:allow-set-webview-zoom`（设置页实时调整 `80–150%` 页面缩放，默认 `100%`）；
 - `core:window:allow-close`、`allow-destroy`、`allow-minimize`、`allow-toggle-maximize`、`allow-start-dragging`。
 
 不得为了方便恢复 `core:default` 全量权限。浏览器开发环境不能因为不存在 Tauri internals 而报错。

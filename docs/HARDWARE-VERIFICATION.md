@@ -24,7 +24,6 @@
 使用各平台原生 runner，配置了以下构建矩阵：
 
 - Ubuntu 22.04：Linux x86_64 AppImage 和 `.deb`
-- macOS 13：Intel `.dmg`
 - macOS 14：Apple Silicon `.dmg`
 - Windows：x64 NSIS 安装包
 
@@ -36,7 +35,7 @@ workflow 只执行依赖安装、前端构建和 Tauri 打包，不枚举 HID、
 
 ## 当前环境无法验证
 
-- macOS Intel / Apple Silicon 的安装、启动、卸载和升级。
+- macOS Apple Silicon 的安装、启动、卸载和升级。
 - Windows x64 的 NSIS 安装、WebView2 安装路径、启动、卸载和升级。
 - Ubuntu 22.04 runner 上的最终 AppImage 产物；Linux 本机只验证 no-bundle，未伪造
   `linuxdeploy` AppImage 结果。

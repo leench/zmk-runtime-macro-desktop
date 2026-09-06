@@ -320,21 +320,18 @@ pub struct DeviceRegistry {
 
 impl DeviceRegistry {
     /// Replace the current directory and invalidate every previously issued ID.
+    ///
+    /// The desktop candidate list is deliberately strict: only a USB record
+    /// with the exact Runtime Macro vendor Usage pair is safe to present as
+    /// connectable. Some Bluetooth HID backends report Usage Page/Usage as
+    /// `0/0`, but neither that metadata nor an exact Usage pair identifies a
+    /// supported USB Runtime Macro interface.
     pub fn refresh(&mut self, records: Vec<DeviceRecord>) -> Vec<DeviceCandidate> {
         self.candidates.clear();
-        let has_exact = records
-            .iter()
-            .any(DeviceRecord::has_target_usage_for_registry);
 
         self.candidates = records
             .into_iter()
-            .filter(|record| {
-                if has_exact {
-                    record.has_target_usage_for_registry()
-                } else {
-                    record.has_missing_usage_for_registry()
-                }
-            })
+            .filter(|record| record.is_usb() && record.has_target_usage_for_registry())
             .map(|record| {
                 let summary = record.summary();
                 let id = format!("candidate-{}", Uuid::new_v4().simple());
@@ -1145,7 +1142,17 @@ mod tests {
     type SetCalls = Arc<StdMutex<Vec<SetCall>>>;
 
     fn record(path: &[u8], usage_page: u16, usage: u16, interface_number: i32) -> DeviceRecord {
-        DeviceRecord::for_test(
+        record_with_transport(path, usage_page, usage, interface_number, true)
+    }
+
+    fn record_with_transport(
+        path: &[u8],
+        usage_page: u16,
+        usage: u16,
+        interface_number: i32,
+        usb: bool,
+    ) -> DeviceRecord {
+        DeviceRecord::for_test_with_transport(
             path,
             DeviceSummary {
                 vendor_id: 0x1234,
@@ -1155,6 +1162,7 @@ mod tests {
                 usage_page,
                 usage,
             },
+            usb,
         )
     }
 
@@ -1387,18 +1395,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_is_fallback_only_when_no_exact_candidate_exists() {
+    fn missing_usage_is_not_exposed_by_desktop_registry() {
         let (factory, _) = factory(Ok(Vec::new()));
         let mut state = AppState::new(factory);
         let devices = state.refresh_records(vec![
             record(b"wrong", 0xff60, 0x62, 1),
-            record(b"missing-a", 0, 0, 2),
-            record(b"missing-b", 0, 0, 3),
+            record(b"bluetooth-keyboard-a", 0, 0, 2),
+            record(b"bluetooth-keyboard-b", 0, 0, 3),
+            record_with_transport(
+                b"bluetooth-runtime-macro",
+                RUNTIME_MACRO_USAGE_PAGE,
+                RUNTIME_MACRO_USAGE,
+                4,
+                false,
+            ),
         ]);
-        assert_eq!(devices.len(), 2);
-        assert!(devices
-            .iter()
-            .all(|device| device.usage_metadata == UsageMetadataStatus::Missing));
+        assert!(devices.is_empty());
     }
 
     #[test]

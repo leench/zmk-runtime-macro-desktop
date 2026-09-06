@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use hidapi::{DeviceInfo as HidDeviceInfo, HidApi, HidDevice, HidError};
+use hidapi::{BusType, DeviceInfo as HidDeviceInfo, HidApi, HidDevice, HidError};
 use zeroize::Zeroizing;
 
 use crate::client::Transport;
@@ -33,10 +33,27 @@ pub struct DeviceSummary {
 /// An enumerated device with its path kept private for an in-process open.
 ///
 /// `Debug` deliberately prints only the safe summary and never the path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DeviceBus {
+    Usb,
+    NonUsb,
+}
+
+impl From<BusType> for DeviceBus {
+    fn from(bus_type: BusType) -> Self {
+        if matches!(bus_type, BusType::Usb) {
+            Self::Usb
+        } else {
+            Self::NonUsb
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceRecord {
     path: Vec<u8>,
     summary: DeviceSummary,
+    bus: DeviceBus,
 }
 
 impl DeviceRecord {
@@ -46,6 +63,10 @@ impl DeviceRecord {
 
     fn path(&self) -> &[u8] {
         &self.path
+    }
+
+    pub(crate) fn is_usb(&self) -> bool {
+        self.bus == DeviceBus::Usb
     }
 
     pub(crate) fn has_target_usage_for_registry(&self) -> bool {
@@ -58,10 +79,15 @@ impl DeviceRecord {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(path: &[u8], summary: DeviceSummary) -> Self {
+    pub(crate) fn for_test_with_transport(path: &[u8], summary: DeviceSummary, usb: bool) -> Self {
         Self {
             path: path.to_vec(),
             summary,
+            bus: if usb {
+                DeviceBus::Usb
+            } else {
+                DeviceBus::NonUsb
+            },
         }
     }
 }
@@ -147,16 +173,19 @@ fn record_from_hid_info(info: &HidDeviceInfo) -> DeviceRecord {
             usage_page: info.usage_page(),
             usage: info.usage(),
         },
+        bus: DeviceBus::from(info.bus_type()),
     }
 }
 
 /// Select exactly one runtime macro HID interface record.
 ///
-/// Automatic selection accepts only the exact vendor Usage Page/Usage pair. If
-/// no exact match exists and a filtered record has both Usage fields missing,
+/// Selection accepts only USB records with the exact vendor Usage Page/Usage
+/// pair. Non-USB records, including Bluetooth and unknown-bus records, are
+/// never connectable even when they report the exact Usage pair. If no exact
+/// USB match exists and a filtered USB record has both Usage fields missing,
 /// the caller must provide an exact path rather than guessing. An explicit
-/// path may select the 0/0 metadata fallback, but still rejects known, other
-/// Usage values.
+/// path may select the 0/0 metadata fallback, but still requires USB and
+/// rejects known, other Usage values.
 pub fn select_device<'a>(
     records: &'a [DeviceRecord],
     filter: &DeviceFilter,
@@ -164,9 +193,10 @@ pub fn select_device<'a>(
     let filtered: Vec<&DeviceRecord> = records
         .iter()
         .filter(|record| {
-            filter
-                .vendor_id
-                .is_none_or(|vendor_id| record.summary.vendor_id == vendor_id)
+            record.is_usb()
+                && filter
+                    .vendor_id
+                    .is_none_or(|vendor_id| record.summary.vendor_id == vendor_id)
                 && filter
                     .product_id
                     .is_none_or(|product_id| record.summary.product_id == product_id)
@@ -216,8 +246,9 @@ fn select_one(records: Vec<&DeviceRecord>) -> Result<&DeviceRecord, DeviceDiscov
     }
 }
 
-/// Convert an enumerated record into a live transport.
+/// Convert an enumerated USB record into a live transport.
 ///
+/// Non-USB records are rejected even when their Usage metadata looks exact.
 /// The path is used only for this in-process open. hidapi does not provide a
 /// stable structured permission/busy error across all supported backends, so
 /// backend failures are deliberately mapped to the safe `OpenFailed` variant.
@@ -225,6 +256,9 @@ pub fn open_device(
     api: &HidApi,
     record: &DeviceRecord,
 ) -> Result<HidTransport, DeviceDiscoveryError> {
+    if !record.is_usb() {
+        return Err(DeviceDiscoveryError::NoDevice);
+    }
     let path = CString::new(record.path()).map_err(|_| DeviceDiscoveryError::InvalidPath)?;
     let device = api
         .open_path(path.as_c_str())
@@ -410,9 +444,9 @@ mod tests {
         usage: u16,
         interface_number: i32,
     ) -> DeviceRecord {
-        DeviceRecord {
-            path: path.to_vec(),
-            summary: DeviceSummary {
+        DeviceRecord::for_test_with_transport(
+            path,
+            DeviceSummary {
                 vendor_id,
                 product_id,
                 product_name: Some("Example Keyboard".to_string()),
@@ -420,7 +454,8 @@ mod tests {
                 usage_page,
                 usage,
             },
-        }
+            true,
+        )
     }
 
     #[test]
@@ -482,6 +517,36 @@ mod tests {
         assert_eq!(
             select_device(&missing, &DeviceFilter::default()),
             Err(DeviceDiscoveryError::UsageMetadataMissing)
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_non_usb_even_with_exact_usage() {
+        let bluetooth = DeviceRecord::for_test_with_transport(
+            b"bluetooth-runtime-macro",
+            DeviceSummary {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                product_name: Some("Example Keyboard".to_string()),
+                interface_number: 7,
+                usage_page: RUNTIME_MACRO_USAGE_PAGE,
+                usage: RUNTIME_MACRO_USAGE,
+            },
+            false,
+        );
+        assert_eq!(
+            select_device(std::slice::from_ref(&bluetooth), &DeviceFilter::default()),
+            Err(DeviceDiscoveryError::NoDevice)
+        );
+        assert_eq!(
+            select_device(
+                std::slice::from_ref(&bluetooth),
+                &DeviceFilter {
+                    path: Some(b"bluetooth-runtime-macro".to_vec()),
+                    ..DeviceFilter::default()
+                }
+            ),
+            Err(DeviceDiscoveryError::NoDevice)
         );
     }
 

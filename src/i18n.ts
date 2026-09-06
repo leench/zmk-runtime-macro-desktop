@@ -162,6 +162,10 @@ export type MessageTable = {
   themeSystem: string;
   themeLight: string;
   themeDark: string;
+  pageZoom: string;
+  pageZoomHelp: string;
+  increasePageZoom: string;
+  decreasePageZoom: string;
   requestTimeout: string;
   retries: string;
   millisecondsRange: (min: number, max: number) => string;
@@ -348,6 +352,10 @@ const english: MessageTable = {
   themeSystem: "System",
   themeLight: "Light",
   themeDark: "Dark",
+  pageZoom: "Interface scale",
+  pageZoomHelp: "80–150% in 5% steps. Changes preview immediately and are saved with Save settings.",
+  increasePageZoom: "Increase interface scale",
+  decreasePageZoom: "Decrease interface scale",
   requestTimeout: "Request timeout",
   retries: "Retries",
   millisecondsRange: (min, max) => `Milliseconds · ${min}–${max}`,
@@ -532,6 +540,10 @@ const chinese: MessageTable = {
   themeSystem: "跟随系统",
   themeLight: "浅色",
   themeDark: "深色",
+  pageZoom: "界面缩放",
+  pageZoomHelp: "范围 80–150%，每次调整 5%。修改会立即预览，点击“保存设置”后下次启动继续使用。",
+  increasePageZoom: "放大界面",
+  decreasePageZoom: "缩小界面",
   requestTimeout: "请求超时",
   retries: "重试次数",
   millisecondsRange: (min, max) => `毫秒 · ${min}–${max}`,

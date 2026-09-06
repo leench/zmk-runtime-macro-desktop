@@ -31,7 +31,6 @@
 | Runner | Target | Bundles |
 |---|---|---|
 | `ubuntu-22.04` | Linux x86_64 | AppImage、`.deb` |
-| `macos-13` | `x86_64-apple-darwin` | `.dmg` |
 | `macos-14` | `aarch64-apple-darwin` | `.dmg` |
 | `windows-latest` | Windows x64 | NSIS `.exe` |
 

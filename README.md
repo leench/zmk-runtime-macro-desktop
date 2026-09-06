@@ -5,7 +5,7 @@ A cross-platform desktop GUI for configuring runtime macro slots provided by [`z
 Supported platforms:
 
 - Linux x86_64
-- macOS Intel / Apple Silicon
+- macOS Apple Silicon (GitHub releases no longer provide an Intel package)
 - Windows x64
 
 ## Current status

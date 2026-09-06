@@ -21,10 +21,6 @@ jobs:
             os: ubuntu-22.04
             rust-targets: ""
             args: --bundles appimage,deb
-          - name: macOS Intel (dmg)
-            os: macos-13
-            rust-targets: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin --bundles dmg
           - name: macOS Apple Silicon (dmg)
             os: macos-14
             rust-targets: aarch64-apple-darwin

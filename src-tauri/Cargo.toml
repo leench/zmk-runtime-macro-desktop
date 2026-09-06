@@ -1,6 +1,6 @@
 [package]
 name = "zmk-runtime-macro-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "Cross-platform desktop client for ZMK runtime macro slots."
 authors = ["ZMK Runtime Macro contributors"]
 edition = "2021"
@@ -18,7 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# Transparent custom window corners require Tauri's macOS private API feature;
+# this app distributes native installers rather than a Mac App Store package.
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
