@@ -1,6 +1,6 @@
 [package]
 name = "zmk-runtime-macro-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cross-platform desktop client for ZMK runtime macro slots."
 authors = ["ZMK Runtime Macro contributors"]
 edition = "2021"
