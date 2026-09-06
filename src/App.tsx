@@ -122,6 +122,16 @@ function clampInteger(value: unknown, min: number, max: number, fallback: number
   return typeof value === "number" && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
 }
 
+function isValidHoverRevealDelay(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && (value === MIN_HOVER_REVEAL_DELAY || (value >= 0 && value <= MAX_HOVER_REVEAL_DELAY && Number.isInteger(value * 2)));
+}
+
+function normalizeHoverRevealDelay(value: unknown): number {
+  return isValidHoverRevealDelay(value) ? value : DEFAULT_PRIVACY_PREVIEW_SETTINGS.hoverRevealDelay;
+}
+
 function readPrivacyPreviewSettings(): PrivacyPreviewSettings {
   try {
     const raw = localStorage.getItem(PRIVACY_PREVIEW_STORAGE_KEY);
@@ -131,7 +141,7 @@ function readPrivacyPreviewSettings(): PrivacyPreviewSettings {
     const value = parsed as Record<string, unknown>;
     return {
       previewCharacterCount: clampInteger(value.previewCharacterCount, MIN_PREVIEW_CHARACTER_COUNT, MAX_PREVIEW_CHARACTER_COUNT, DEFAULT_PRIVACY_PREVIEW_SETTINGS.previewCharacterCount),
-      hoverRevealDelay: clampInteger(value.hoverRevealDelay, MIN_HOVER_REVEAL_DELAY, MAX_HOVER_REVEAL_DELAY, DEFAULT_PRIVACY_PREVIEW_SETTINGS.hoverRevealDelay),
+      hoverRevealDelay: normalizeHoverRevealDelay(value.hoverRevealDelay),
     };
   } catch {
     return DEFAULT_PRIVACY_PREVIEW_SETTINGS;
@@ -377,21 +387,21 @@ function App() {
 
   const preloadSlotPreviews = useCallback(async (
     metadata: SlotMetadata[],
+    sequence: number,
     generation: number,
     initialSlots: SlotState[],
-    selectedSlotNumber: number | null,
     connectionKey: string | null,
-  ) => {
+  ): Promise<boolean> => {
     let snapshot = initialSlots;
     const isCurrentPreviewContext = () => mounted.current
+      && operation.current === sequence
       && generation === previewGenerationRef.current
-      && canManage(connectionRef.current)
-      && deviceSummaryKey(connectionRef.current.device) === connectionKey;
+      && (connectionRef.current.device === null || deviceSummaryKey(connectionRef.current.device) === connectionKey);
 
     for (const item of metadata) {
       const current = snapshot.find((slot) => slot.slot === item.slot);
-      if (!current || item.slot === selectedSlotNumber || item.length === 0 || current.loaded || current.loading || current.error || isDirty(current)) continue;
-      if (!isCurrentPreviewContext()) return;
+      if (!current || item.length === 0 || current.loaded || current.loading || current.error || isDirty(current)) continue;
+      if (!isCurrentPreviewContext()) return false;
 
       snapshot = snapshot.map((slot) => slot.slot === item.slot
         ? { ...slot, loading: true, previewLoading: true, error: null, lastAction: null }
@@ -406,35 +416,41 @@ function App() {
           if (!isCurrentPreviewContext()) return null;
           return getSlot(item.slot);
         });
-        if (bytes === null) return;
+        if (bytes === null) return false;
         const text = decodeSlotBytes(bytes);
         if (text === null) throw { code: "invalid_text", message: "" } satisfies CommandError;
-        if (!isCurrentPreviewContext()) return;
+        if (!isCurrentPreviewContext()) return false;
         snapshot = snapshot.map((slot) => slot.slot === item.slot
           ? { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, previewLoading: false, revealed: false, status: "idle", error: null, lastAction: null }
           : slot);
         setSlots((previous) => previous.map((slot) => {
-          if (slot.slot !== item.slot || !slot.previewLoading) return slot;
+          if (slot.slot !== item.slot) return slot;
           if (isDirty(slot)) return { ...slot, loading: false, previewLoading: false };
           return { ...slot, length: bytes.length, savedText: text, draftText: text, loaded: true, loading: false, previewLoading: false, revealed: false, status: "idle", error: null, lastAction: null };
         }));
       } catch (caught) {
-        // Check generation and the safe device summary before mapping the
-        // result. A canceled request must not affect a newer connection.
-        if (!isCurrentPreviewContext()) return;
-        setSlots((previous) => previous.map((slot) => slot.slot === item.slot && slot.previewLoading
-          ? { ...slot, loading: false, previewLoading: false }
-          : slot));
+        // Check the operation generation and safe device summary before mapping
+        // the result. A canceled request must not affect a newer connection.
+        if (!isCurrentPreviewContext()) return false;
         const error = asCommandError(caught);
+        snapshot = snapshot.map((slot) => slot.slot === item.slot
+          ? { ...slot, loading: false, previewLoading: false, revealed: false, status: "error", error, lastAction: "load" }
+          : slot);
+        setSlots((previous) => previous.map((slot) => {
+          if (slot.slot !== item.slot) return slot;
+          if (isDirty(slot)) return { ...slot, loading: false, previewLoading: false };
+          return { ...slot, loading: false, previewLoading: false, revealed: false, status: "error", error, lastAction: "load" };
+        }));
         if (authStateForErrorCode(error.code) || dropsConnection(error.code)) {
-          applyErrorState(commandError(caught));
-          return;
+          applyErrorState(error);
+          return false;
         }
         // A remote non-auth error leaves the session usable. Keep this row
-        // safely masked and continue best-effort loading of later rows.
+        // safely masked and continue loading later rows.
       }
     }
-  }, [applyErrorState, commandError, enqueueProtocolOperation]);
+    return isCurrentPreviewContext();
+  }, [applyErrorState, enqueueProtocolOperation]);
 
   const loadSlots = useCallback(async (sequence: number, nextLabels: Record<number, string>, preserveDirty: boolean): Promise<boolean> => {
     cancelPreviewLoads();
@@ -443,11 +459,9 @@ function App() {
     if (!mounted.current || operation.current !== sequence) return false;
     const nextSlots = mergeSlotMetadata(metadata, nextLabels, preserveDirty);
     const generation = previewGenerationRef.current;
-    const selectedSlotNumber = selectedSlotRef.current !== null && metadata.some((item) => item.slot === selectedSlotRef.current)
-      ? selectedSlotRef.current
-      : metadata[0]?.slot ?? null;
     const connectionKey = deviceSummaryKey(connectionRef.current.device);
-    void preloadSlotPreviews(metadata, generation, nextSlots, selectedSlotNumber, connectionKey);
+    const loaded = await preloadSlotPreviews(metadata, sequence, generation, nextSlots, connectionKey);
+    if (!loaded || !mounted.current || operation.current !== sequence) return false;
     markAuthenticatedActivity();
     return true;
   }, [cancelPreviewLoads, enqueueProtocolOperation, markAuthenticatedActivity, mergeSlotMetadata, preloadSlotPreviews, recordOperation]);
@@ -465,6 +479,7 @@ function App() {
       const priorConnected = connectionRef.current.connected;
       setDevices(nextDevices);
       setConnection(nextConnection);
+      connectionRef.current = nextConnection;
       // A disconnected status carries no device object. Keep the last safe summary
       // key so a later connection to that device can restore in-memory drafts.
       const nextKey = nextConnection.connected ? deviceSummaryKey(nextConnection.device) : null;
@@ -554,6 +569,7 @@ function App() {
       const nextLabels = readLabels(nextConnection.device);
       setLabels(nextLabels);
       setConnection(nextConnection);
+      connectionRef.current = nextConnection;
       markAuthenticatedActivity(nextConnection.authState === "authenticated");
       if (canManage(nextConnection)) {
         const listed = await loadSlots(sequence, nextLabels, preserveDirty);
@@ -794,17 +810,6 @@ function App() {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
   }, [applyErrorState, cancelPreviewLoads, commandError, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation]);
-
-  useEffect(() => {
-    if (!canManage(connection) || selectedSlot === null) return;
-    const selected = slots.find((slot) => slot.slot === selectedSlot);
-    if (!selected || selected.loaded || selected.loading || selected.error) return;
-    if (selected.length === 0) {
-      setSlots((previous) => previous.map((slot) => slot.slot === selectedSlot ? { ...slot, loaded: true } : slot));
-      return;
-    }
-    void loadSlotContent(selectedSlot);
-  }, [connection, loadSlotContent, selectedSlot, slots]);
 
   const selectSlotImmediately = useCallback((slotNumber: number) => {
     operation.current += 1;
@@ -1053,7 +1058,7 @@ function App() {
       const nextSettings = await setSettingsCommand(settingsDraft.timeoutMs, settingsDraft.retries);
       const nextPrivacy = {
         previewCharacterCount: clampInteger(privacyDraft.previewCharacterCount, MIN_PREVIEW_CHARACTER_COUNT, MAX_PREVIEW_CHARACTER_COUNT, DEFAULT_PRIVACY_PREVIEW_SETTINGS.previewCharacterCount),
-        hoverRevealDelay: clampInteger(privacyDraft.hoverRevealDelay, MIN_HOVER_REVEAL_DELAY, MAX_HOVER_REVEAL_DELAY, DEFAULT_PRIVACY_PREVIEW_SETTINGS.hoverRevealDelay),
+        hoverRevealDelay: normalizeHoverRevealDelay(privacyDraft.hoverRevealDelay),
       };
       setSettings(nextSettings);
       setSettingsDraft(nextSettings);
@@ -1323,8 +1328,8 @@ function App() {
               <button type="button" onClick={() => setSettingsOpen(false)} disabled={settingsBusy} aria-label={copy.close} className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" aria-hidden="true" /></button>
             </div>
             <div className="mt-6 space-y-5">
-              <label className="block" htmlFor="language-setting"><span className="text-sm font-medium text-ink">{copy.language}</span><select id="language-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink" value={languagePreference} onChange={updateLanguage} disabled={settingsBusy}><option value="system">{copy.languageFollowSystem}</option><option value="zh-CN">{copy.languageChinese}</option><option value="en">{copy.languageEnglish}</option></select><small className="mt-1.5 block text-xs text-ink-subtle">{copy.languageHelp}</small></label>
-              <label className="block" htmlFor="theme-setting"><span className="text-sm font-medium text-ink">{copy.theme}</span><select id="theme-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink" value={theme} onChange={(event) => updateTheme(event.target.value as ThemeMode)} disabled={settingsBusy}><option value="system">{copy.themeSystem}</option><option value="light">{copy.themeLight}</option><option value="dark">{copy.themeDark}</option></select></label>
+              <label className="block" htmlFor="language-setting"><span className="text-sm font-medium text-ink">{copy.language}</span><select id="language-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink focus:border-accent focus:outline-none" value={languagePreference} onChange={updateLanguage} disabled={settingsBusy}><option value="system">{copy.languageFollowSystem}</option><option value="zh-CN">{copy.languageChinese}</option><option value="en">{copy.languageEnglish}</option></select><small className="mt-1.5 block text-xs text-ink-subtle">{copy.languageHelp}</small></label>
+              <label className="block" htmlFor="theme-setting"><span className="text-sm font-medium text-ink">{copy.theme}</span><select id="theme-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink focus:border-accent focus:outline-none" value={theme} onChange={(event) => updateTheme(event.target.value as ThemeMode)} disabled={settingsBusy}><option value="system">{copy.themeSystem}</option><option value="light">{copy.themeLight}</option><option value="dark">{copy.themeDark}</option></select></label>
               <div className="grid grid-cols-2 gap-4">
                 <label className="block" htmlFor="timeout-setting"><span className="text-sm font-medium text-ink">{copy.requestTimeout}</span><input id="timeout-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={MIN_TIMEOUT_MS} max={MAX_TIMEOUT_MS} step={1} value={Number.isNaN(settingsDraft.timeoutMs) ? "" : settingsDraft.timeoutMs} onChange={(event) => { setSettingsDraft((value) => ({ ...value, timeoutMs: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.millisecondsRange(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)}</small></label>
                 <label className="block" htmlFor="retries-setting"><span className="text-sm font-medium text-ink">{copy.retries}</span><input id="retries-setting" className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 font-mono text-sm text-ink" type="number" min={0} max={MAX_RETRIES} step={1} value={Number.isNaN(settingsDraft.retries) ? "" : settingsDraft.retries} onChange={(event) => { setSettingsDraft((value) => ({ ...value, retries: Number(event.target.value) })); setSettingsError(null); }} disabled={settingsBusy} /><small className="mt-1.5 block text-xs text-ink-subtle">{copy.transportRetriesRange(MAX_RETRIES)}</small></label>
@@ -1349,6 +1354,7 @@ function App() {
                   displayValue={privacyDraft.hoverRevealDelay < 0 ? copy.hoverRevealDisabled : privacyDraft.hoverRevealDelay === 0 ? copy.hoverRevealImmediate : copy.hoverRevealSeconds(privacyDraft.hoverRevealDelay)}
                   min={MIN_HOVER_REVEAL_DELAY}
                   max={MAX_HOVER_REVEAL_DELAY}
+                  step={0.5}
                   help={copy.hoverRevealDelayHelp}
                   increaseLabel={copy.increaseHoverRevealDelay}
                   decreaseLabel={copy.decreaseHoverRevealDelay}

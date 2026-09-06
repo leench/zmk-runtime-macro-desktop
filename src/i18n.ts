@@ -92,6 +92,7 @@ export type MessageTable = {
   chooseSlotHelp: string;
   slotLabel: (slot: string) => string;
   defaultSlotLabel: (slot: string) => string;
+  unnamedSlot: string;
   name: string;
   localLabelHelp: string;
   macro: string;
@@ -277,6 +278,7 @@ const english: MessageTable = {
   chooseSlotHelp: "Choose a slot to view and edit its macro.",
   slotLabel: (slot) => `Slot ${slot}`,
   defaultSlotLabel: (slot) => `Slot ${slot}`,
+  unnamedSlot: "Unnamed",
   name: "Name",
   localLabelHelp: "Local label · not written to the keyboard",
   macro: "Macro",
@@ -460,6 +462,7 @@ const chinese: MessageTable = {
   chooseSlotHelp: "选择一个插槽以查看和编辑宏。",
   slotLabel: (slot) => `插槽 ${slot}`,
   defaultSlotLabel: (slot) => `插槽 ${slot}`,
+  unnamedSlot: "未命名",
   name: "名称",
   localLabelHelp: "本机标签 · 不会写入键盘",
   macro: "宏",

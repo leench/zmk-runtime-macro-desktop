@@ -13,7 +13,8 @@ type SlotPreviewProps = {
   disabled: boolean;
   previewCharacterCount: number;
   hoverRevealDelay: number;
-};
+  className?: string;
+}
 
 function clearTimer(timer: ReturnType<typeof setTimeout> | null): null {
   if (timer !== null) clearTimeout(timer);
@@ -31,6 +32,7 @@ export function SlotPreview({
   disabled,
   previewCharacterCount,
   hoverRevealDelay,
+  className,
 }: SlotPreviewProps) {
   const [revealed, setRevealed] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -96,7 +98,7 @@ export function SlotPreview({
       disabled={disabled || !available}
       aria-pressed={revealed}
       aria-label={revealed ? copy.hideSlotPreview : copy.revealSlotPreview}
-      className={`min-w-0 max-w-[148px] shrink-0 truncate rounded-lg px-1.5 py-1 font-mono text-base transition-colors hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-70 ${selected ? "text-accent" : "text-ink-muted"}`}
+      className={`min-w-0 max-w-[148px] shrink-0 truncate rounded-lg px-1.5 py-1 font-mono text-base transition-colors hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-70 ${selected ? "text-accent" : "text-ink-muted"} ${className ?? ""}`}
     >
       <span aria-hidden="true" className="inline-flex max-w-full overflow-hidden">
         {values.map((value, index) => (

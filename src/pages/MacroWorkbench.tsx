@@ -122,7 +122,7 @@ export function MacroWorkbench({
   const slotItems = slots.map((slot) => ({
     slot: slot.slot,
     length: slot.length,
-    label: slot.draftLabel || copy.defaultSlotLabel(String(slot.slot + 1).padStart(2, "0")),
+    label: slot.draftLabel || copy.unnamedSlot,
     text: slot.loaded && !slot.loading && !slot.error ? slot.draftText : null,
     loaded: slot.loaded,
     dirty: slot.loaded && (slot.draftText !== slot.savedText || slot.draftLabel !== slot.savedLabel),

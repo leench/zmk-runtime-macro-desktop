@@ -140,20 +140,18 @@ export function MacroEditor({
               <h2 className="text-base font-semibold text-ink">{copy.macro}</h2>
               <div className="flex items-center gap-3">
                 <span className="font-mono text-xs text-ink-subtle">{copy.bytes(byteCount)}</span>
-                {revealed ? (
-                  <div className="flex items-center gap-1 rounded-lg border border-line bg-surface p-1" aria-label={copy.tokenActions}>
-                    <button type="button" onClick={() => moveToken(-1)} disabled={disabled || !selectedCanMove || selectedAtStart} aria-label={copy.moveLeft} title={copy.moveLeft} className="grid h-8 w-8 place-items-center rounded-md text-ink-muted hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35">
-                      <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-                    </button>
-                    <button type="button" onClick={() => moveToken(1)} disabled={disabled || !selectedCanMove || selectedAtEnd} aria-label={copy.moveRight} title={copy.moveRight} className="grid h-8 w-8 place-items-center rounded-md text-ink-muted hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35">
-                      <ArrowRight className="h-4 w-4" aria-hidden="true" />
-                    </button>
-                    <span className="mx-0.5 h-5 w-px bg-line" aria-hidden="true" />
-                    <button type="button" onClick={() => selectedIndex !== null && removeToken(selectedIndex)} disabled={disabled || selectedIndex === null} aria-label={copy.deleteToken} title={copy.deleteToken} className="grid h-8 w-8 place-items-center rounded-md text-ink-muted hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-35">
-                      <Trash2 className="h-4 w-4" aria-hidden="true" />
-                    </button>
-                  </div>
-                ) : null}
+                <div className="flex items-center gap-1 rounded-lg border border-line bg-surface p-1" aria-label={copy.tokenActions}>
+                  <button type="button" onClick={() => moveToken(-1)} disabled={disabled || !revealed || !selectedCanMove || selectedAtStart} aria-label={copy.moveLeft} title={copy.moveLeft} className="grid h-8 w-8 place-items-center rounded-md text-ink-muted hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35">
+                    <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                  <button type="button" onClick={() => moveToken(1)} disabled={disabled || !revealed || !selectedCanMove || selectedAtEnd} aria-label={copy.moveRight} title={copy.moveRight} className="grid h-8 w-8 place-items-center rounded-md text-ink-muted hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35">
+                    <ArrowRight className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                  <span className="mx-0.5 h-5 w-px bg-line" aria-hidden="true" />
+                  <button type="button" onClick={() => selectedIndex !== null && removeToken(selectedIndex)} disabled={disabled || !revealed || selectedIndex === null} aria-label={copy.deleteToken} title={copy.deleteToken} className="grid h-8 w-8 place-items-center rounded-md text-ink-muted hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-35">
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                </div>
               </div>
             </div>
 

@@ -7,11 +7,23 @@ type PreviewSettingStepperProps = {
   displayValue: string;
   min: number;
   max: number;
+  step?: number;
   help: string;
   increaseLabel: string;
   decreaseLabel: string;
   onChange: (value: number) => void;
 };
+
+function stepValue(value: number, direction: -1 | 1, min: number, max: number, step: number): number {
+  // The hover delay has one intentional gap: -1 means disabled, and the next
+  // available value is 0 (there is no -0.5 state).
+  if (step === 0.5 && min === -1) {
+    if (direction === 1 && value === -1) return 0;
+    if (direction === -1 && value === 0) return -1;
+  }
+  const next = value + direction * step;
+  return Math.min(max, Math.max(min, Number(next.toFixed(3))));
+}
 
 export function PreviewSettingStepper({
   id,
@@ -20,6 +32,7 @@ export function PreviewSettingStepper({
   displayValue,
   min,
   max,
+  step = 1,
   help,
   increaseLabel,
   decreaseLabel,
@@ -37,7 +50,7 @@ export function PreviewSettingStepper({
           <span className="flex flex-col overflow-hidden rounded-lg border border-line-strong bg-surface">
             <button
               type="button"
-              onClick={() => onChange(Math.min(max, value + 1))}
+              onClick={() => onChange(stepValue(value, 1, min, max, step))}
               disabled={increaseDisabled}
               aria-label={increaseLabel}
               className="grid h-5 w-7 place-items-center text-ink-muted transition-colors hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35"
@@ -47,7 +60,7 @@ export function PreviewSettingStepper({
             <span className="h-px bg-line" aria-hidden="true" />
             <button
               type="button"
-              onClick={() => onChange(Math.max(min, value - 1))}
+              onClick={() => onChange(stepValue(value, -1, min, max, step))}
               disabled={decreaseDisabled}
               aria-label={decreaseLabel}
               className="grid h-5 w-7 place-items-center text-ink-muted transition-colors hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-35"

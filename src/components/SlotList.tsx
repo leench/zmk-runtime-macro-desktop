@@ -60,51 +60,64 @@ export function SlotList({
           {slots.map((item) => {
             const selected = selectedSlot === item.slot;
             const empty = item.loaded && item.length === 0;
+            const status = item.error ? copy.slotError : item.loading ? copy.loadingSlot : null;
             return (
               <li key={item.slot}>
                 <div
-                  className={`relative mb-1 flex w-full items-center gap-4 rounded-xl px-4 py-3.5 text-left transition-colors duration-150 ease-out ${selected ? "bg-accent-soft" : "hover:bg-surface-2"}`}
+                  className={`relative mb-1 grid w-full grid-cols-[2.25rem_minmax(0,1fr)_auto] items-center gap-4 rounded-xl px-4 py-3.5 text-left transition-colors duration-150 ease-out ${selected ? "bg-accent-soft" : "hover:bg-surface-2"}`}
                 >
                   <button
                     type="button"
                     onClick={() => onSelect(item.slot)}
                     disabled={disabled}
                     aria-current={selected ? "true" : undefined}
-                    className="flex min-w-0 flex-1 items-center gap-4 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label={copy.slotLabel(String(item.slot + 1).padStart(2, "0"))}
+                    className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-sm transition-colors ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-subtle"} disabled:cursor-not-allowed disabled:opacity-50`}
                   >
-                    <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg font-mono text-sm ${selected ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink-subtle"}`}>
-                      {String(item.slot + 1).padStart(2, "0")}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className={`flex items-center gap-2 truncate font-mono text-base ${empty ? "text-ink-subtle" : selected ? "text-accent" : "text-ink"}`}>
-                        {empty ? (
-                          <>
-                            <CircleSlash2 className="h-4 w-4" aria-hidden="true" />
-                            <span className="font-sans text-sm">{copy.empty}</span>
-                          </>
-                        ) : (
-                          item.label || copy.defaultSlotLabel(String(item.slot + 1))
-                        )}
-                      </span>
-                      <span className="mt-0.5 block truncate text-xs font-normal text-ink-subtle">
-                        {item.loading ? <LoaderCircle className="mr-1 inline-block h-3.5 w-3.5 animate-spin align-[-2px]" aria-hidden="true" /> : null}
-                        {item.error ? copy.slotError : item.loaded ? copy.bytes(item.length) : copy.loadingSlot}
-                      </span>
-                    </span>
-                    {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-accent" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
+                    {String(item.slot + 1).padStart(2, "0")}
                   </button>
-                  <SlotPreview
-                    copy={copy}
-                    text={item.text}
-                    length={item.length}
-                    loaded={item.loaded}
-                    loading={item.loading}
-                    error={item.error}
-                    selected={selected}
-                    disabled={disabled}
-                    previewCharacterCount={previewCharacterCount}
-                    hoverRevealDelay={hoverRevealDelay}
-                  />
+
+                  <div className="min-w-0">
+                    <div className="flex min-w-0 items-center gap-2">
+                      {empty ? (
+                        <span className="flex min-w-0 items-center gap-2 truncate font-mono text-base text-ink-subtle">
+                          <CircleSlash2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                          <span className="font-sans text-sm">{copy.empty}</span>
+                        </span>
+                      ) : (
+                        <SlotPreview
+                          copy={copy}
+                          text={item.text}
+                          length={item.length}
+                          loaded={item.loaded}
+                          loading={item.loading}
+                          error={item.error}
+                          selected={selected}
+                          disabled={disabled}
+                          previewCharacterCount={previewCharacterCount}
+                          hoverRevealDelay={hoverRevealDelay}
+                          className="w-full max-w-full justify-start text-left"
+                        />
+                      )}
+                      {status ? (
+                        <span className="flex min-w-0 shrink-0 items-center gap-1 text-xs text-ink-subtle">
+                          {item.loading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
+                          <span className="truncate">{status}</span>
+                        </span>
+                      ) : null}
+                      {item.dirty ? <span className="h-2 w-2 shrink-0 rounded-full bg-accent" title={copy.unsavedChanges} aria-label={copy.unsavedChanges} /> : null}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onSelect(item.slot)}
+                      disabled={disabled}
+                      className={`mt-0.5 block max-w-full truncate text-left text-xs font-normal text-ink-subtle transition-colors hover:text-ink disabled:cursor-not-allowed disabled:opacity-50 ${selected ? "text-ink-muted" : ""}`}
+                    >
+                      {item.label || copy.unnamedSlot}
+                    </button>
+                  </div>
+
+                  {!empty ? <span className="shrink-0 font-mono text-xs text-ink-subtle">{copy.bytes(item.length)}</span> : <span aria-hidden="true" />}
                 </div>
               </li>
             );
