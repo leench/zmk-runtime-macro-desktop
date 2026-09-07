@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::thread;
 
 use serde::Serialize;
 use tauri::State;
@@ -186,6 +187,71 @@ impl From<ClientError> for CommandError {
             ),
         }
     }
+}
+
+type HidJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Run every application-state command on one long-lived thread.
+///
+/// macOS's hidapi backend keeps a process-global IOHIDManager tied to the
+/// thread that initializes it. Tauri's blocking pool is allowed to move
+/// successive commands between short-lived worker threads, so HID operations
+/// must not run directly on that pool. Keeping the state and all session
+/// lifecycle operations on this worker also makes device close/drop ordering
+/// deterministic.
+struct HidWorker {
+    sender: mpsc::Sender<HidJob>,
+}
+
+impl HidWorker {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel::<HidJob>();
+        thread::Builder::new()
+            .name("zmk-hid-worker".to_string())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job();
+                }
+            })
+            .expect("failed to start HID worker thread");
+        Self { sender }
+    }
+
+    fn execute<T, F>(&self, operation: F) -> Result<T, CommandError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, CommandError> + Send + 'static,
+    {
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(Box::new(move || {
+                let _ = result_sender.send(operation());
+            }))
+            .map_err(|_| CommandError::state_unavailable())?;
+        result_receiver
+            .recv()
+            .map_err(|_| CommandError::state_unavailable())?
+    }
+}
+
+static HID_WORKER: OnceLock<HidWorker> = OnceLock::new();
+
+fn execute_on_hid_worker<T, F>(operation: F) -> Result<T, CommandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CommandError> + Send + 'static,
+{
+    HID_WORKER.get_or_init(HidWorker::new).execute(operation)
+}
+
+async fn run_on_hid_worker<T, F>(operation: F) -> Result<T, CommandError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CommandError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || execute_on_hid_worker(operation))
+        .await
+        .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -910,14 +976,13 @@ pub async fn get_settings(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<ClientSettings, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         Ok(state.client_settings())
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -927,14 +992,13 @@ pub async fn set_settings(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<ClientSettings, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.set_client_settings(timeout_ms, retries)
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -942,7 +1006,7 @@ pub async fn list_devices(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<DeviceCandidate>, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
@@ -953,7 +1017,6 @@ pub async fn list_devices(
         Ok(state.refresh_records(records))
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -962,20 +1025,19 @@ pub async fn connect_device(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<ConnectionState, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.connect(&opaque_id)
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
 pub async fn disconnect_device(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
@@ -983,7 +1045,6 @@ pub async fn disconnect_device(state: State<'_, Arc<Mutex<AppState>>>) -> Result
         Ok(())
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -991,14 +1052,13 @@ pub async fn get_connection(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<ConnectionState, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         Ok(state.connection_state())
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1006,14 +1066,13 @@ pub async fn refresh_auth_state(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<AuthState, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.refresh_auth_state()
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1025,14 +1084,13 @@ pub async fn authenticate(
     // is never logged, serialized, persisted, or included in an error.
     let password = Zeroizing::new(password);
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.authenticate(password.as_str())
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1042,14 +1100,13 @@ pub async fn set_password(
 ) -> Result<AuthState, CommandError> {
     let password = Zeroizing::new(password);
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.set_password(password.as_str())
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1057,14 +1114,13 @@ pub async fn lock_device(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<AuthState, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.lock()
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1072,14 +1128,13 @@ pub async fn list_slots(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<SlotMetadata>, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.list_slots()
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1088,14 +1143,13 @@ pub async fn get_slot(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<u8>, CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.get_slot(slot)
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1105,14 +1159,13 @@ pub async fn set_slot(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.set_slot(slot, &text)
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[tauri::command]
@@ -1121,14 +1174,13 @@ pub async fn clear_slot(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), CommandError> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         state.clear_slot(slot)
     })
     .await
-    .map_err(|_| CommandError::state_unavailable())?
 }
 
 #[cfg(test)]
