@@ -157,12 +157,26 @@ impl std::error::Error for DeviceDiscoveryError {}
 /// second compatible device. Transport type is not used as a proxy for
 /// compatibility.
 pub fn enumerate_devices(api: &HidApi) -> Vec<DeviceRecord> {
+    enumerate_devices_with_known_record(api, None)
+}
+
+/// Enumerate devices while reusing the descriptor identity of the currently
+/// connected record. macOS opens HID devices exclusively by default, so
+/// probing that same path again would fail even though the existing session is
+/// healthy.
+pub fn enumerate_devices_with_known_record(
+    api: &HidApi,
+    known_record: Option<&DeviceRecord>,
+) -> Vec<DeviceRecord> {
     api.device_list()
         .map(|info| {
             let mut record = record_from_hid_info(info);
             if record.has_target_usage_for_registry() {
+                let is_known_runtime_macro = known_record.is_some_and(|known| {
+                    known.is_runtime_macro_interface() && known.path() == record.path()
+                });
                 record.has_runtime_macro_report_descriptor =
-                    device_has_runtime_macro_report_descriptor(api, info);
+                    is_known_runtime_macro || device_has_runtime_macro_report_descriptor(api, info);
             }
             record
         })

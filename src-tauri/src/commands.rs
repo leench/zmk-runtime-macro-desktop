@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 use crate::client::{ClientConfig, RuntimeMacroClient, SlotInfo};
 use crate::error::{ClientError, TransportError};
 use crate::hid::{
-    enumerate_devices, new_hid_api, open_device, DeviceDiscoveryError, DeviceRecord, DeviceSummary,
-    HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
+    enumerate_devices_with_known_record, new_hid_api, open_device, DeviceDiscoveryError,
+    DeviceRecord, DeviceSummary, HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
 use crate::protocol::{AuthInfo, Status};
 
@@ -526,6 +526,7 @@ impl SessionFactory for HidSessionFactory {
 }
 
 struct ConnectedSession {
+    record: DeviceRecord,
     device: ConnectedDevice,
     session: Box<dyn MacroSession>,
     auth_state: AuthState,
@@ -610,6 +611,7 @@ impl<F: SessionFactory> AppState<F> {
         };
         let auth_state = AuthState::from_info(&info);
         self.connection = Some(ConnectedSession {
+            record,
             device,
             session,
             auth_state,
@@ -1010,9 +1012,13 @@ pub async fn list_devices(
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
         // Even a failed refresh must not leave an old opaque ID usable.
+        let known_record = state
+            .connection
+            .as_ref()
+            .map(|connection| connection.record.clone());
         state.invalidate_candidates();
         let api = new_hid_api().map_err(CommandError::from)?;
-        let records = enumerate_devices(&api);
+        let records = enumerate_devices_with_known_record(&api, known_record.as_ref());
         Ok(state.refresh_records(records))
     })
     .await
