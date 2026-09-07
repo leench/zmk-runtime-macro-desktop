@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use hidapi::{BusType, DeviceInfo as HidDeviceInfo, HidApi, HidDevice, HidError};
+use hidapi::{DeviceInfo as HidDeviceInfo, HidApi, HidDevice, HidError};
 use zeroize::Zeroizing;
 
 use crate::client::Transport;
@@ -33,27 +33,11 @@ pub struct DeviceSummary {
 /// An enumerated device with its path kept private for an in-process open.
 ///
 /// `Debug` deliberately prints only the safe summary and never the path.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum DeviceBus {
-    Usb,
-    NonUsb,
-}
-
-impl From<BusType> for DeviceBus {
-    fn from(bus_type: BusType) -> Self {
-        if matches!(bus_type, BusType::Usb) {
-            Self::Usb
-        } else {
-            Self::NonUsb
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceRecord {
     path: Vec<u8>,
     summary: DeviceSummary,
-    bus: DeviceBus,
+    has_runtime_macro_report_descriptor: bool,
 }
 
 impl DeviceRecord {
@@ -65,13 +49,13 @@ impl DeviceRecord {
         &self.path
     }
 
-    pub(crate) fn is_usb(&self) -> bool {
-        self.bus == DeviceBus::Usb
-    }
-
     pub(crate) fn has_target_usage_for_registry(&self) -> bool {
         self.summary.usage_page == RUNTIME_MACRO_USAGE_PAGE
             && self.summary.usage == RUNTIME_MACRO_USAGE
+    }
+
+    pub(crate) fn is_runtime_macro_interface(&self) -> bool {
+        self.has_target_usage_for_registry() && self.has_runtime_macro_report_descriptor
     }
 
     pub(crate) fn has_missing_usage_for_registry(&self) -> bool {
@@ -79,15 +63,22 @@ impl DeviceRecord {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test_with_transport(path: &[u8], summary: DeviceSummary, usb: bool) -> Self {
+    pub(crate) fn for_test(path: &[u8], summary: DeviceSummary) -> Self {
+        let has_runtime_macro_report_descriptor =
+            summary.usage_page == RUNTIME_MACRO_USAGE_PAGE && summary.usage == RUNTIME_MACRO_USAGE;
+        Self::for_test_with_report_descriptor(path, summary, has_runtime_macro_report_descriptor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_report_descriptor(
+        path: &[u8],
+        summary: DeviceSummary,
+        has_runtime_macro_report_descriptor: bool,
+    ) -> Self {
         Self {
             path: path.to_vec(),
             summary,
-            bus: if usb {
-                DeviceBus::Usb
-            } else {
-                DeviceBus::NonUsb
-            },
+            has_runtime_macro_report_descriptor,
         }
     }
 }
@@ -158,8 +149,24 @@ impl fmt::Display for DeviceDiscoveryError {
 impl std::error::Error for DeviceDiscoveryError {}
 
 /// Enumerate records from a hidapi context without printing or exposing paths.
+///
+/// A device's top-level Usage Page/Usage is not sufficient to identify this
+/// protocol: another vendor HID interface may intentionally share the same
+/// pair. Inspect the report descriptor for records that advertise the Runtime
+/// Macro pair so a composite device's raw-HID interface is not shown as a
+/// second compatible device. Transport type is not used as a proxy for
+/// compatibility.
 pub fn enumerate_devices(api: &HidApi) -> Vec<DeviceRecord> {
-    api.device_list().map(record_from_hid_info).collect()
+    api.device_list()
+        .map(|info| {
+            let mut record = record_from_hid_info(info);
+            if record.has_target_usage_for_registry() {
+                record.has_runtime_macro_report_descriptor =
+                    device_has_runtime_macro_report_descriptor(api, info);
+            }
+            record
+        })
+        .collect()
 }
 
 fn record_from_hid_info(info: &HidDeviceInfo) -> DeviceRecord {
@@ -173,19 +180,153 @@ fn record_from_hid_info(info: &HidDeviceInfo) -> DeviceRecord {
             usage_page: info.usage_page(),
             usage: info.usage(),
         },
-        bus: DeviceBus::from(info.bus_type()),
+        has_runtime_macro_report_descriptor: false,
     }
+}
+
+fn device_has_runtime_macro_report_descriptor(api: &HidApi, info: &HidDeviceInfo) -> bool {
+    let Ok(device) = info.open_device(api) else {
+        return false;
+    };
+    let mut descriptor = [0u8; hidapi::MAX_REPORT_DESCRIPTOR_SIZE];
+    let Ok(length) = device.get_report_descriptor(&mut descriptor) else {
+        return false;
+    };
+    is_runtime_macro_report_descriptor(&descriptor[..length])
+}
+
+fn is_runtime_macro_report_descriptor(descriptor: &[u8]) -> bool {
+    let mut offset = 0;
+    let mut usage_page = 0u32;
+    let mut report_size = 0u32;
+    let mut report_count = 0u32;
+    let mut report_id = 0u8;
+    let mut has_report_id = false;
+    let mut collection_depth = 0u32;
+    let mut has_runtime_macro_collection = false;
+    let mut has_runtime_macro_input = false;
+    let mut has_runtime_macro_output = false;
+    let mut local_usages = Vec::new();
+
+    while offset < descriptor.len() {
+        let prefix = descriptor[offset];
+        offset += 1;
+
+        if prefix == 0xfe {
+            if offset + 2 > descriptor.len() {
+                return false;
+            }
+            let data_len = descriptor[offset] as usize;
+            offset += 2;
+            if offset + data_len > descriptor.len() {
+                return false;
+            }
+            offset += data_len;
+            continue;
+        }
+
+        let data_len = match prefix & 0x03 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => unreachable!(),
+        };
+        if offset + data_len > descriptor.len() {
+            return false;
+        }
+        let data = &descriptor[offset..offset + data_len];
+        offset += data_len;
+        let item_type = (prefix >> 2) & 0x03;
+        let tag = prefix >> 4;
+        let value = match data_len {
+            0 => 0,
+            1 => data[0] as u32,
+            2 => u16::from_le_bytes([data[0], data[1]]) as u32,
+            4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            _ => unreachable!(),
+        };
+
+        match (item_type, tag) {
+            // Global items.
+            (1, 0) => usage_page = value,
+            (1, 7) => report_size = value,
+            (1, 8) => {
+                has_report_id = true;
+                report_id = value as u8;
+            }
+            (1, 9) => report_count = value,
+            // Local Usage item.
+            (2, 0) => local_usages.push((usage_page as u16, value as u16)),
+            // Main Collection item.
+            (0, 0x0a) => {
+                if collection_depth == 0
+                    && value == 0x01
+                    && local_usages.iter().any(|&(page, usage)| {
+                        page == RUNTIME_MACRO_USAGE_PAGE && usage == RUNTIME_MACRO_USAGE
+                    })
+                {
+                    has_runtime_macro_collection = true;
+                }
+                collection_depth += 1;
+            }
+            // Main Input item.
+            (0, 0x08) => {
+                if report_id == 0
+                    && report_size == 8
+                    && report_count == FRAME_SIZE as u32
+                    && local_usages
+                        .iter()
+                        .any(|&(page, usage)| page == RUNTIME_MACRO_USAGE_PAGE && usage == 0x62)
+                {
+                    has_runtime_macro_input = true;
+                }
+            }
+            // Main Output item.
+            (0, 0x09) => {
+                if report_id == 0
+                    && report_size == 8
+                    && report_count == FRAME_SIZE as u32
+                    && local_usages
+                        .iter()
+                        .any(|&(page, usage)| page == RUNTIME_MACRO_USAGE_PAGE && usage == 0x63)
+                {
+                    has_runtime_macro_output = true;
+                }
+            }
+            // Main End Collection item.
+            (0, 0x0c) => {
+                if collection_depth == 0 {
+                    return false;
+                }
+                collection_depth -= 1;
+            }
+            _ => {}
+        }
+
+        // Local items apply only to the next Main item.
+        if item_type == 0 {
+            local_usages.clear();
+        }
+    }
+
+    collection_depth == 0
+        && !has_report_id
+        && has_runtime_macro_collection
+        && has_runtime_macro_input
+        && has_runtime_macro_output
 }
 
 /// Select exactly one runtime macro HID interface record.
 ///
-/// Selection accepts only USB records with the exact vendor Usage Page/Usage
-/// pair. Non-USB records, including Bluetooth and unknown-bus records, are
-/// never connectable even when they report the exact Usage pair. If no exact
-/// USB match exists and a filtered USB record has both Usage fields missing,
-/// the caller must provide an exact path rather than guessing. An explicit
-/// path may select the 0/0 metadata fallback, but still requires USB and
-/// rejects known, other Usage values.
+/// Selection accepts only records whose top-level Usage Page/Usage and report
+/// descriptor both identify the Runtime Macro interface. This is stricter than
+/// checking the top-level pair alone because a composite device may expose a
+/// separate raw-HID interface with the same pair. Transport type is not used
+/// to guess whether a record is compatible. If no exact match exists and a
+/// filtered record has both Usage fields missing, the caller must provide an
+/// exact path rather than guessing. An explicit path may select the 0/0
+/// metadata fallback, but still rejects known, other Usage values.
 pub fn select_device<'a>(
     records: &'a [DeviceRecord],
     filter: &DeviceFilter,
@@ -193,10 +334,9 @@ pub fn select_device<'a>(
     let filtered: Vec<&DeviceRecord> = records
         .iter()
         .filter(|record| {
-            record.is_usb()
-                && filter
-                    .vendor_id
-                    .is_none_or(|vendor_id| record.summary.vendor_id == vendor_id)
+            filter
+                .vendor_id
+                .is_none_or(|vendor_id| record.summary.vendor_id == vendor_id)
                 && filter
                     .product_id
                     .is_none_or(|product_id| record.summary.product_id == product_id)
@@ -211,7 +351,7 @@ pub fn select_device<'a>(
         let usable: Vec<&DeviceRecord> = filtered
             .into_iter()
             .filter(|record| {
-                record.has_target_usage_for_registry() || record.has_missing_usage_for_registry()
+                record.is_runtime_macro_interface() || record.has_missing_usage_for_registry()
             })
             .collect();
         return select_one(usable);
@@ -220,7 +360,7 @@ pub fn select_device<'a>(
     let exact: Vec<&DeviceRecord> = filtered
         .iter()
         .copied()
-        .filter(|record| record.has_target_usage_for_registry())
+        .filter(|record| record.is_runtime_macro_interface())
         .collect();
     if !exact.is_empty() {
         return select_one(exact);
@@ -246,9 +386,8 @@ fn select_one(records: Vec<&DeviceRecord>) -> Result<&DeviceRecord, DeviceDiscov
     }
 }
 
-/// Convert an enumerated USB record into a live transport.
+/// Convert an enumerated record into a live transport.
 ///
-/// Non-USB records are rejected even when their Usage metadata looks exact.
 /// The path is used only for this in-process open. hidapi does not provide a
 /// stable structured permission/busy error across all supported backends, so
 /// backend failures are deliberately mapped to the safe `OpenFailed` variant.
@@ -256,9 +395,6 @@ pub fn open_device(
     api: &HidApi,
     record: &DeviceRecord,
 ) -> Result<HidTransport, DeviceDiscoveryError> {
-    if !record.is_usb() {
-        return Err(DeviceDiscoveryError::NoDevice);
-    }
     let path = CString::new(record.path()).map_err(|_| DeviceDiscoveryError::InvalidPath)?;
     let device = api
         .open_path(path.as_c_str())
@@ -444,7 +580,7 @@ mod tests {
         usage: u16,
         interface_number: i32,
     ) -> DeviceRecord {
-        DeviceRecord::for_test_with_transport(
+        DeviceRecord::for_test(
             path,
             DeviceSummary {
                 vendor_id,
@@ -454,8 +590,23 @@ mod tests {
                 usage_page,
                 usage,
             },
-            true,
         )
+    }
+
+    #[test]
+    fn report_descriptor_distinguishes_runtime_macro_from_raw_hid() {
+        let runtime_macro_descriptor = [
+            0x06, 0x60, 0xff, 0x09, 0x61, 0xa1, 0x01, 0x09, 0x62, 0x15, 0x00, 0x26, 0xff, 0x00,
+            0x75, 0x08, 0x95, 0x20, 0x81, 0x02, 0x09, 0x63, 0x91, 0x02, 0xc0,
+        ];
+        let raw_hid_descriptor = [
+            0x06, 0x60, 0xff, 0x09, 0x61, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08,
+            0x95, 0x20, 0x09, 0x01, 0x81, 0x02, 0x09, 0x02, 0x91, 0x02, 0xc0,
+        ];
+        assert!(is_runtime_macro_report_descriptor(
+            &runtime_macro_descriptor
+        ));
+        assert!(!is_runtime_macro_report_descriptor(&raw_hid_descriptor));
     }
 
     #[test]
@@ -477,6 +628,33 @@ mod tests {
             selected.summary().product_name.as_deref(),
             Some("Example Keyboard")
         );
+    }
+
+    #[test]
+    fn discovery_rejects_raw_hid_interface_with_shared_usage() {
+        let runtime_macro = fake_record_with_interface(
+            b"runtime-macro",
+            0x1234,
+            0x5678,
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            4,
+        );
+        let raw_hid = DeviceRecord::for_test_with_report_descriptor(
+            b"raw-hid",
+            DeviceSummary {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                product_name: Some("Example Keyboard".to_string()),
+                interface_number: 3,
+                usage_page: RUNTIME_MACRO_USAGE_PAGE,
+                usage: RUNTIME_MACRO_USAGE,
+            },
+            false,
+        );
+        let records = [runtime_macro, raw_hid];
+        let selected = select_device(&records, &DeviceFilter::default()).unwrap();
+        assert_eq!(selected.summary().interface_number, 4);
     }
 
     #[test]
@@ -517,36 +695,6 @@ mod tests {
         assert_eq!(
             select_device(&missing, &DeviceFilter::default()),
             Err(DeviceDiscoveryError::UsageMetadataMissing)
-        );
-    }
-
-    #[test]
-    fn discovery_rejects_non_usb_even_with_exact_usage() {
-        let bluetooth = DeviceRecord::for_test_with_transport(
-            b"bluetooth-runtime-macro",
-            DeviceSummary {
-                vendor_id: 0x1234,
-                product_id: 0x5678,
-                product_name: Some("Example Keyboard".to_string()),
-                interface_number: 7,
-                usage_page: RUNTIME_MACRO_USAGE_PAGE,
-                usage: RUNTIME_MACRO_USAGE,
-            },
-            false,
-        );
-        assert_eq!(
-            select_device(std::slice::from_ref(&bluetooth), &DeviceFilter::default()),
-            Err(DeviceDiscoveryError::NoDevice)
-        );
-        assert_eq!(
-            select_device(
-                std::slice::from_ref(&bluetooth),
-                &DeviceFilter {
-                    path: Some(b"bluetooth-runtime-macro".to_vec()),
-                    ..DeviceFilter::default()
-                }
-            ),
-            Err(DeviceDiscoveryError::NoDevice)
         );
     }
 

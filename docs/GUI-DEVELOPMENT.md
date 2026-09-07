@@ -51,9 +51,15 @@ discover -> explicit device selection -> connect -> AUTH_INFO
 
 设备列表只展示安全摘要：产品名（如果 HID 提供）、VID/PID、interface number 和 Usage 元数据状态。列表不推测或展示 `requiresPassword`，是否受保护只有连接后的 `AUTH_INFO` 才能决定。没有设备、多个候选、设备忙/权限拒绝、传输错误和协议不兼容都使用本地化的安全提示；不展示 HID path、serial、raw report 或后端原始错误字符串。
 
-#### 蓝牙设备发现边界（方案 1）
+#### 复合 HID 设备发现边界
 
-桌面端自动候选只接受 USB transport 且具有 Runtime Macro 的精确 HID Usage：Usage Page `0xff60`、Usage `0x61`。所有非 USB 记录（包括 Bluetooth 和 Unknown）即使报告精确 Usage 也必须过滤，不能通过尝试 `AUTH_INFO` 来猜测。部分 `hidapi` Bluetooth HID backend 会把普通键盘的 Usage 元数据报告为 `0/0`；这类记录同样不能证明存在 Runtime Macro 管理通道。该改动只修复误发现，不实现桌面应用直接通过蓝牙连接；当前 Runtime Macro 管理通道仍是 USB HID，直接 BLE 传输列为后续方案。
+桌面端自动候选同时验证 Runtime Macro 的完整 HID report descriptor：顶层 Usage
+Page `0xff60`、Usage `0x61`，输入 Usage `0x62`、输出 Usage `0x63`，固定
+32-byte report 且不使用 Report ID。仅检查顶层 Usage 不够，因为同一复合键盘可以
+同时暴露 `raw_hid_adapter`；它可能复用 `0xff60/0x61`，但输入/输出 Usage 是
+`0x01/0x02`，不是 Runtime Macro 通道。因此应用不硬编码 interface number，也不
+根据 `BusType`/Bluetooth 元数据猜测兼容性，而是过滤掉 report descriptor 不匹配的
+接口。
 
 认证行为：
 

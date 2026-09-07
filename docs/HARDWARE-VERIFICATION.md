@@ -28,8 +28,9 @@
 - Windows：x64 NSIS 安装包
 
 Linux 使用 `hidapi` 的 `linux-static-hidraw` backend；macOS 和 Windows 使用
-`hidapi` 默认 portable C backend。运行时根据 Usage metadata 选择候选，不硬编码
-HID interface 编号。
+`hidapi` 默认 portable C backend。运行时同时检查 Usage metadata 和完整 HID report
+descriptor，过滤复用相同顶层 Usage 的 raw-HID 接口；不根据 transport 或 Bluetooth
+元数据猜测兼容性，也不硬编码 HID interface 编号。
 
 workflow 只执行依赖安装、前端构建和 Tauri 打包，不枚举 HID、不打开设备，也不执行协议命令。因此平台安装包生成和启动检查必须在对应 runner 上完成；当前环境没有伪造这些 runner 的结果。
 
