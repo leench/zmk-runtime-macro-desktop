@@ -48,6 +48,7 @@ import { DeviceSelect } from "./pages/DeviceSelect";
 import { MacroWorkbench } from "./pages/MacroWorkbench";
 import { Unlock } from "./pages/Unlock";
 import { PasswordSetupModal } from "./components/PasswordSetupModal";
+import { DynamicMacroModal } from "./components/DynamicMacroModal";
 import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
 import { SelectField } from "./components/SelectField";
 import type { Platform } from "./components/TitleBar";
@@ -351,6 +352,7 @@ function App() {
   const [dynamicProgress, setDynamicProgress] = useState<number | null>(null);
   const [dynamicError, setDynamicError] = useState<CommandError | null>(null);
   const [dynamicClearConfirm, setDynamicClearConfirm] = useState(false);
+  const [dynamicModalOpen, setDynamicModalOpen] = useState(false);
 
   const mounted = useRef(false);
   const operation = useRef(0);
@@ -463,6 +465,7 @@ function App() {
       setConnection(disconnected);
       setDynamicCapabilities(null);
       setDynamicStatus("unknown");
+      setDynamicModalOpen(false);
       setDynamicError(null);
       setDynamicProgress(null);
       setDynamicClearConfirm(false);
@@ -643,6 +646,7 @@ function App() {
       if (!nextConnection.connected) {
         setDynamicCapabilities(null);
         setDynamicStatus("unknown");
+        setDynamicModalOpen(false);
         setDynamicError(null);
         setDynamicProgress(null);
         setDynamicClearConfirm(false);
@@ -681,6 +685,7 @@ function App() {
     setPasswordModalMode(null);
     setDynamicCapabilities(null);
     setDynamicStatus("unknown");
+    setDynamicModalOpen(false);
     setDynamicError(null);
     setDynamicProgress(null);
     setDynamicClearConfirm(false);
@@ -759,6 +764,7 @@ function App() {
       clearAuthDeadline();
       setDynamicCapabilities(null);
       setDynamicStatus("unknown");
+      setDynamicModalOpen(false);
       setDynamicError(null);
       setDynamicProgress(null);
       setDynamicClearConfirm(false);
@@ -794,6 +800,7 @@ function App() {
           setConnection(disconnected);
           setDynamicCapabilities(null);
           setDynamicStatus("unknown");
+          setDynamicModalOpen(false);
           setDynamicError(null);
           setDynamicProgress(null);
           setDynamicClearConfirm(false);
@@ -1158,7 +1165,7 @@ function App() {
       setDynamicProgress(25);
       await enqueueProtocolOperation(() => uploadDynamicCommand(dynamicText, dynamicTtlSeconds, dynamicKeepAfterExecute));
       if (!mounted.current || operation.current !== sequence) return null;
-      setDynamicProgress(100);
+      setDynamicProgress(null);
       setDynamicStatus("committed");
       markAuthenticatedActivity(false);
       return null;
@@ -1197,7 +1204,7 @@ function App() {
       setDynamicProgress(50);
       await enqueueProtocolOperation(() => clearDynamicCommand());
       if (!mounted.current || operation.current !== sequence) return null;
-      setDynamicProgress(100);
+      setDynamicProgress(null);
       setDynamicStatus("cleared");
       return null;
     } catch (caught) {
@@ -1492,21 +1499,7 @@ function App() {
           externalErrorCode={errorCode}
           onBack={() => { void disconnectDevice(); }}
           onUnlock={authenticateDevice}
-          dynamicCapabilities={dynamicCapabilities}
-          dynamicText={dynamicText}
-          dynamicTtlSeconds={dynamicTtlSeconds}
-          dynamicKeepAfterExecute={dynamicKeepAfterExecute}
-          dynamicStatus={dynamicStatus}
-          dynamicProgress={dynamicProgress}
-          dynamicError={dynamicError}
-          dynamicClearPending={dynamicClearConfirm}
-          onDynamicTextChange={updateDynamicText}
-          onDynamicTtlChange={setDynamicTtlSeconds}
-          onDynamicKeepChange={setDynamicKeepAfterExecute}
-          onDynamicUpload={uploadDynamic}
-          onDynamicClearRequest={requestDynamicClear}
-          onDynamicClearConfirm={clearDynamic}
-          onDynamicClearCancel={cancelDynamicClear}
+          onDynamicOpen={() => setDynamicModalOpen(true)}
         />
       ) : null}
 
@@ -1547,6 +1540,8 @@ function App() {
           onLock={() => void lockManagement()}
           onSwitchDevice={requestDeviceConnect}
           onDisconnect={() => void disconnectDevice()}
+          onDynamicOpen={() => setDynamicModalOpen(true)}
+          dynamicModalOpen={dynamicModalOpen}
           onSelectSlot={selectSlot}
           onMoveSelection={(offset) => {
             const index = slots.findIndex((slot) => slot.slot === selectedSlot);
@@ -1572,21 +1567,29 @@ function App() {
           onRetry={retrySelected}
           onCloseDiagnostics={() => setDiagnosticsOpen(false)}
           diagnosticsOpen={diagnosticsOpen}
-          dynamicCapabilities={dynamicCapabilities}
-          dynamicText={dynamicText}
-          dynamicTtlSeconds={dynamicTtlSeconds}
-          dynamicKeepAfterExecute={dynamicKeepAfterExecute}
-          dynamicStatus={dynamicStatus}
-          dynamicProgress={dynamicProgress}
-          dynamicError={dynamicError}
-          dynamicClearPending={dynamicClearConfirm}
-          onDynamicTextChange={updateDynamicText}
-          onDynamicTtlChange={setDynamicTtlSeconds}
-          onDynamicKeepChange={setDynamicKeepAfterExecute}
-          onDynamicUpload={uploadDynamic}
-          onDynamicClearRequest={requestDynamicClear}
-          onDynamicClearConfirm={clearDynamic}
-          onDynamicClearCancel={cancelDynamicClear}
+        />
+      ) : null}
+
+      {dynamicModalOpen && route !== "select" && connection.device ? (
+        <DynamicMacroModal
+          copy={copy}
+          capabilities={dynamicCapabilities}
+          text={dynamicText}
+          ttlSeconds={dynamicTtlSeconds}
+          keepAfterExecute={dynamicKeepAfterExecute}
+          status={dynamicStatus}
+          progress={dynamicProgress}
+          error={dynamicError}
+          disabled={busy}
+          clearPending={dynamicClearConfirm}
+          onTextChange={updateDynamicText}
+          onTtlChange={setDynamicTtlSeconds}
+          onKeepChange={setDynamicKeepAfterExecute}
+          onUpload={uploadDynamic}
+          onClearRequest={requestDynamicClear}
+          onClearConfirm={clearDynamic}
+          onClearCancel={cancelDynamicClear}
+          onClose={() => { if (!busy) setDynamicModalOpen(false); }}
         />
       ) : null}
 

@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Settings,
   ShieldCheck,
+  Zap,
   Sun,
 } from "lucide-react";
 import type { DeviceCandidate } from "../bridge";
@@ -41,6 +42,8 @@ type AppHeaderProps = {
   onLock: () => void;
   onSwitchDevice: (id: string) => void;
   onDisconnect: () => void;
+  onDynamicOpen: () => void;
+  dynamicModalOpen: boolean;
   disabled?: boolean;
 };
 
@@ -72,6 +75,8 @@ export function AppHeader({
   onLock,
   onSwitchDevice,
   onDisconnect,
+  onDynamicOpen,
+  dynamicModalOpen,
   disabled = false,
 }: AppHeaderProps) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -127,6 +132,7 @@ export function AppHeader({
 
       <div className="ml-auto flex items-center gap-1">
         <IconButton icon={refreshing ? Activity : RefreshCw} label={copy.refreshSlots} onClick={onRefresh} disabled={disabled || refreshing} />
+        <IconButton icon={Zap} label={copy.dynamicMacro} active={dynamicModalOpen} onClick={onDynamicOpen} disabled={disabled} />
         <IconButton icon={dark ? Sun : Moon} label={copy.theme} onClick={toggleTheme} disabled={disabled} />
         <IconButton icon={Settings} label={copy.settings} onClick={onSettings} disabled={disabled} />
         <div className="relative" ref={menuRef}>

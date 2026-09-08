@@ -212,13 +212,13 @@ export type MessageTable = {
   dynamicYes: string;
   dynamicNo: string;
   dynamicTtl: string;
-  dynamicTtlDefault: string;
+  dynamicTtlDefault: (seconds: number) => string;
   dynamicTtlCustom: string;
   dynamicTtlHelp: (min: number, max: number) => string;
   seconds: string;
-  dynamicKeepAfterExecute: string;
-  dynamicKeepAfterExecuteHelp: string;
-  dynamicKeepUnsupported: string;
+  dynamicSingleUse: string;
+  dynamicSingleUseHelp: string;
+  dynamicSingleUseUnsupported: string;
   dynamicCapabilityNote: string;
   dynamicUpload: string;
   dynamicClear: string;
@@ -450,13 +450,13 @@ const english: MessageTable = {
   dynamicYes: "yes",
   dynamicNo: "no",
   dynamicTtl: "TTL",
-  dynamicTtlDefault: "Device default",
+  dynamicTtlDefault: (seconds) => `Device default (${seconds} seconds)`,
   dynamicTtlCustom: "Custom…",
   dynamicTtlHelp: (min, max) => `Optional explicit TTL · ${min}–${max} seconds`,
   seconds: "seconds",
-  dynamicKeepAfterExecute: "Keep after execute",
-  dynamicKeepAfterExecuteHelp: "Retain after a successful execution.",
-  dynamicKeepUnsupported: "Not advertised by this device",
+  dynamicSingleUse: "Single-use input",
+  dynamicSingleUseHelp: "Consume the dynamic object after a successful execution.",
+  dynamicSingleUseUnsupported: "This device cannot retain the object, so it is always single-use.",
   dynamicCapabilityNote: "Upload and clear report local observation only; the object cannot be read back.",
   dynamicUpload: "Upload",
   dynamicClear: "Clear",
@@ -686,13 +686,13 @@ const chinese: MessageTable = {
   dynamicYes: "是",
   dynamicNo: "否",
   dynamicTtl: "TTL",
-  dynamicTtlDefault: "设备默认值",
+  dynamicTtlDefault: (seconds) => `设备默认值（${seconds} 秒）`,
   dynamicTtlCustom: "自定义…",
   dynamicTtlHelp: (min, max) => `可选显式 TTL · ${min}–${max} 秒`,
   seconds: "秒",
-  dynamicKeepAfterExecute: "执行后保留",
-  dynamicKeepAfterExecuteHelp: "成功执行后保留动态对象。",
-  dynamicKeepUnsupported: "设备未声明支持",
+  dynamicSingleUse: "单次输入",
+  dynamicSingleUseHelp: "成功执行后自动消费动态对象。",
+  dynamicSingleUseUnsupported: "设备不支持保留对象，因此始终为单次输入。",
   dynamicCapabilityNote: "上传和清空只表示本地观察；对象不能读回。",
   dynamicUpload: "上传",
   dynamicClear: "清空",
@@ -755,7 +755,7 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     dynamic_auth_boundary: "The device returned an authentication status for Dynamic Macro; static authentication was not changed.",
     dynamic_empty: english.dynamicTextRequired,
     dynamic_ttl_invalid: english.dynamicTtlInvalid,
-    dynamic_keep_unsupported: english.dynamicKeepUnsupported,
+    dynamic_keep_unsupported: english.dynamicSingleUseUnsupported,
   },
   "zh-CN": {
     hid_backend_unavailable: "无法初始化 HID 后端。",
@@ -794,7 +794,7 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     dynamic_auth_boundary: "设备为 Dynamic Macro 返回了认证状态；静态认证状态未改变。",
     dynamic_empty: chinese.dynamicTextRequired,
     dynamic_ttl_invalid: chinese.dynamicTtlInvalid,
-    dynamic_keep_unsupported: chinese.dynamicKeepUnsupported,
+    dynamic_keep_unsupported: chinese.dynamicSingleUseUnsupported,
   },
 };
 

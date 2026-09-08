@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { AlertCircle, ArrowLeft, Eye, EyeOff, Lock, Unlock as UnlockIcon } from "lucide-react";
-import type { CommandError, ConnectedDevice, DynamicCapabilities } from "../bridge";
+import { AlertCircle, ArrowLeft, Eye, EyeOff, Lock, Unlock as UnlockIcon, Zap } from "lucide-react";
+import type { CommandError, ConnectedDevice } from "../bridge";
 import type { Locale, Messages } from "../i18n";
 import { translateCommandError } from "../i18n";
 import { TitleBar, type Platform } from "../components/TitleBar";
-import { DynamicMacroPanel, type DynamicMacroStatus } from "../components/DynamicMacroPanel";
 
 type UnlockProps = {
   copy: Messages;
@@ -17,24 +16,10 @@ type UnlockProps = {
   externalErrorCode: string | null;
   onBack: () => void;
   onUnlock: (password: string) => Promise<CommandError | null>;
-  dynamicCapabilities: DynamicCapabilities | null;
-  dynamicText: string;
-  dynamicTtlSeconds: number | null;
-  dynamicKeepAfterExecute: boolean;
-  dynamicStatus: DynamicMacroStatus;
-  dynamicProgress: number | null;
-  dynamicError: CommandError | null;
-  dynamicClearPending: boolean;
-  onDynamicTextChange: (value: string) => void;
-  onDynamicTtlChange: (value: number | null) => void;
-  onDynamicKeepChange: (value: boolean) => void;
-  onDynamicUpload: () => Promise<CommandError | null>;
-  onDynamicClearRequest: () => void;
-  onDynamicClearConfirm: () => Promise<CommandError | null>;
-  onDynamicClearCancel: () => void;
+  onDynamicOpen: () => void;
 };
 
-export function Unlock({ copy, locale, platform, device, credentialInvalid, busy, externalErrorCode, onBack, onUnlock, dynamicCapabilities, dynamicText, dynamicTtlSeconds, dynamicKeepAfterExecute, dynamicStatus, dynamicProgress, dynamicError, dynamicClearPending, onDynamicTextChange, onDynamicTtlChange, onDynamicKeepChange, onDynamicUpload, onDynamicClearRequest, onDynamicClearConfirm, onDynamicClearCancel }: UnlockProps) {
+export function Unlock({ copy, locale, platform, device, credentialInvalid, busy, externalErrorCode, onBack, onUnlock, onDynamicOpen }: UnlockProps) {
   const [password, setPassword] = useState("");
   const [visible, setVisible] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -115,25 +100,15 @@ export function Unlock({ copy, locale, platform, device, credentialInvalid, busy
               </button>
             </form>
           )}
-          <DynamicMacroPanel
-            copy={copy}
-            capabilities={dynamicCapabilities}
-            text={dynamicText}
-            ttlSeconds={dynamicTtlSeconds}
-            keepAfterExecute={dynamicKeepAfterExecute}
-            status={dynamicStatus}
-            progress={dynamicProgress}
-            error={dynamicError}
+          <button
+            type="button"
+            onClick={onDynamicOpen}
             disabled={busy}
-            clearPending={dynamicClearPending}
-            onTextChange={onDynamicTextChange}
-            onTtlChange={onDynamicTtlChange}
-            onKeepChange={onDynamicKeepChange}
-            onUpload={onDynamicUpload}
-            onClearRequest={onDynamicClearRequest}
-            onClearConfirm={onDynamicClearConfirm}
-            onClearCancel={onDynamicClearCancel}
-          />
+            className="mt-4 inline-flex h-12 w-full items-center justify-center gap-2.5 rounded-xl border border-line-strong text-sm font-semibold text-ink-muted transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <Zap className="h-4 w-4" aria-hidden="true" />
+            {copy.dynamicMacro}
+          </button>
         </div>
       </main>
     </div>

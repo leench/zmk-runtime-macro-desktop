@@ -1,10 +1,9 @@
-import type { DeviceCandidate, ConnectedDevice, DynamicCapabilities, CommandError } from "../bridge";
+import type { DeviceCandidate, ConnectedDevice } from "../bridge";
 import type { Messages } from "../i18n";
 import type { ThemeMode } from "../types/ui";
 import type { SlotState } from "../types/workbench";
 import { AppHeader } from "../components/AppHeader";
 import { MacroEditor } from "../components/MacroEditor";
-import { DynamicMacroPanel, type DynamicMacroStatus } from "../components/DynamicMacroPanel";
 import { SlotList } from "../components/SlotList";
 import { TitleBar, type Platform } from "../components/TitleBar";
 
@@ -44,6 +43,8 @@ type MacroWorkbenchProps = {
   onLock: () => void;
   onSwitchDevice: (id: string) => void;
   onDisconnect: () => void;
+  onDynamicOpen: () => void;
+  dynamicModalOpen: boolean;
   onSelectSlot: (slot: number) => void;
   onMoveSelection: (offset: number) => void;
   onLabelChange: (value: string) => void;
@@ -61,21 +62,6 @@ type MacroWorkbenchProps = {
   onRetry: () => void;
   onCloseDiagnostics: () => void;
   diagnosticsOpen: boolean;
-  dynamicCapabilities: DynamicCapabilities | null;
-  dynamicText: string;
-  dynamicTtlSeconds: number | null;
-  dynamicKeepAfterExecute: boolean;
-  dynamicStatus: DynamicMacroStatus;
-  dynamicProgress: number | null;
-  dynamicError: CommandError | null;
-  dynamicClearPending: boolean;
-  onDynamicTextChange: (value: string) => void;
-  onDynamicTtlChange: (value: number | null) => void;
-  onDynamicKeepChange: (value: boolean) => void;
-  onDynamicUpload: () => Promise<CommandError | null>;
-  onDynamicClearRequest: () => void;
-  onDynamicClearConfirm: () => Promise<CommandError | null>;
-  onDynamicClearCancel: () => void;
 };
 
 export function MacroWorkbench({
@@ -114,6 +100,8 @@ export function MacroWorkbench({
   onLock,
   onSwitchDevice,
   onDisconnect,
+  onDynamicOpen,
+  dynamicModalOpen,
   onSelectSlot,
   onMoveSelection,
   onLabelChange,
@@ -131,21 +119,6 @@ export function MacroWorkbench({
   onRetry,
   onCloseDiagnostics,
   diagnosticsOpen,
-  dynamicCapabilities,
-  dynamicText,
-  dynamicTtlSeconds,
-  dynamicKeepAfterExecute,
-  dynamicStatus,
-  dynamicProgress,
-  dynamicError,
-  dynamicClearPending,
-  onDynamicTextChange,
-  onDynamicTtlChange,
-  onDynamicKeepChange,
-  onDynamicUpload,
-  onDynamicClearRequest,
-  onDynamicClearConfirm,
-  onDynamicClearCancel,
 }: MacroWorkbenchProps) {
   const selectedState = slots.find((slot) => slot.slot === selectedSlot) ?? null;
   const dirty = Boolean(selectedState?.loaded && (selectedState.draftText !== selectedState.savedText || selectedState.draftLabel !== selectedState.savedLabel));
@@ -188,6 +161,8 @@ export function MacroWorkbench({
         onLock={onLock}
         onSwitchDevice={onSwitchDevice}
         onDisconnect={onDisconnect}
+        onDynamicOpen={onDynamicOpen}
+        dynamicModalOpen={dynamicModalOpen}
         disabled={busy}
       />
 
@@ -195,25 +170,6 @@ export function MacroWorkbench({
         {errorMessage ? <div className="mx-10 mt-3 flex shrink-0 items-center justify-between gap-4 rounded-xl border border-danger bg-danger-soft px-4 py-3 text-sm text-danger" role="alert"><span>{errorMessage}</span><button type="button" onClick={onRetry} disabled={busy} className="shrink-0 font-medium underline underline-offset-2 disabled:cursor-not-allowed disabled:opacity-50">{copy.retry}</button></div> : null}
         {isOpen ? <div className="mx-10 my-3 flex shrink-0 items-center gap-2 rounded-xl bg-warning-soft px-4 py-3 text-sm text-warning" role="status"><span className="h-2 w-2 rounded-full bg-warning" aria-hidden="true" /><span><strong className="font-semibold">{copy.unprotectedTitle}</strong>{copy.unprotectedHelp}</span></div> : null}
 
-        <DynamicMacroPanel
-          copy={copy}
-          capabilities={dynamicCapabilities}
-          text={dynamicText}
-          ttlSeconds={dynamicTtlSeconds}
-          keepAfterExecute={dynamicKeepAfterExecute}
-          status={dynamicStatus}
-          progress={dynamicProgress}
-          error={dynamicError}
-          disabled={busy}
-          clearPending={dynamicClearPending}
-          onTextChange={onDynamicTextChange}
-          onTtlChange={onDynamicTtlChange}
-          onKeepChange={onDynamicKeepChange}
-          onUpload={onDynamicUpload}
-          onClearRequest={onDynamicClearRequest}
-          onClearConfirm={onDynamicClearConfirm}
-          onClearCancel={onDynamicClearCancel}
-        />
 
         {diagnosticsOpen ? (
           <section className="mx-10 mt-3 shrink-0 rounded-2xl border border-line bg-surface p-5" aria-labelledby="diagnostics-heading">
