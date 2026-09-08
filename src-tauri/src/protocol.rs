@@ -13,6 +13,24 @@ pub const PASSWORD_SET_LENGTH: usize = 52;
 pub const AUTH_INFO_LENGTH: usize = 22;
 pub const AUTH_CHALLENGE_LENGTH: usize = NONCE_SIZE;
 pub const AUTH_PROVE_LENGTH: usize = 16;
+pub const DYNAMIC_CAPABILITIES_LENGTH: usize = 22;
+pub const DYNAMIC_DEFAULT_TTL_SECONDS: u32 = 300;
+pub const DYNAMIC_MIN_TTL_SECONDS: u32 = 1;
+pub const DYNAMIC_MAX_TTL_SECONDS: u32 = 86_400;
+pub const DYNAMIC_TRANSACTION_TIMEOUT_SECONDS: u32 = 30;
+pub const DYNAMIC_BEGIN_FLAG_KEEP_AFTER_EXECUTE: u8 = 1 << 0;
+pub const DYNAMIC_BEGIN_KNOWN_FLAGS: u8 = DYNAMIC_BEGIN_FLAG_KEEP_AFTER_EXECUTE;
+pub const DYNAMIC_LIFECYCLE_CLEAR_ON_BOOT: u16 = 1 << 0;
+pub const DYNAMIC_LIFECYCLE_CLEAR_ON_TTL_EXPIRY: u16 = 1 << 1;
+pub const DYNAMIC_LIFECYCLE_CLEAR_ON_EXECUTION_ACCEPT: u16 = 1 << 2;
+pub const DYNAMIC_LIFECYCLE_CLEAR_ON_USB_DISCONNECT: u16 = 1 << 3;
+pub const DYNAMIC_LIFECYCLE_CLEAR_ON_BLE_PROFILE_CHANGE: u16 = 1 << 4;
+pub const DYNAMIC_LIFECYCLE_CLEAR_ON_SELECTED_ENDPOINT_CHANGE: u16 = 1 << 5;
+pub const DYNAMIC_LIFECYCLE_SUPPORTS_KEEP_AFTER_EXECUTE: u16 = 1 << 6;
+pub const DYNAMIC_LIFECYCLE_KNOWN_MASK: u16 = 0x007f;
+pub const DYNAMIC_LIFECYCLE_REQUIRED_MASK: u16 = DYNAMIC_LIFECYCLE_CLEAR_ON_BOOT
+    | DYNAMIC_LIFECYCLE_CLEAR_ON_TTL_EXPIRY
+    | DYNAMIC_LIFECYCLE_CLEAR_ON_EXECUTION_ACCEPT;
 pub const PASSWORD_CONFIGURED_FLAG: u8 = 1 << 0;
 pub const SESSION_AUTHENTICATED_FLAG: u8 = 1 << 1;
 
@@ -60,6 +78,10 @@ pub enum Opcode {
     AuthProve = 0x12,
     PasswordSet = 0x13,
     Lock = 0x14,
+    DynamicBegin = 0x20,
+    DynamicData = 0x21,
+    DynamicClear = 0x22,
+    Capabilities = 0x23,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -76,6 +98,10 @@ impl TryFrom<u8> for Opcode {
             0x12 => Ok(Self::AuthProve),
             0x13 => Ok(Self::PasswordSet),
             0x14 => Ok(Self::Lock),
+            0x20 => Ok(Self::DynamicBegin),
+            0x21 => Ok(Self::DynamicData),
+            0x22 => Ok(Self::DynamicClear),
+            0x23 => Ok(Self::Capabilities),
             value => Err(ProtocolError::UnknownOpcode(value)),
         }
     }
@@ -148,12 +174,59 @@ impl AuthInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicCapabilities {
+    pub capability_version: u8,
+    pub dynamic_object_count: u8,
+    pub lifecycle_flags: u16,
+    pub max_dynamic_length: u16,
+    pub default_ttl_seconds: u32,
+    pub min_ttl_seconds: u32,
+    pub max_ttl_seconds: u32,
+    pub transaction_timeout_seconds: u32,
+}
+
+impl DynamicCapabilities {
+    pub fn supports_keep_after_execute(&self) -> bool {
+        self.lifecycle_flags & DYNAMIC_LIFECYCLE_SUPPORTS_KEEP_AFTER_EXECUTE != 0
+    }
+
+    pub fn clear_on_usb_disconnect(&self) -> bool {
+        self.lifecycle_flags & DYNAMIC_LIFECYCLE_CLEAR_ON_USB_DISCONNECT != 0
+    }
+
+    pub fn clear_on_ble_profile_change(&self) -> bool {
+        self.lifecycle_flags & DYNAMIC_LIFECYCLE_CLEAR_ON_BLE_PROFILE_CHANGE != 0
+    }
+
+    pub fn clear_on_selected_endpoint_change(&self) -> bool {
+        self.lifecycle_flags & DYNAMIC_LIFECYCLE_CLEAR_ON_SELECTED_ENDPOINT_CHANGE != 0
+    }
+}
+
 pub fn read_u16(frame: &Frame, offset: usize) -> u16 {
     u16::from_le_bytes([frame[offset], frame[offset + 1]])
 }
 
 fn write_u16(frame: &mut Frame, offset: usize, value: u16) {
     frame[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn valid_dynamic_begin_payload(payload: &[u8]) -> bool {
+    match payload.len() {
+        0 => true,
+        1 => payload[0] & !DYNAMIC_BEGIN_KNOWN_FLAGS == 0,
+        4 => {
+            let ttl = u32::from_le_bytes(payload.try_into().expect("length checked"));
+            (DYNAMIC_MIN_TTL_SECONDS..=DYNAMIC_MAX_TTL_SECONDS).contains(&ttl)
+        }
+        5 => {
+            let ttl = u32::from_le_bytes(payload[..4].try_into().expect("length checked"));
+            (DYNAMIC_MIN_TTL_SECONDS..=DYNAMIC_MAX_TTL_SECONDS).contains(&ttl)
+                && payload[4] & !DYNAMIC_BEGIN_KNOWN_FLAGS == 0
+        }
+        _ => false,
+    }
 }
 
 /// Build a canonical v2 request. The frame starts zero-filled, including all
@@ -229,6 +302,34 @@ pub fn build_frame(
                 operation: opcode.name(),
             });
         }
+        Opcode::DynamicBegin
+            if slot != LIST_SLOT
+                || offset != 0
+                || !(1..=MAX_TEXT_LENGTH as u16).contains(&total_length)
+                || !valid_dynamic_begin_payload(payload) =>
+        {
+            return Err(ProtocolError::InvalidRequest {
+                operation: opcode.name(),
+            });
+        }
+        Opcode::DynamicData
+            if slot != LIST_SLOT
+                || !(1..=MAX_TEXT_LENGTH as u16).contains(&total_length)
+                || offset > total_length
+                || payload.is_empty()
+                || payload.len() > (total_length - offset) as usize =>
+        {
+            return Err(ProtocolError::InvalidRequest {
+                operation: opcode.name(),
+            });
+        }
+        Opcode::DynamicClear | Opcode::Capabilities
+            if slot != LIST_SLOT || !payload.is_empty() || offset != 0 || total_length != 0 =>
+        {
+            return Err(ProtocolError::InvalidRequest {
+                operation: opcode.name(),
+            });
+        }
         _ => {}
     }
 
@@ -258,6 +359,10 @@ impl Opcode {
             Self::AuthProve => "AUTH_PROVE",
             Self::PasswordSet => "PASSWORD_SET",
             Self::Lock => "LOCK",
+            Self::DynamicBegin => "DYNAMIC_BEGIN",
+            Self::DynamicData => "DYNAMIC_DATA",
+            Self::DynamicClear => "DYNAMIC_CLEAR",
+            Self::Capabilities => "CAPABILITIES",
         }
     }
 }
@@ -303,6 +408,130 @@ pub(crate) fn build_password_set_chunk(
 
 pub fn build_lock_request(request_id: u8) -> Result<Frame, ProtocolError> {
     build_frame(Opcode::Lock, request_id, AUTH_SLOT, &[], 0, 0)
+}
+
+pub fn build_capabilities_request(request_id: u8) -> Result<Frame, ProtocolError> {
+    build_frame(Opcode::Capabilities, request_id, LIST_SLOT, &[], 0, 0)
+}
+
+pub fn build_dynamic_begin_request(
+    request_id: u8,
+    total_length: usize,
+    ttl_seconds: Option<u32>,
+    keep_after_execute: bool,
+) -> Result<Frame, ProtocolError> {
+    let total_length = u16::try_from(total_length).map_err(|_| ProtocolError::InvalidRequest {
+        operation: "DYNAMIC_BEGIN",
+    })?;
+    let mut payload = [0u8; 5];
+    let payload_length = match (ttl_seconds, keep_after_execute) {
+        (None, false) => 0,
+        (None, true) => {
+            payload[0] = DYNAMIC_BEGIN_FLAG_KEEP_AFTER_EXECUTE;
+            1
+        }
+        (Some(ttl), false) => {
+            if !(DYNAMIC_MIN_TTL_SECONDS..=DYNAMIC_MAX_TTL_SECONDS).contains(&ttl) {
+                return Err(ProtocolError::InvalidRequest {
+                    operation: "DYNAMIC_BEGIN",
+                });
+            }
+            payload[..4].copy_from_slice(&ttl.to_le_bytes());
+            4
+        }
+        (Some(ttl), true) => {
+            if !(DYNAMIC_MIN_TTL_SECONDS..=DYNAMIC_MAX_TTL_SECONDS).contains(&ttl) {
+                return Err(ProtocolError::InvalidRequest {
+                    operation: "DYNAMIC_BEGIN",
+                });
+            }
+            payload[..4].copy_from_slice(&ttl.to_le_bytes());
+            payload[4] = DYNAMIC_BEGIN_FLAG_KEEP_AFTER_EXECUTE;
+            5
+        }
+    };
+    build_frame(
+        Opcode::DynamicBegin,
+        request_id,
+        LIST_SLOT,
+        &payload[..payload_length],
+        0,
+        total_length,
+    )
+}
+
+pub fn build_dynamic_data_request(
+    request_id: u8,
+    offset: usize,
+    total_length: usize,
+    payload: &[u8],
+) -> Result<Frame, ProtocolError> {
+    let offset = u16::try_from(offset).map_err(|_| ProtocolError::InvalidRequest {
+        operation: "DYNAMIC_DATA",
+    })?;
+    let total_length = u16::try_from(total_length).map_err(|_| ProtocolError::InvalidRequest {
+        operation: "DYNAMIC_DATA",
+    })?;
+    build_frame(
+        Opcode::DynamicData,
+        request_id,
+        LIST_SLOT,
+        payload,
+        offset,
+        total_length,
+    )
+}
+
+pub fn build_dynamic_clear_request(request_id: u8) -> Result<Frame, ProtocolError> {
+    build_frame(Opcode::DynamicClear, request_id, LIST_SLOT, &[], 0, 0)
+}
+
+/// Parse the fixed capability metadata response after common response identity,
+/// status, and padding validation has completed.
+pub fn parse_dynamic_capabilities_response(
+    response: &Frame,
+) -> Result<DynamicCapabilities, ProtocolError> {
+    if response[VERSION_OFFSET] != VERSION
+        || response[OPCODE_OFFSET] != Opcode::Capabilities as u8
+        || response[SLOT_OFFSET] != LIST_SLOT
+        || Status::try_from(response[STATUS_OFFSET])? != Status::Ok
+        || response[PAYLOAD_LENGTH_OFFSET] as usize != DYNAMIC_CAPABILITIES_LENGTH
+        || read_u16(response, OFFSET_OFFSET) != 0
+        || read_u16(response, TOTAL_LENGTH_OFFSET) != DYNAMIC_CAPABILITIES_LENGTH as u16
+        || response[PAYLOAD_OFFSET + DYNAMIC_CAPABILITIES_LENGTH..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(ProtocolError::InvalidDynamicCapabilities);
+    }
+
+    let payload = &response[PAYLOAD_OFFSET..PAYLOAD_OFFSET + DYNAMIC_CAPABILITIES_LENGTH];
+    let lifecycle_flags = u16::from_le_bytes([payload[2], payload[3]]);
+    let capabilities = DynamicCapabilities {
+        capability_version: payload[0],
+        dynamic_object_count: payload[1],
+        lifecycle_flags,
+        max_dynamic_length: u16::from_le_bytes([payload[4], payload[5]]),
+        default_ttl_seconds: u32::from_le_bytes(payload[6..10].try_into().expect("fixed field")),
+        min_ttl_seconds: u32::from_le_bytes(payload[10..14].try_into().expect("fixed field")),
+        max_ttl_seconds: u32::from_le_bytes(payload[14..18].try_into().expect("fixed field")),
+        transaction_timeout_seconds: u32::from_le_bytes(
+            payload[18..22].try_into().expect("fixed field"),
+        ),
+    };
+    if capabilities.capability_version != 1
+        || capabilities.dynamic_object_count != 1
+        || lifecycle_flags & !DYNAMIC_LIFECYCLE_KNOWN_MASK != 0
+        || lifecycle_flags & DYNAMIC_LIFECYCLE_REQUIRED_MASK != DYNAMIC_LIFECYCLE_REQUIRED_MASK
+        || capabilities.max_dynamic_length != MAX_TEXT_LENGTH as u16
+        || capabilities.default_ttl_seconds != DYNAMIC_DEFAULT_TTL_SECONDS
+        || capabilities.min_ttl_seconds != DYNAMIC_MIN_TTL_SECONDS
+        || capabilities.max_ttl_seconds != DYNAMIC_MAX_TTL_SECONDS
+        || capabilities.transaction_timeout_seconds != DYNAMIC_TRANSACTION_TIMEOUT_SECONDS
+    {
+        return Err(ProtocolError::InvalidDynamicCapabilities);
+    }
+    Ok(capabilities)
 }
 
 /// Parse and validate the common request invariants before dispatching an
@@ -412,6 +641,44 @@ pub fn validate_request(frame: &Frame) -> Result<Opcode, ProtocolError> {
                 || payload_length > (total - offset) as usize
             {
                 return Err(ProtocolError::InvalidAuthRequest {
+                    operation: opcode.name(),
+                });
+            }
+        }
+        Opcode::DynamicBegin => {
+            if frame[SLOT_OFFSET] != LIST_SLOT
+                || read_u16(frame, OFFSET_OFFSET) != 0
+                || !(1..=MAX_TEXT_LENGTH as u16).contains(&read_u16(frame, TOTAL_LENGTH_OFFSET))
+                || !valid_dynamic_begin_payload(
+                    &frame[PAYLOAD_OFFSET..PAYLOAD_OFFSET + payload_length],
+                )
+            {
+                return Err(ProtocolError::InvalidRequest {
+                    operation: opcode.name(),
+                });
+            }
+        }
+        Opcode::DynamicData => {
+            let offset = read_u16(frame, OFFSET_OFFSET);
+            let total = read_u16(frame, TOTAL_LENGTH_OFFSET);
+            if frame[SLOT_OFFSET] != LIST_SLOT
+                || !(1..=MAX_TEXT_LENGTH as u16).contains(&total)
+                || offset > total
+                || payload_length == 0
+                || payload_length > (total - offset) as usize
+            {
+                return Err(ProtocolError::InvalidRequest {
+                    operation: opcode.name(),
+                });
+            }
+        }
+        Opcode::DynamicClear | Opcode::Capabilities => {
+            if frame[SLOT_OFFSET] != LIST_SLOT
+                || payload_length != 0
+                || read_u16(frame, OFFSET_OFFSET) != 0
+                || read_u16(frame, TOTAL_LENGTH_OFFSET) != 0
+            {
+                return Err(ProtocolError::InvalidRequest {
                     operation: opcode.name(),
                 });
             }
@@ -706,6 +973,98 @@ mod tests {
         assert_eq!(
             validate_request(&build_lock_request(6).unwrap()),
             Ok(Opcode::Lock)
+        );
+    }
+
+    #[test]
+    fn dynamic_requests_use_canonical_wire_shapes_and_payload_combinations() {
+        assert_eq!(Opcode::try_from(0x20), Ok(Opcode::DynamicBegin));
+        assert_eq!(Opcode::try_from(0x21), Ok(Opcode::DynamicData));
+        assert_eq!(Opcode::try_from(0x22), Ok(Opcode::DynamicClear));
+        assert_eq!(Opcode::try_from(0x23), Ok(Opcode::Capabilities));
+
+        let capabilities = build_capabilities_request(1).unwrap();
+        assert_eq!(validate_request(&capabilities), Ok(Opcode::Capabilities));
+        assert!(capabilities[PAYLOAD_OFFSET..].iter().all(|byte| *byte == 0));
+
+        for (ttl, keep, expected_length) in [
+            (None, false, 0),
+            (None, true, 1),
+            (Some(600), false, 4),
+            (Some(600), true, 5),
+        ] {
+            let begin = build_dynamic_begin_request(2, 23, ttl, keep).unwrap();
+            assert_eq!(validate_request(&begin), Ok(Opcode::DynamicBegin));
+            assert_eq!(begin[PAYLOAD_LENGTH_OFFSET] as usize, expected_length);
+            assert!(begin[PAYLOAD_OFFSET + expected_length..]
+                .iter()
+                .all(|byte| *byte == 0));
+            assert_eq!(read_u16(&begin, TOTAL_LENGTH_OFFSET), 23);
+        }
+
+        let data = build_dynamic_data_request(2, 22, 23, b"x").unwrap();
+        assert_eq!(validate_request(&data), Ok(Opcode::DynamicData));
+        let clear = build_dynamic_clear_request(3).unwrap();
+        assert_eq!(validate_request(&clear), Ok(Opcode::DynamicClear));
+        assert!(build_dynamic_begin_request(2, 0, None, false).is_err());
+        assert!(build_dynamic_begin_request(2, 1, Some(0), false).is_err());
+        assert!(build_dynamic_begin_request(2, 1, Some(86_401), false).is_err());
+        assert!(build_frame(Opcode::DynamicBegin, 2, LIST_SLOT, &[2], 0, 1).is_err());
+    }
+
+    #[test]
+    fn dynamic_capability_parser_rejects_reserved_and_noncanonical_metadata() {
+        let request = build_capabilities_request(7).unwrap();
+        let mut response = response_for(&request, Status::Ok as u8);
+        response[PAYLOAD_LENGTH_OFFSET] = DYNAMIC_CAPABILITIES_LENGTH as u8;
+        response[TOTAL_LENGTH_OFFSET..TOTAL_LENGTH_OFFSET + 2]
+            .copy_from_slice(&(DYNAMIC_CAPABILITIES_LENGTH as u16).to_le_bytes());
+        response[PAYLOAD_OFFSET] = 1;
+        response[PAYLOAD_OFFSET + 1] = 1;
+        response[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4].copy_from_slice(&0x004f_u16.to_le_bytes());
+        response[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 6]
+            .copy_from_slice(&(MAX_TEXT_LENGTH as u16).to_le_bytes());
+        response[PAYLOAD_OFFSET + 6..PAYLOAD_OFFSET + 10]
+            .copy_from_slice(&DYNAMIC_DEFAULT_TTL_SECONDS.to_le_bytes());
+        response[PAYLOAD_OFFSET + 10..PAYLOAD_OFFSET + 14]
+            .copy_from_slice(&DYNAMIC_MIN_TTL_SECONDS.to_le_bytes());
+        response[PAYLOAD_OFFSET + 14..PAYLOAD_OFFSET + 18]
+            .copy_from_slice(&DYNAMIC_MAX_TTL_SECONDS.to_le_bytes());
+        response[PAYLOAD_OFFSET + 18..PAYLOAD_OFFSET + 22]
+            .copy_from_slice(&DYNAMIC_TRANSACTION_TIMEOUT_SECONDS.to_le_bytes());
+        assert_eq!(
+            parse_dynamic_capabilities_response(&response).unwrap(),
+            DynamicCapabilities {
+                capability_version: 1,
+                dynamic_object_count: 1,
+                lifecycle_flags: 0x004f,
+                max_dynamic_length: 256,
+                default_ttl_seconds: 300,
+                min_ttl_seconds: 1,
+                max_ttl_seconds: 86_400,
+                transaction_timeout_seconds: 30,
+            }
+        );
+
+        for (offset, value) in [(PAYLOAD_OFFSET, 2), (PAYLOAD_OFFSET + 1, 2)] {
+            let mut malformed = response;
+            malformed[offset] = value;
+            assert_eq!(
+                parse_dynamic_capabilities_response(&malformed),
+                Err(ProtocolError::InvalidDynamicCapabilities)
+            );
+        }
+        let mut reserved = response;
+        reserved[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4].copy_from_slice(&0x008f_u16.to_le_bytes());
+        assert_eq!(
+            parse_dynamic_capabilities_response(&reserved),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+        let mut bad_length = response;
+        bad_length[PAYLOAD_LENGTH_OFFSET] = (DYNAMIC_CAPABILITIES_LENGTH - 1) as u8;
+        assert_eq!(
+            parse_dynamic_capabilities_response(&bad_length),
+            Err(ProtocolError::InvalidDynamicCapabilities)
         );
     }
 

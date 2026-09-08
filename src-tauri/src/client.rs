@@ -5,12 +5,15 @@ use zeroize::Zeroizing;
 use crate::auth::{AuthSession, Credential, SALT_SIZE};
 use crate::error::{ClientError, ProtocolError, TransportError};
 use crate::protocol::{
-    build_auth_challenge_request, build_auth_info_request, build_auth_prove_request, build_frame,
-    build_lock_request, build_password_set_chunk, normalize_response,
-    parse_auth_challenge_response, parse_auth_info_response, read_u16, response_identity_matches,
-    validate_empty_success, validate_response, validate_text, AuthInfo, Frame, Opcode, Status,
-    LIST_SLOT, MAX_TEXT_LENGTH, OFFSET_OFFSET, OPCODE_OFFSET, PASSWORD_SET_LENGTH,
-    PAYLOAD_LENGTH_OFFSET, PAYLOAD_OFFSET, PAYLOAD_SIZE, STATUS_OFFSET, TOTAL_LENGTH_OFFSET,
+    build_auth_challenge_request, build_auth_info_request, build_auth_prove_request,
+    build_capabilities_request, build_dynamic_begin_request, build_dynamic_clear_request,
+    build_dynamic_data_request, build_frame, build_lock_request, build_password_set_chunk,
+    normalize_response, parse_auth_challenge_response, parse_auth_info_response,
+    parse_dynamic_capabilities_response, read_u16, response_identity_matches,
+    validate_empty_success, validate_response, validate_text, AuthInfo, DynamicCapabilities, Frame,
+    Opcode, Status, DYNAMIC_MAX_TTL_SECONDS, DYNAMIC_MIN_TTL_SECONDS, LIST_SLOT, MAX_TEXT_LENGTH,
+    OFFSET_OFFSET, OPCODE_OFFSET, PASSWORD_SET_LENGTH, PAYLOAD_LENGTH_OFFSET, PAYLOAD_OFFSET,
+    PAYLOAD_SIZE, STATUS_OFFSET, TOTAL_LENGTH_OFFSET,
 };
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
@@ -76,6 +79,11 @@ pub struct RuntimeMacroClient<T> {
     retries: usize,
     next_request_id: u8,
     auth_session: AuthSession,
+}
+
+enum DynamicUploadAttemptError {
+    Begin(ClientError),
+    Data(ClientError),
 }
 
 impl<T: Transport> RuntimeMacroClient<T> {
@@ -154,6 +162,7 @@ impl<T: Transport> RuntimeMacroClient<T> {
 
     fn call(&mut self, request: &Frame) -> Result<Frame, ClientError> {
         let response = self.exchange(request)?;
+        let dynamic_request = is_dynamic_opcode(request[OPCODE_OFFSET]);
         let status = match validate_response(request, &response) {
             Ok(status) => status,
             // Older firmware commonly echoes its own v1 response version when
@@ -174,20 +183,39 @@ impl<T: Transport> RuntimeMacroClient<T> {
                 self.auth_session.clear_session();
                 return Err(ClientError::Remote(Status::BadVersion));
             }
+            Err(ProtocolError::ResponseFieldMismatch {
+                field: "version",
+                actual: 1,
+                ..
+            }) if dynamic_request
+                && response[STATUS_OFFSET] == Status::BadVersion as u8
+                && response[PAYLOAD_LENGTH_OFFSET] == 0
+                && read_u16(&response, OFFSET_OFFSET) == 0
+                && read_u16(&response, TOTAL_LENGTH_OFFSET) == 0
+                && response[PAYLOAD_OFFSET..].iter().all(|byte| *byte == 0) =>
+            {
+                return Err(ClientError::Remote(Status::BadVersion));
+            }
             Err(error) => return Err(error.into()),
         };
 
         match status {
             Status::Ok => Ok(response),
             status => {
-                if matches!(
-                    status,
-                    Status::AuthRequired
-                        | Status::AuthFailed
-                        | Status::AuthNotConfigured
-                        | Status::RateLimited
-                        | Status::AuthNoChallenge
-                ) {
+                // Dynamic commands intentionally live outside the static
+                // authentication gate. An auth status on that branch is a
+                // firmware/protocol mismatch, not evidence that the static
+                // session expired, so preserve the existing auth observation.
+                if !dynamic_request
+                    && matches!(
+                        status,
+                        Status::AuthRequired
+                            | Status::AuthFailed
+                            | Status::AuthNotConfigured
+                            | Status::RateLimited
+                            | Status::AuthNoChallenge
+                    )
+                {
                     self.auth_session.clear_session();
                 }
                 Err(ClientError::Remote(status))
@@ -424,6 +452,167 @@ impl<T: Transport> RuntimeMacroClient<T> {
         self.auth_session.clear_session();
         let response = response?;
         validate_empty_success(&response, "LOCK")?;
+        Ok(())
+    }
+
+    /// Discover and strictly validate the dynamic capability metadata. This
+    /// method never observes, refreshes, or gates the static auth session.
+    pub fn dynamic_capabilities(&mut self) -> Result<DynamicCapabilities, ClientError> {
+        let response = self.call_with_transport_retry(|request_id| {
+            build_capabilities_request(request_id).map_err(ClientError::from)
+        })?;
+        Ok(parse_dynamic_capabilities_response(&response)?)
+    }
+
+    fn validate_dynamic_input(data: &[u8], ttl_seconds: Option<u32>) -> Result<(), ClientError> {
+        if data.is_empty() {
+            return Err(ClientError::EmptyDynamicText);
+        }
+        if data.len() > MAX_TEXT_LENGTH {
+            return Err(ClientError::LengthExceeded {
+                length: data.len(),
+                maximum: MAX_TEXT_LENGTH,
+            });
+        }
+        validate_text(data)?;
+        if let Some(ttl) = ttl_seconds {
+            if !(DYNAMIC_MIN_TTL_SECONDS..=DYNAMIC_MAX_TTL_SECONDS).contains(&ttl) {
+                return Err(ClientError::InvalidDynamicTtl { value: ttl });
+            }
+        }
+        Ok(())
+    }
+
+    fn upload_dynamic_once(
+        &mut self,
+        data: &[u8],
+        ttl_seconds: Option<u32>,
+        keep_after_execute: bool,
+        request_id: u8,
+    ) -> Result<(), DynamicUploadAttemptError> {
+        let begin =
+            build_dynamic_begin_request(request_id, data.len(), ttl_seconds, keep_after_execute)
+                .map_err(|error| DynamicUploadAttemptError::Begin(error.into()))?;
+        let response = self
+            .call(&begin)
+            .map_err(DynamicUploadAttemptError::Begin)?;
+        Self::validate_dynamic_chunk_ack(&response, "DYNAMIC_BEGIN", 0, data.len() as u16)
+            .map_err(DynamicUploadAttemptError::Begin)?;
+
+        for offset in (0..data.len()).step_by(PAYLOAD_SIZE) {
+            let end = (offset + PAYLOAD_SIZE).min(data.len());
+            let request =
+                build_dynamic_data_request(request_id, offset, data.len(), &data[offset..end])
+                    .map_err(|error| DynamicUploadAttemptError::Data(error.into()))?;
+            let response = self
+                .call(&request)
+                .map_err(DynamicUploadAttemptError::Data)?;
+            Self::validate_dynamic_chunk_ack(
+                &response,
+                "DYNAMIC_DATA",
+                end as u16,
+                data.len() as u16,
+            )
+            .map_err(DynamicUploadAttemptError::Data)?;
+        }
+        Ok(())
+    }
+
+    fn validate_dynamic_chunk_ack(
+        response: &Frame,
+        operation: &'static str,
+        expected_offset: u16,
+        expected_total: u16,
+    ) -> Result<(), ClientError> {
+        if response[PAYLOAD_LENGTH_OFFSET] != 0 {
+            return Err(ProtocolError::UnexpectedResponsePayload { operation }.into());
+        }
+        let actual_offset = read_u16(response, OFFSET_OFFSET);
+        if actual_offset != expected_offset {
+            return Err(ProtocolError::DynamicAckOffset {
+                operation,
+                expected: expected_offset,
+                actual: actual_offset,
+            }
+            .into());
+        }
+        let actual_total = read_u16(response, TOTAL_LENGTH_OFFSET);
+        if actual_total != expected_total {
+            return Err(ProtocolError::DynamicAckTotal {
+                operation,
+                expected: expected_total,
+                actual: actual_total,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Upload one dynamic object atomically. Every retry starts with a fresh
+    /// request ID and a new BEGIN; no DATA is ever replayed in isolation.
+    pub fn upload_dynamic(
+        &mut self,
+        data: &[u8],
+        ttl_seconds: Option<u32>,
+        keep_after_execute: bool,
+    ) -> Result<(), ClientError> {
+        // This validation deliberately precedes capability discovery, and
+        // therefore precedes every HID write.
+        Self::validate_dynamic_input(data, ttl_seconds)?;
+        let capabilities = self.dynamic_capabilities()?;
+        if data.len() > capabilities.max_dynamic_length as usize {
+            return Err(ClientError::LengthExceeded {
+                length: data.len(),
+                maximum: capabilities.max_dynamic_length as usize,
+            });
+        }
+        if let Some(ttl) = ttl_seconds {
+            if !(capabilities.min_ttl_seconds..=capabilities.max_ttl_seconds).contains(&ttl) {
+                return Err(ClientError::InvalidDynamicTtl { value: ttl });
+            }
+        }
+        if keep_after_execute && !capabilities.supports_keep_after_execute() {
+            return Err(ClientError::DynamicKeepAfterExecuteUnsupported);
+        }
+
+        let mut last_error = None;
+        for _ in 0..=self.retries {
+            let request_id = self.take_request_id();
+            match self.upload_dynamic_once(data, ttl_seconds, keep_after_execute, request_id) {
+                Ok(()) => return Ok(()),
+                Err(DynamicUploadAttemptError::Begin(error)) => {
+                    if matches!(&error, ClientError::Transport(transport) if transport.is_retryable())
+                    {
+                        last_error = Some(error);
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(DynamicUploadAttemptError::Data(error)) => {
+                    if matches!(&error, ClientError::Transport(transport) if transport.is_retryable())
+                        || matches!(
+                            &error,
+                            ClientError::Remote(Status::BadRequest | Status::BadOffset)
+                        )
+                    {
+                        last_error = Some(error);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("at least one dynamic upload attempt is always made"))
+    }
+
+    /// Clear the dynamic object after capability discovery. CLEAR is canonical
+    /// and idempotent, so transport failures may use a fresh request ID.
+    pub fn clear_dynamic(&mut self) -> Result<(), ClientError> {
+        self.dynamic_capabilities()?;
+        let response = self.call_with_transport_retry(|request_id| {
+            build_dynamic_clear_request(request_id).map_err(ClientError::from)
+        })?;
+        validate_empty_success(&response, "DYNAMIC_CLEAR")?;
         Ok(())
     }
 
@@ -664,6 +853,16 @@ impl<T: Transport> RuntimeMacroClient<T> {
     }
 }
 
+fn is_dynamic_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        value if value == Opcode::DynamicBegin as u8
+            || value == Opcode::DynamicData as u8
+            || value == Opcode::DynamicClear as u8
+            || value == Opcode::Capabilities as u8
+    )
+}
+
 fn validate_slot(slot: u8) -> Result<(), ClientError> {
     if slot == LIST_SLOT {
         Err(ClientError::InvalidSlot(slot))
@@ -805,6 +1004,323 @@ mod tests {
             0,
             crate::protocol::AUTH_CHALLENGE_LENGTH as u16,
         ))]
+    }
+
+    fn dynamic_capabilities_ok(request: &Frame, flags: u16) -> Vec<ReadResult> {
+        let mut payload = [0u8; crate::protocol::DYNAMIC_CAPABILITIES_LENGTH];
+        payload[0] = 1;
+        payload[1] = 1;
+        payload[2..4].copy_from_slice(&flags.to_le_bytes());
+        payload[4..6].copy_from_slice(&(MAX_TEXT_LENGTH as u16).to_le_bytes());
+        payload[6..10].copy_from_slice(&300_u32.to_le_bytes());
+        payload[10..14].copy_from_slice(&1_u32.to_le_bytes());
+        payload[14..18].copy_from_slice(&86_400_u32.to_le_bytes());
+        payload[18..22].copy_from_slice(&30_u32.to_le_bytes());
+        vec![Ok(FakeTransport::response(
+            request,
+            Status::Ok,
+            &payload,
+            0,
+            crate::protocol::DYNAMIC_CAPABILITIES_LENGTH as u16,
+        ))]
+    }
+
+    #[test]
+    fn dynamic_capabilities_are_strictly_validated() {
+        let mut client = client_with_handler(
+            |request| {
+                assert_eq!(request[OPCODE_OFFSET], Opcode::Capabilities as u8);
+                assert_eq!(request[SLOT_OFFSET], LIST_SLOT);
+                assert_eq!(request[PAYLOAD_LENGTH_OFFSET], 0);
+                dynamic_capabilities_ok(request, 0x004f)
+            },
+            0,
+        );
+        let capabilities = client.dynamic_capabilities().unwrap();
+        assert_eq!(capabilities.lifecycle_flags, 0x004f);
+        assert!(capabilities.supports_keep_after_execute());
+        assert_eq!(client.transport_mut().writes.len(), 1);
+
+        let mut malformed = client_with_handler(
+            |request| {
+                let mut response = dynamic_capabilities_ok(request, 0x004f)
+                    .pop()
+                    .unwrap()
+                    .unwrap();
+                response[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4]
+                    .copy_from_slice(&0x008f_u16.to_le_bytes());
+                vec![Ok(response)]
+            },
+            3,
+        );
+        assert!(matches!(
+            malformed.dynamic_capabilities(),
+            Err(ClientError::Protocol(
+                ProtocolError::InvalidDynamicCapabilities
+            ))
+        ));
+        assert_eq!(malformed.transport_mut().writes.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_bad_version_is_reported_as_unsupported_without_auth_reset() {
+        let mut client = client_with_handler(
+            |request| {
+                let mut response = FakeTransport::response(request, Status::BadVersion, &[], 0, 0);
+                response[VERSION_OFFSET] = 1;
+                vec![Ok(response)]
+            },
+            0,
+        );
+        client.auth_session.install_authenticated();
+        assert_eq!(
+            client.dynamic_capabilities(),
+            Err(ClientError::Remote(Status::BadVersion))
+        );
+        assert!(client.is_authenticated());
+    }
+
+    #[test]
+    fn dynamic_input_is_rejected_before_capability_write() {
+        for (data, ttl) in [
+            (Vec::new(), None),
+            (vec![0x00], None),
+            (vec![0x80], None),
+            (vec![b'x'; MAX_TEXT_LENGTH + 1], None),
+            (vec![b'x'], Some(0)),
+            (vec![b'x'], Some(86_401)),
+        ] {
+            let mut client = client_with_handler(|_| Vec::new(), 0);
+            assert!(client.upload_dynamic(&data, ttl, false).is_err());
+            assert!(client.transport_mut().writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn dynamic_begin_payload_variants_and_chunk_ids_follow_contract() {
+        for (ttl, keep, expected_payload_length) in [
+            (None, false, 0usize),
+            (Some(600), false, 4usize),
+            (None, true, 1usize),
+            (Some(600), true, 5usize),
+        ] {
+            let mut client = client_with_handler(
+                |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                    Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                    Opcode::DynamicBegin | Opcode::DynamicData => {
+                        let offset = read_u16(request, OFFSET_OFFSET);
+                        let length = request[PAYLOAD_LENGTH_OFFSET] as u16;
+                        vec![ok_response(
+                            request,
+                            if request[OPCODE_OFFSET] == Opcode::DynamicBegin as u8 {
+                                0
+                            } else {
+                                offset + length
+                            },
+                            read_u16(request, TOTAL_LENGTH_OFFSET),
+                        )]
+                    }
+                    opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+                },
+                0,
+            );
+            client.upload_dynamic(b"xy", ttl, keep).unwrap();
+            let writes = &client.transport_mut().writes;
+            assert_eq!(writes.len(), 3);
+            assert_eq!(writes[1][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+            assert_eq!(
+                writes[1][PAYLOAD_LENGTH_OFFSET] as usize,
+                expected_payload_length
+            );
+            assert_eq!(writes[2][OPCODE_OFFSET], Opcode::DynamicData as u8);
+            assert_eq!(writes[1][REQUEST_ID_OFFSET], writes[2][REQUEST_ID_OFFSET]);
+            assert!(writes.iter().all(|frame| {
+                frame[PAYLOAD_OFFSET + frame[PAYLOAD_LENGTH_OFFSET] as usize..]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            }));
+        }
+    }
+
+    #[test]
+    fn dynamic_keep_is_rejected_before_begin_when_capability_bit_is_absent() {
+        let mut client = client_with_handler(
+            |request| {
+                if request[OPCODE_OFFSET] == Opcode::Capabilities as u8 {
+                    dynamic_capabilities_ok(request, 0x000f)
+                } else {
+                    panic!("dynamic BEGIN must not be sent without capability support")
+                }
+            },
+            2,
+        );
+        assert_eq!(
+            client.upload_dynamic(b"x", None, true),
+            Err(ClientError::DynamicKeepAfterExecuteUnsupported)
+        );
+        assert_eq!(client.transport_mut().writes.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_begin_bad_request_and_offset_fail_without_retry() {
+        for failure in [Status::BadRequest, Status::BadOffset] {
+            let mut client = client_with_handler(
+                move |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                    Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                    Opcode::DynamicBegin => {
+                        vec![Ok(FakeTransport::response(request, failure, &[], 0, 0))]
+                    }
+                    opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+                },
+                3,
+            );
+            assert_eq!(
+                client.upload_dynamic(b"xy", None, false),
+                Err(ClientError::Remote(failure))
+            );
+            let writes = &client.transport_mut().writes;
+            assert_eq!(writes.len(), 2);
+            assert_eq!(writes[1][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+        }
+    }
+
+    #[test]
+    fn dynamic_upload_restarts_from_begin_with_new_id_after_data_failures() {
+        for failure in [Status::BadRequest, Status::BadOffset] {
+            let mut calls = 0;
+            let mut client = client_with_handler(
+                move |request| {
+                    calls += 1;
+                    match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                        Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                        Opcode::DynamicBegin => vec![ok_response(
+                            request,
+                            0,
+                            read_u16(request, TOTAL_LENGTH_OFFSET),
+                        )],
+                        Opcode::DynamicData if calls == 3 => {
+                            vec![Ok(FakeTransport::response(request, failure, &[], 0, 0))]
+                        }
+                        Opcode::DynamicData => vec![ok_response(
+                            request,
+                            read_u16(request, OFFSET_OFFSET)
+                                + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                            read_u16(request, TOTAL_LENGTH_OFFSET),
+                        )],
+                        opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+                    }
+                },
+                1,
+            );
+            client.upload_dynamic(&[b'x'; 23], None, false).unwrap();
+            let writes = &client.transport_mut().writes;
+            assert_eq!(writes.len(), 6);
+            assert_eq!(writes[1][REQUEST_ID_OFFSET], 1);
+            assert_eq!(writes[2][REQUEST_ID_OFFSET], 1);
+            assert_eq!(writes[3][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+            assert_eq!(writes[3][REQUEST_ID_OFFSET], 2);
+            assert_eq!(read_u16(&writes[3], OFFSET_OFFSET), 0);
+        }
+    }
+
+    #[test]
+    fn dynamic_timeout_and_lost_final_ack_restart_the_complete_upload() {
+        let mut calls = 0;
+        let mut client = client_with_handler(
+            move |request| {
+                calls += 1;
+                if calls == 3 || calls == 6 {
+                    return Vec::new();
+                }
+                match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                    Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                    Opcode::DynamicBegin => vec![ok_response(
+                        request,
+                        0,
+                        read_u16(request, TOTAL_LENGTH_OFFSET),
+                    )],
+                    Opcode::DynamicData => vec![ok_response(
+                        request,
+                        read_u16(request, OFFSET_OFFSET) + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                        read_u16(request, TOTAL_LENGTH_OFFSET),
+                    )],
+                    opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+                }
+            },
+            2,
+        );
+        client.upload_dynamic(&[b'y'; 23], None, false).unwrap();
+        let writes = &client.transport_mut().writes;
+        assert_eq!(writes.len(), 9);
+        assert_eq!(writes[1][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+        assert_eq!(writes[2][OPCODE_OFFSET], Opcode::DynamicData as u8);
+        assert_eq!(writes[3][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+        assert_eq!(writes[1][REQUEST_ID_OFFSET], 1);
+        assert_eq!(writes[3][REQUEST_ID_OFFSET], 2);
+    }
+
+    #[test]
+    fn dynamic_clear_retries_with_new_request_id_and_does_not_refresh_auth() {
+        let mut calls = 0;
+        let mut client = client_with_handler(
+            move |request| {
+                calls += 1;
+                match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                    Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                    Opcode::DynamicClear if calls == 2 => Vec::new(),
+                    Opcode::DynamicClear => vec![ok_response(request, 0, 0)],
+                    opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+                }
+            },
+            1,
+        );
+        client.auth_session.install_authenticated();
+        client.clear_dynamic().unwrap();
+        assert!(client.is_authenticated());
+        assert_eq!(client.transport_mut().writes.len(), 3);
+        assert_eq!(client.transport_mut().writes[1][REQUEST_ID_OFFSET], 1);
+        assert_eq!(client.transport_mut().writes[2][REQUEST_ID_OFFSET], 2);
+    }
+
+    #[test]
+    fn matching_dynamic_malformed_ack_is_not_retried() {
+        let mut client = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                Opcode::DynamicBegin => vec![ok_response(request, 1, 1)],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            3,
+        );
+        assert!(matches!(
+            client.upload_dynamic(b"x", None, false),
+            Err(ClientError::Protocol(
+                ProtocolError::DynamicAckOffset { .. }
+            ))
+        ));
+        assert_eq!(client.transport_mut().writes.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_auth_status_does_not_clear_static_session() {
+        let mut client = client_with_handler(
+            |request| {
+                vec![Ok(FakeTransport::response(
+                    request,
+                    Status::AuthRequired,
+                    &[],
+                    0,
+                    0,
+                ))]
+            },
+            0,
+        );
+        client.auth_session.install_authenticated();
+        assert_eq!(
+            client.dynamic_capabilities(),
+            Err(ClientError::Remote(Status::AuthRequired))
+        );
+        assert!(client.is_authenticated());
     }
 
     #[test]

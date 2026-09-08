@@ -33,6 +33,24 @@ export type SlotMetadata = {
   length: number;
 };
 
+export type DynamicCapabilities = {
+  capabilityVersion: number;
+  dynamicObjectCount: number;
+  lifecycleFlags: number;
+  maxDynamicLength: number;
+  defaultTtlSeconds: number;
+  minTtlSeconds: number;
+  maxTtlSeconds: number;
+  transactionTimeoutSeconds: number;
+  clearOnBoot: boolean;
+  clearOnTtlExpiry: boolean;
+  clearOnExecutionAccept: boolean;
+  clearOnUsbDisconnect: boolean;
+  clearOnBleProfileChange: boolean;
+  clearOnSelectedEndpointChange: boolean;
+  supportsKeepAfterExecute: boolean;
+};
+
 export type ClientSettings = {
   timeoutMs: number;
   retries: number;
@@ -119,6 +137,18 @@ export function setSlot(slot: number, text: string): Promise<void> {
 
 export function clearSlot(slot: number): Promise<void> {
   return invoke("clear_slot", { slot });
+}
+
+export function getDynamicCapabilities(): Promise<DynamicCapabilities> {
+  return invoke<DynamicCapabilities>("get_dynamic_capabilities");
+}
+
+export function uploadDynamic(text: string, ttlSeconds: number | null, keepAfterExecute: boolean): Promise<void> {
+  return invoke("upload_dynamic", { text, ttlSeconds, keepAfterExecute });
+}
+
+export function clearDynamic(): Promise<void> {
+  return invoke("clear_dynamic");
 }
 
 export function getSettings(): Promise<ClientSettings> {

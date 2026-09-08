@@ -6,9 +6,11 @@ import {
   asCommandError,
   authenticate,
   clearSlot as clearSlotCommand,
+  clearDynamic as clearDynamicCommand,
   connectDevice as connectDeviceCommand,
   disconnectDevice as disconnectDeviceCommand,
   getConnection,
+  getDynamicCapabilities,
   getSettings,
   getSlot,
   listDevices,
@@ -18,12 +20,14 @@ import {
   setPassword as setPasswordCommand,
   setSettings as setSettingsCommand,
   setSlot as setSlotCommand,
+  uploadDynamic as uploadDynamicCommand,
   type AuthState,
   type ClientSettings,
   type CommandError,
   type ConnectedDevice,
   type ConnectionState,
   type DeviceCandidate,
+  type DynamicCapabilities,
   type SlotBytes,
   type SlotMetadata,
 } from "./bridge";
@@ -50,6 +54,8 @@ import type { Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
 import type { SlotAction, SlotState } from "./types/workbench";
 import { MAX_TEXT_BYTES, macroBytes, textFromTokens, tokensFromText } from "./utils/macro";
+import { validateDynamicText, validateDynamicTtl } from "./utils/dynamic";
+import type { DynamicMacroStatus } from "./components/DynamicMacroPanel";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -337,6 +343,14 @@ function App() {
   const [lastErrorCode, setLastErrorCode] = useState<string | null>(null);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   const [authRemainingSeconds, setAuthRemainingSeconds] = useState<number | null>(null);
+  const [dynamicCapabilities, setDynamicCapabilities] = useState<DynamicCapabilities | null>(null);
+  const [dynamicText, setDynamicText] = useState("");
+  const [dynamicTtlSeconds, setDynamicTtlSeconds] = useState<number | null>(null);
+  const [dynamicKeepAfterExecute, setDynamicKeepAfterExecute] = useState(false);
+  const [dynamicStatus, setDynamicStatus] = useState<DynamicMacroStatus>("unknown");
+  const [dynamicProgress, setDynamicProgress] = useState<number | null>(null);
+  const [dynamicError, setDynamicError] = useState<CommandError | null>(null);
+  const [dynamicClearConfirm, setDynamicClearConfirm] = useState(false);
 
   const mounted = useRef(false);
   const operation = useRef(0);
@@ -445,7 +459,13 @@ function App() {
       cancelPreviewLoads();
       hideRevealed();
     } else if (dropsConnection(error.code)) {
+      connectionRef.current = disconnected;
       setConnection(disconnected);
+      setDynamicCapabilities(null);
+      setDynamicStatus("unknown");
+      setDynamicError(null);
+      setDynamicProgress(null);
+      setDynamicClearConfirm(false);
       clearAuthDeadline();
       cancelPreviewLoads();
       hideRevealed();
@@ -453,6 +473,30 @@ function App() {
       missingDevicePollsRef.current = 0;
     }
   }, [cancelPreviewLoads, clearAuthDeadline, hideRevealed]);
+
+  const loadDynamicCapabilities = useCallback(async (sequence: number, preserveUnknown: boolean): Promise<boolean> => {
+    if (!connectionRef.current.connected) return false;
+    setDynamicError(null);
+    setDynamicProgress(null);
+    setDynamicStatus(preserveUnknown ? "unknown" : "discovering");
+    recordOperation("CAPABILITIES");
+    try {
+      const capabilities = await enqueueProtocolOperation(() => getDynamicCapabilities());
+      if (!mounted.current || operation.current !== sequence || !connectionRef.current.connected) return false;
+      setDynamicCapabilities(capabilities);
+      setDynamicKeepAfterExecute((current) => capabilities.supportsKeepAfterExecute ? current : false);
+      setDynamicStatus(preserveUnknown ? "unknown" : "ready");
+      return true;
+    } catch (caught) {
+      if (!mounted.current || operation.current !== sequence) return false;
+      const error = asCommandError(caught);
+      setDynamicError(error);
+      setDynamicCapabilities(null);
+      setDynamicStatus(error.code === "dynamic_unsupported" ? "unsupported" : "error");
+      if (dropsConnection(error.code)) applyErrorState(error);
+      return false;
+    }
+  }, [applyErrorState, enqueueProtocolOperation, recordOperation]);
 
   const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean): SlotState[] => {
     const nextSlots = metadata.map((item) => makeSlotState(item, nextLabels, slotsRef.current.find((slot) => slot.slot === item.slot), preserveDirty));
@@ -582,7 +626,10 @@ function App() {
         const matching = nextDevices.find((device) => deviceSummaryKey(device) === recoveryKey);
         return matching?.id ?? nextDevices[0]?.id ?? "";
       });
-      if (nextConnection.connected && canManage(nextConnection)) {
+      if (nextConnection.connected && (dynamicCapabilities === null || !priorConnected)) {
+        await loadDynamicCapabilities(sequence, preserveDirty && !priorConnected);
+      }
+      if (connectionRef.current.connected && canManage(nextConnection)) {
         if (nextConnection.authState === "authenticated" && authDeadlineRef.current === null) {
           markAuthenticatedActivity(true);
         }
@@ -592,6 +639,13 @@ function App() {
         clearAuthDeadline();
         cancelPreviewLoads();
         hideRevealed();
+      }
+      if (!nextConnection.connected) {
+        setDynamicCapabilities(null);
+        setDynamicStatus("unknown");
+        setDynamicError(null);
+        setDynamicProgress(null);
+        setDynamicClearConfirm(false);
       }
       if (!nextConnection.connected && nextDevices.length === 0) {
         setLastErrorCode("no_device");
@@ -609,7 +663,7 @@ function App() {
         setRefreshing(false);
       }
     }
-  }, [applyErrorState, cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
+  }, [applyErrorState, cancelPreviewLoads, clearAuthDeadline, commandError, dynamicCapabilities, hideRevealed, loadDynamicCapabilities, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const connectDevice = useCallback(async (id: string, automaticReconnect = false) => {
     const sequence = ++operation.current;
@@ -625,6 +679,11 @@ function App() {
     setDeviceSwitchConfirm(null);
     setSetupOpen(false);
     setPasswordModalMode(null);
+    setDynamicCapabilities(null);
+    setDynamicStatus("unknown");
+    setDynamicError(null);
+    setDynamicProgress(null);
+    setDynamicClearConfirm(false);
     setConnection(disconnected);
     hideRevealed();
     recordOperation("Connect");
@@ -633,6 +692,7 @@ function App() {
       if (!mounted.current || operation.current !== sequence) return;
       const nextKey = nextConnection.connected ? deviceSummaryKey(nextConnection.device) : null;
       const preserveDirty = nextKey !== null && nextKey === deviceKey.current;
+      const preserveDynamicUnknown = preserveDirty;
       // Do not discard drafts until the replacement connection succeeds and its
       // safe summary is known to differ from the retained device.
       if (nextConnection.connected && nextKey !== null) {
@@ -648,8 +708,11 @@ function App() {
       setLabels(nextLabels);
       setConnection(nextConnection);
       connectionRef.current = nextConnection;
+      if (nextConnection.connected) {
+        await loadDynamicCapabilities(sequence, preserveDynamicUnknown);
+      }
       markAuthenticatedActivity(nextConnection.authState === "authenticated");
-      if (canManage(nextConnection)) {
+      if (connectionRef.current.connected && canManage(nextConnection)) {
         const listed = await loadSlots(sequence, nextLabels, preserveDirty);
         if (listed && nextConnection.authState === "open") setSetupOpen(true);
       }
@@ -667,7 +730,7 @@ function App() {
         setBusy(false);
       }
     }
-  }, [cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, loadSlots, markAuthenticatedActivity, recordOperation]);
+  }, [cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, loadDynamicCapabilities, loadSlots, markAuthenticatedActivity, recordOperation]);
 
   const requestDeviceConnect = useCallback((id: string) => {
     const candidate = devices.find((item) => item.id === id);
@@ -694,6 +757,11 @@ function App() {
       if (!mounted.current || operation.current !== sequence) return;
       setConnection(disconnected);
       clearAuthDeadline();
+      setDynamicCapabilities(null);
+      setDynamicStatus("unknown");
+      setDynamicError(null);
+      setDynamicProgress(null);
+      setDynamicClearConfirm(false);
       setSelectedId("");
       setClearConfirm(null);
       setSwitchConfirm(null);
@@ -724,6 +792,11 @@ function App() {
           await disconnectDeviceCommand().catch(() => undefined);
           if (!mounted.current || operation.current !== sequence || deviceKey.current !== knownKey) return;
           setConnection(disconnected);
+          setDynamicCapabilities(null);
+          setDynamicStatus("unknown");
+          setDynamicError(null);
+          setDynamicProgress(null);
+          setDynamicClearConfirm(false);
           clearAuthDeadline();
           cancelPreviewLoads();
           hideRevealed();
@@ -1038,6 +1111,111 @@ function App() {
     }
   }, [applyErrorState, busy, commandError, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
 
+  const updateDynamicText = useCallback((value: string) => {
+    setDynamicText(value);
+    setDynamicError(null);
+    if (dynamicStatus === "error" || dynamicStatus === "committed" || dynamicStatus === "cleared") setDynamicStatus(dynamicCapabilities ? "ready" : "unknown");
+  }, [dynamicCapabilities, dynamicStatus]);
+
+  const requestDynamicClear = useCallback(() => {
+    if (!connectionRef.current.connected || dynamicCapabilities === null || dynamicStatus === "unsupported" || dynamicStatus === "discovering") return;
+    setDynamicClearConfirm(true);
+  }, [dynamicCapabilities, dynamicStatus]);
+
+  const cancelDynamicClear = useCallback(() => {
+    setDynamicClearConfirm(false);
+  }, []);
+
+  const uploadDynamic = useCallback(async (): Promise<CommandError | null> => {
+    if (!connectionRef.current.connected || dynamicCapabilities === null) {
+      const error = { code: "dynamic_unsupported", message: "" } satisfies CommandError;
+      setDynamicError(error);
+      setDynamicStatus("unsupported");
+      return error;
+    }
+    const textError = validateDynamicText(dynamicText);
+    const ttlError = validateDynamicTtl(dynamicTtlSeconds);
+    if (textError || ttlError) {
+      const error = { code: textError === "empty" ? "dynamic_empty" : textError === "tooLong" ? "length_exceeded" : textError === "ttlInvalid" ? "dynamic_ttl_invalid" : "invalid_text", message: "" } satisfies CommandError;
+      setDynamicError(error);
+      setDynamicStatus("error");
+      return error;
+    }
+    if (dynamicKeepAfterExecute && !dynamicCapabilities.supportsKeepAfterExecute) {
+      const error = { code: "dynamic_keep_unsupported", message: "" } satisfies CommandError;
+      setDynamicError(error);
+      setDynamicStatus("error");
+      return error;
+    }
+    const sequence = ++operation.current;
+    setBusy(true);
+    setDynamicError(null);
+    setDynamicStatus("uploading");
+    setDynamicProgress(0);
+    setErrorCode(null);
+    recordOperation("DYNAMIC_UPLOAD");
+    try {
+      setDynamicProgress(25);
+      await enqueueProtocolOperation(() => uploadDynamicCommand(dynamicText, dynamicTtlSeconds, dynamicKeepAfterExecute));
+      if (!mounted.current || operation.current !== sequence) return null;
+      setDynamicProgress(100);
+      setDynamicStatus("committed");
+      markAuthenticatedActivity(false);
+      return null;
+    } catch (caught) {
+      if (!mounted.current || operation.current !== sequence) return null;
+      const error = asCommandError(caught);
+      setDynamicError(error);
+      setDynamicStatus(error.code === "dynamic_unsupported" ? "unsupported" : dropsConnection(error.code) ? "unknown" : "error");
+      setDynamicProgress(null);
+      if (dropsConnection(error.code)) {
+        setDynamicCapabilities(null);
+        applyErrorState(error);
+      }
+      return error;
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, dynamicCapabilities, dynamicKeepAfterExecute, dynamicText, dynamicTtlSeconds, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation]);
+
+  const clearDynamic = useCallback(async (): Promise<CommandError | null> => {
+    setDynamicClearConfirm(false);
+    if (!connectionRef.current.connected || dynamicCapabilities === null) {
+      const error = { code: "dynamic_unsupported", message: "" } satisfies CommandError;
+      setDynamicError(error);
+      setDynamicStatus("unsupported");
+      return error;
+    }
+    const sequence = ++operation.current;
+    setBusy(true);
+    setDynamicError(null);
+    setDynamicStatus("clearing");
+    setDynamicProgress(0);
+    setErrorCode(null);
+    recordOperation("DYNAMIC_CLEAR");
+    try {
+      setDynamicProgress(50);
+      await enqueueProtocolOperation(() => clearDynamicCommand());
+      if (!mounted.current || operation.current !== sequence) return null;
+      setDynamicProgress(100);
+      setDynamicStatus("cleared");
+      return null;
+    } catch (caught) {
+      if (!mounted.current || operation.current !== sequence) return null;
+      const error = asCommandError(caught);
+      setDynamicError(error);
+      setDynamicStatus(error.code === "dynamic_unsupported" ? "unsupported" : dropsConnection(error.code) ? "unknown" : "error");
+      setDynamicProgress(null);
+      if (dropsConnection(error.code)) {
+        setDynamicCapabilities(null);
+        applyErrorState(error);
+      }
+      return error;
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, dynamicCapabilities, enqueueProtocolOperation, recordOperation]);
+
   const retrySelected = useCallback(() => {
     const selected = slots.find((slot) => slot.slot === selectedSlot);
     if (!selected) return;
@@ -1314,6 +1492,21 @@ function App() {
           externalErrorCode={errorCode}
           onBack={() => { void disconnectDevice(); }}
           onUnlock={authenticateDevice}
+          dynamicCapabilities={dynamicCapabilities}
+          dynamicText={dynamicText}
+          dynamicTtlSeconds={dynamicTtlSeconds}
+          dynamicKeepAfterExecute={dynamicKeepAfterExecute}
+          dynamicStatus={dynamicStatus}
+          dynamicProgress={dynamicProgress}
+          dynamicError={dynamicError}
+          dynamicClearPending={dynamicClearConfirm}
+          onDynamicTextChange={updateDynamicText}
+          onDynamicTtlChange={setDynamicTtlSeconds}
+          onDynamicKeepChange={setDynamicKeepAfterExecute}
+          onDynamicUpload={uploadDynamic}
+          onDynamicClearRequest={requestDynamicClear}
+          onDynamicClearConfirm={clearDynamic}
+          onDynamicClearCancel={cancelDynamicClear}
         />
       ) : null}
 
@@ -1379,6 +1572,21 @@ function App() {
           onRetry={retrySelected}
           onCloseDiagnostics={() => setDiagnosticsOpen(false)}
           diagnosticsOpen={diagnosticsOpen}
+          dynamicCapabilities={dynamicCapabilities}
+          dynamicText={dynamicText}
+          dynamicTtlSeconds={dynamicTtlSeconds}
+          dynamicKeepAfterExecute={dynamicKeepAfterExecute}
+          dynamicStatus={dynamicStatus}
+          dynamicProgress={dynamicProgress}
+          dynamicError={dynamicError}
+          dynamicClearPending={dynamicClearConfirm}
+          onDynamicTextChange={updateDynamicText}
+          onDynamicTtlChange={setDynamicTtlSeconds}
+          onDynamicKeepChange={setDynamicKeepAfterExecute}
+          onDynamicUpload={uploadDynamic}
+          onDynamicClearRequest={requestDynamicClear}
+          onDynamicClearConfirm={clearDynamic}
+          onDynamicClearCancel={cancelDynamicClear}
         />
       ) : null}
 

@@ -191,6 +191,54 @@ export type MessageTable = {
   operationFailed: string;
   unprotectedTitle: string;
   unprotectedHelp: string;
+  dynamicMacro: string;
+  dynamicMacroTitle: string;
+  dynamicMacroHelp: string;
+  dynamicUnencryptedTitle: string;
+  dynamicUnencryptedHelp: string;
+  dynamicMacroText: string;
+  dynamicMacroPlaceholder: string;
+  dynamicMacroTextHelp: string;
+  dynamicBytes: (count: number, maximum: number) => string;
+  dynamicCapabilityStatus: string;
+  dynamicCapabilityVersion: string;
+  dynamicMaxBytes: (count: number) => string;
+  dynamicLifecycleBoot: string;
+  dynamicLifecycleTtl: string;
+  dynamicLifecycleExecute: string;
+  dynamicLifecycleUsb: string;
+  dynamicLifecycleBle: string;
+  dynamicLifecycleEndpoint: string;
+  dynamicYes: string;
+  dynamicNo: string;
+  dynamicTtl: string;
+  dynamicTtlDefault: string;
+  dynamicTtlCustom: string;
+  dynamicTtlHelp: (min: number, max: number) => string;
+  seconds: string;
+  dynamicKeepAfterExecute: string;
+  dynamicKeepAfterExecuteHelp: string;
+  dynamicKeepUnsupported: string;
+  dynamicCapabilityNote: string;
+  dynamicUpload: string;
+  dynamicClear: string;
+  dynamicUploading: string;
+  dynamicClearing: string;
+  dynamicStatusUnknown: string;
+  dynamicStatusDiscovering: string;
+  dynamicStatusReady: string;
+  dynamicStatusUploading: string;
+  dynamicStatusClearing: string;
+  dynamicStatusCommitted: string;
+  dynamicStatusCleared: string;
+  dynamicStatusUnsupported: string;
+  dynamicStatusError: string;
+  dynamicUnsupportedHelp: string;
+  dynamicOperationError: string;
+  dynamicTextRequired: string;
+  dynamicUnsupportedText: string;
+  dynamicTextTooLong: string;
+  dynamicTtlInvalid: string;
 };
 
 export type Messages = MessageTable;
@@ -381,6 +429,54 @@ const english: MessageTable = {
   operationFailed: "The operation failed. Try again.",
   unprotectedTitle: "Not protected · ",
   unprotectedHelp: "no management password is set; macro management is available to other local HID clients.",
+  dynamicMacro: "Dynamic Macro",
+  dynamicMacroTitle: "Temporary macro",
+  dynamicMacroHelp: "One RAM-only object with no readback. Upload only non-secret text; it is independent of static macro slots.",
+  dynamicUnencryptedTitle: "HID is unencrypted.",
+  dynamicUnencryptedHelp: "Do not upload passwords, tokens, or other secrets. Dynamic Macro is available even while static management is locked.",
+  dynamicMacroText: "Dynamic text",
+  dynamicMacroPlaceholder: "Type a temporary macro…",
+  dynamicMacroTextHelp: "Printable US ASCII, LF, Tab, and Backspace · maximum 256 bytes.",
+  dynamicBytes: (count, maximum) => `${count} / ${maximum} bytes`,
+  dynamicCapabilityStatus: "Capability",
+  dynamicCapabilityVersion: "Version",
+  dynamicMaxBytes: (count) => `max ${count} bytes`,
+  dynamicLifecycleBoot: "Boot clear",
+  dynamicLifecycleTtl: "TTL clear",
+  dynamicLifecycleExecute: "Execute clear",
+  dynamicLifecycleUsb: "USB clear",
+  dynamicLifecycleBle: "BLE clear",
+  dynamicLifecycleEndpoint: "Endpoint clear",
+  dynamicYes: "yes",
+  dynamicNo: "no",
+  dynamicTtl: "TTL",
+  dynamicTtlDefault: "Device default",
+  dynamicTtlCustom: "Custom…",
+  dynamicTtlHelp: (min, max) => `Optional explicit TTL · ${min}–${max} seconds`,
+  seconds: "seconds",
+  dynamicKeepAfterExecute: "Keep after execute",
+  dynamicKeepAfterExecuteHelp: "Retain after a successful execution.",
+  dynamicKeepUnsupported: "Not advertised by this device",
+  dynamicCapabilityNote: "Upload and clear report local observation only; the object cannot be read back.",
+  dynamicUpload: "Upload",
+  dynamicClear: "Clear",
+  dynamicUploading: "Uploading…",
+  dynamicClearing: "Clearing…",
+  dynamicStatusUnknown: "Unknown",
+  dynamicStatusDiscovering: "Checking capability…",
+  dynamicStatusReady: "Ready · no local observation",
+  dynamicStatusUploading: "Uploading…",
+  dynamicStatusClearing: "Clearing…",
+  dynamicStatusCommitted: "Committed locally",
+  dynamicStatusCleared: "Cleared locally",
+  dynamicStatusUnsupported: "Unsupported",
+  dynamicStatusError: "Error",
+  dynamicUnsupportedHelp: "This device does not advertise the Dynamic Macro protocol. Static macro management remains available.",
+  dynamicOperationError: "Dynamic Macro operation failed. The local state is unknown; do not assume the object is present.",
+  dynamicTextRequired: "Enter non-empty dynamic text.",
+  dynamicUnsupportedText: "Dynamic text supports printable US ASCII, LF, Tab, and Backspace only.",
+  dynamicTextTooLong: "Dynamic text cannot exceed 256 bytes.",
+  dynamicTtlInvalid: "The Dynamic Macro TTL is outside the supported range.",
 };
 
 const chinese: MessageTable = {
@@ -569,6 +665,54 @@ const chinese: MessageTable = {
   operationFailed: "操作失败，请重试。",
   unprotectedTitle: "未受保护 · ",
   unprotectedHelp: "未设置管理密码；其他本机 HID 客户端也可以管理宏。",
+  dynamicMacro: "动态宏",
+  dynamicMacroTitle: "临时宏",
+  dynamicMacroHelp: "单个仅存于 RAM 且不可读回的对象。仅上传非敏感文本；它独立于静态宏列表。",
+  dynamicUnencryptedTitle: "HID 未加密。",
+  dynamicUnencryptedHelp: "不要上传密码、令牌或其他秘密。静态管理锁定时仍可使用动态宏。",
+  dynamicMacroText: "动态文本",
+  dynamicMacroPlaceholder: "输入临时宏…",
+  dynamicMacroTextHelp: "可打印 US ASCII、LF、Tab 和 Backspace · 最多 256 bytes。",
+  dynamicBytes: (count, maximum) => `${count} / ${maximum} bytes`,
+  dynamicCapabilityStatus: "能力",
+  dynamicCapabilityVersion: "版本",
+  dynamicMaxBytes: (count) => `最多 ${count} bytes`,
+  dynamicLifecycleBoot: "启动清空",
+  dynamicLifecycleTtl: "TTL 清空",
+  dynamicLifecycleExecute: "执行清空",
+  dynamicLifecycleUsb: "USB 断开清空",
+  dynamicLifecycleBle: "BLE profile 清空",
+  dynamicLifecycleEndpoint: "端点切换清空",
+  dynamicYes: "是",
+  dynamicNo: "否",
+  dynamicTtl: "TTL",
+  dynamicTtlDefault: "设备默认值",
+  dynamicTtlCustom: "自定义…",
+  dynamicTtlHelp: (min, max) => `可选显式 TTL · ${min}–${max} 秒`,
+  seconds: "秒",
+  dynamicKeepAfterExecute: "执行后保留",
+  dynamicKeepAfterExecuteHelp: "成功执行后保留动态对象。",
+  dynamicKeepUnsupported: "设备未声明支持",
+  dynamicCapabilityNote: "上传和清空只表示本地观察；对象不能读回。",
+  dynamicUpload: "上传",
+  dynamicClear: "清空",
+  dynamicUploading: "正在上传…",
+  dynamicClearing: "正在清空…",
+  dynamicStatusUnknown: "未知",
+  dynamicStatusDiscovering: "正在检查能力…",
+  dynamicStatusReady: "就绪 · 尚无本地观察",
+  dynamicStatusUploading: "正在上传…",
+  dynamicStatusClearing: "正在清空…",
+  dynamicStatusCommitted: "已在本地记录提交",
+  dynamicStatusCleared: "已在本地记录清空",
+  dynamicStatusUnsupported: "不支持",
+  dynamicStatusError: "错误",
+  dynamicUnsupportedHelp: "设备未声明 Dynamic Macro 协议支持。静态宏管理仍可用。",
+  dynamicOperationError: "动态宏操作失败。本地状态未知，不要假设对象仍存在。",
+  dynamicTextRequired: "请输入非空动态文本。",
+  dynamicUnsupportedText: "动态文本仅支持可打印 US ASCII、LF、Tab 和 Backspace。",
+  dynamicTextTooLong: "动态文本不能超过 256 bytes。",
+  dynamicTtlInvalid: "Dynamic Macro TTL 超出支持范围。",
 };
 
 const MESSAGE_TABLE: Record<Locale, MessageTable> = { en: english, "zh-CN": chinese };
@@ -607,6 +751,11 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     length_exceeded: "The slot text exceeds the protocol limit.",
     invalid_configuration: "The client configuration is invalid.",
     state_unavailable: "The application state is unavailable.",
+    dynamic_unsupported: "This device does not support Dynamic Macro. Static macro management remains available.",
+    dynamic_auth_boundary: "The device returned an authentication status for Dynamic Macro; static authentication was not changed.",
+    dynamic_empty: english.dynamicTextRequired,
+    dynamic_ttl_invalid: english.dynamicTtlInvalid,
+    dynamic_keep_unsupported: english.dynamicKeepUnsupported,
   },
   "zh-CN": {
     hid_backend_unavailable: "无法初始化 HID 后端。",
@@ -641,6 +790,11 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     length_exceeded: "宏正文超过协议限制。",
     invalid_configuration: "客户端配置无效。",
     state_unavailable: "应用状态不可用。",
+    dynamic_unsupported: "此设备不支持 Dynamic Macro；静态宏管理仍可用。",
+    dynamic_auth_boundary: "设备为 Dynamic Macro 返回了认证状态；静态认证状态未改变。",
+    dynamic_empty: chinese.dynamicTextRequired,
+    dynamic_ttl_invalid: chinese.dynamicTtlInvalid,
+    dynamic_keep_unsupported: chinese.dynamicKeepUnsupported,
   },
 };
 

@@ -33,6 +33,9 @@ pub fn run() {
             commands::get_slot,
             commands::set_slot,
             commands::clear_slot,
+            commands::get_dynamic_capabilities,
+            commands::upload_dynamic,
+            commands::clear_dynamic,
             commands::get_settings,
             commands::set_settings,
         ])

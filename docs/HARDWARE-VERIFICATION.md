@@ -2,7 +2,7 @@
 
 本文件记录阶段 5 的硬件与平台验证边界。硬件测试只允许执行安全的
 `enumerate → 唯一候选选择 → connect → LIST` 流程；本阶段未连接真实硬件，
-也没有执行 `GET`、`SET` 或 `CLEAR`，不修改设备内容。
+也没有执行 `GET`、`SET`、`CLEAR` 或任何 Dynamic Macro upload/clear，不修改设备内容。
 
 ## 已记录的 LIST-only 硬件冒烟结果
 
@@ -41,7 +41,7 @@ workflow 只执行依赖安装、前端构建和 Tauri 打包，不枚举 HID、
 - Ubuntu 22.04 runner 上的最终 AppImage 产物；Linux 本机只验证 no-bundle，未伪造
   `linuxdeploy` AppImage 结果。
 - 三个平台上的真实键盘交互、拔插和自动重连。
-- `GET`、`SET`、`CLEAR`、Flash/NVS 持久化，以及宏执行效果；这些需要后续明确授权的设备测试，并且任何报告仍只能记录脱敏状态、slot 数量和必要的 byte length。
+- `GET`、`SET`、`CLEAR`、Dynamic Macro upload/clear、Flash/NVS 持久化，以及宏执行效果；当前项目禁止真实硬件 dynamic 写入，软件行为使用 fake-HID 验证。任何未来获授权的静态设备测试仍只能记录脱敏状态、slot 数量和必要的 byte length。
 - 桌面窗口的人工视觉验收；本阶段只完成静态检查和 no-bundle 构建，没有把 GUI 自动化接入发布 workflow。
 
 ## 本阶段静态门禁

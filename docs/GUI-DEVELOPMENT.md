@@ -6,19 +6,19 @@
 
 首版目标平台：Linux x86_64、macOS Intel/Apple Silicon、Windows x64。前端不直接访问 HID，所有枚举、认证、协议和传输都在 Rust/Tauri command 层完成。
 
-当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
+当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）以及 Dynamic Macro v1 桌面流程已实现并通过自动验证。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
 
 ## 2. 固件和协议约束
 
 GUI 必须遵守现有 `docs/PROTOCOL.md`、`docs/CLI.md` 以及 sibling firmware 的 `docs/AUTHENTICATION_PROTOCOL.md`：
 
 - 使用专用 runtime macro USB HID interface；默认 HID_1，但固件可以配置为其他未占用的 HID instance；键盘 HID_0 保持不变；
-- 每个 request/response 是固定 32 bytes；v2 宏命令为 `LIST`、`GET`、`SET`、`CLEAR`；认证命令为 `AUTH_INFO`、`AUTH_CHALLENGE`、`AUTH_PROVE`、`PASSWORD_SET`、`LOCK`；
+- 每个 request/response 是固定 32 bytes；static v2 宏命令为 `LIST`、`GET`、`SET`、`CLEAR`；dynamic v1 命令为 `CAPABILITIES`、`DYNAMIC_BEGIN`、`DYNAMIC_DATA`、`DYNAMIC_CLEAR`；认证命令为 `AUTH_INFO`、`AUTH_CHALLENGE`、`AUTH_PROVE`、`PASSWORD_SET`、`LOCK`；
 - `SET` 使用 22-byte payload 分块，完整 transaction 完成前不能替换 slot；slot 数量必须由 `LIST` 动态获取；
 - 宏正文只允许 printable US ASCII（`0x20..0x7e`）、LF（`0x0a`）、Tab（`0x09`）和 Backspace（`0x08`）；Enter 在 UI 中转换为 LF，不能写入 CR；不提供 Esc；中文、Emoji 和其他 Unicode 不能进入宏正文；
 - 协议允许的正文范围上限是 256 bytes，固件的 `CONFIG_ZMK_RUNTIME_MACRO_MAX_TEXT_LEN` 可能更小；桌面端无法预先知道该值，设备返回 `BAD_LENGTH` 时显示明确错误；
 - `TAP_MS` 和 `WAIT_MS` 是编译期配置，当前协议没有 capability 或设置命令，桌面端不读取也不修改；
-- v2 USB 配置通道不加密。`OPEN` 状态下可访问该 HID interface 的本机程序可能修改 slots；`PROTECTED` 状态下宏管理命令需要有效认证窗口；
+- v2 USB 配置通道不加密。`OPEN` 状态下可访问该 HID interface 的本机程序可能修改 slots；`PROTECTED` 状态下 static 宏管理命令需要有效认证窗口，但 dynamic 命令在 `OPEN`、`PROTECTED` 和 `ERROR_LOCKED` 都不经过 static auth gate；
 - 固件是 RAM-first。`STORAGE_ERROR` 可能表示内存值已经生效但 Flash/NVS 持久化失败；UI 不得错误宣称完全失败；
 - 认证密码在 Rust command 边界立即进入 zeroizing storage，原始密码不进入日志、序列化对象、持久化数据、错误 DTO 或返回值。
 
@@ -108,7 +108,17 @@ Page `0xff60`、Usage `0x61`，输入 Usage `0x62`、输出 Usage `0x63`，固�
 - SET/CLEAR 出错时保留 dirty draft 并给出 Retry；`STORAGE_ERROR` 显示“本次会话可能已生效，但未能永久保存”；
 - Clear 使用原位二次确认；slot 切换和关闭使用不含正文的本地化 dirty 确认。
 
-### 4.5 设置、主题和诊断
+### 4.5 Dynamic Macro surface
+
+Dynamic Macro 是独立于 static slot 的单个 RAM-only object，最大 256 bytes、无 LIST/GET/readback，不写 Settings/NVS。Unlock 页面和 authenticated/open Workbench 都显示独立 surface；locked 用户看不到 static slot 内容，但仍可操作 dynamic。界面明确提示 management HID 未加密，只允许非-secret 文本。
+
+连接后先发送 `CAPABILITIES` 并严格校验 capability version、object count、固定长度/TTL/timeout、required lifecycle flags 和 reserved bits 7..15。`BAD_OPCODE`/`BAD_VERSION` 映射为 Dynamic unsupported，不阻塞 static 功能；malformed success 是 protocol error，不降级为 static `SET`，也不自动 login。Dynamic request 不刷新或修改 static auth session。
+
+Dynamic 文本在任何 HID write 前完成本地校验：非空、1–256 bytes、仅 printable US ASCII/LF/Tab/Backspace；显式 TTL 为 1–86400 秒，缺省使用设备默认 300 秒。BEGIN payload 只允许 0/1/4/5，keep-after-execute 只有 capability lifecycle bit 6 支持时才显示/发送，Tauri 参数使用 `keepAfterExecute`。上传失败或 timeout 从新 request ID 的 BEGIN 重新开始；clear 可用新 ID 幂等重试。Dynamic 文本只存在当前内存编辑区，不写 localStorage、日志、诊断、错误、报告或诊断摘要。
+
+状态文案区分 `Unknown`、`Unsupported`、`Uploading`、`Committed locally`、`Cleared locally` 和 `Error`；提交/清除仅表示本地收到 ACK，不是 readback 证明。断开、重连、重启或生命周期不确定后回到 Unknown，不自动 re-upload。capability flags 摘要、byte count、TTL、keep 开关和进度均为本地 UI 信息，不能推断设备当前仍保存动态文本。
+
+### 4.6 设置、主题和诊断
 
 当前实现保留中文/English 与 System/Light/Dark，并包含 v2 密码管理和隐私预览设置：
 
@@ -130,7 +140,7 @@ Rust command layer
 Runtime Macro protocol v2 / hidapi
 ```
 
-前端只调用 `bridge.ts` 中的 Tauri commands。Rust 负责设备发现、显式候选选择、AUTH_INFO、认证 KDF/proof、LIST/GET/SET/CLEAR、重试、事务边界和错误映射。Tauri command 不返回 salt、iterations、K、nonce、proof、密码或 raw report。
+前端只调用 `bridge.ts` 中的 Tauri commands。Rust 负责设备发现、显式候选选择、AUTH_INFO、认证 KDF/proof、static LIST/GET/SET/CLEAR、dynamic capability/upload/clear、重试、事务边界和错误映射。Dynamic commands 不经过 `ensure_management_access`，但仍复用同一 HID session/串行队列；Tauri IPC 使用 camelCase 参数（包括 `ttlSeconds`、`keepAfterExecute`）。Tauri command 不返回 salt、iterations、K、nonce、proof、密码、dynamic readback 或 raw report。
 
 ## 6. Tauri window 权限
 
@@ -148,7 +158,8 @@ Runtime Macro protocol v2 / hidapi
 2. Tauri session/auth bridge、HID session 和安全 command boundary；
 3. MagicPatterns UI 源代码迁移、真实 v2 auth/宏流程、密码设置/修改和视觉 gate；
 4. 列表隐私预览、认证窗口倒计时、`AUTH_REQUIRED`/错误恢复、自动重连和正常关闭 best-effort LOCK；
-5. 文档、跨平台行为/安装器配置检查和最终验证（含硬件边界检查）。
+5. 文档、跨平台行为/安装器配置检查和最终验证（含硬件边界检查）；
+6. Dynamic Macro v1 capability、独立 upload/clear surface、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix。
 
 所有阶段均只支持 v2，不提供 Legacy v1 管理。MagicPatterns 是唯一视觉基准；仅在真实功能、v2 协议、安全约束或 Tauri 平台行为冲突时适配，并记录冲突原因。
 
@@ -161,7 +172,7 @@ Runtime Macro protocol v2 / hidapi
 - `npm run tauri build -- --no-bundle`；
 - `git diff --check` 和隐私/secret scan。
 
-真实硬件验证不得执行 GET、SET 或 CLEAR；硬件测试如有需要只发送 LIST，并且报告只写发现/连接状态、slot count 和 byte length，不写 HID path、serial、raw report、slot content、密码或用户名。
+真实硬件验证不得执行 GET、SET、CLEAR 或任何 dynamic upload/clear；硬件测试如有需要只发送 LIST，并且报告只写发现/连接状态、slot count 和 byte length，不写 HID path、serial、raw report、slot content、dynamic text、密码或用户名。Dynamic 功能只用 fake-HID 和软件构建/单元测试验证。
 
 公开代码、测试、文档、构建日志和诊断不能包含真实 HID path、设备 serial、用户名、设备拓扑、宏正文或凭据。示例必须是抽象占位符，不能复制设计原型中的邮箱、SSH、IP 或其他静态示例。
 

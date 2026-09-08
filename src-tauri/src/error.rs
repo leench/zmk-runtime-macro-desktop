@@ -94,6 +94,17 @@ pub enum ProtocolError {
     InvalidAuthInfo,
     PasswordSetConfirmationMismatch,
     InvalidAuthChallenge,
+    InvalidDynamicCapabilities,
+    DynamicAckOffset {
+        operation: &'static str,
+        expected: u16,
+        actual: u16,
+    },
+    DynamicAckTotal {
+        operation: &'static str,
+        expected: u16,
+        actual: u16,
+    },
     InvalidAuthFlags {
         flags: u8,
     },
@@ -178,6 +189,25 @@ impl fmt::Display for ProtocolError {
             Self::InvalidAuthChallenge => {
                 write!(formatter, "invalid AUTH_CHALLENGE response fields")
             }
+            Self::InvalidDynamicCapabilities => {
+                write!(formatter, "invalid CAPABILITIES response fields")
+            }
+            Self::DynamicAckOffset {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{operation} acknowledgement offset is {actual}, expected {expected}"
+            ),
+            Self::DynamicAckTotal {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{operation} acknowledgement total is {actual}, expected {expected}"
+            ),
             Self::InvalidAuthFlags { flags } => {
                 write!(
                     formatter,
@@ -282,6 +312,9 @@ pub enum ClientError {
     InvalidSlot(u8),
     InvalidText(TextError),
     LengthExceeded { length: usize, maximum: usize },
+    EmptyDynamicText,
+    InvalidDynamicTtl { value: u32 },
+    DynamicKeepAfterExecuteUnsupported,
     InvalidConfiguration(&'static str),
 }
 
@@ -303,6 +336,18 @@ impl fmt::Display for ClientError {
                     formatter,
                     "text length {length} exceeds protocol maximum {maximum} bytes"
                 )
+            }
+            Self::EmptyDynamicText => {
+                write!(formatter, "dynamic text must not be empty")
+            }
+            Self::InvalidDynamicTtl { value } => {
+                write!(
+                    formatter,
+                    "dynamic TTL {value} is outside the supported range"
+                )
+            }
+            Self::DynamicKeepAfterExecuteUnsupported => {
+                write!(formatter, "dynamic keep-after-execute is not supported")
             }
             Self::InvalidConfiguration(message) => {
                 write!(formatter, "invalid client configuration: {message}")

@@ -12,7 +12,7 @@ use crate::hid::{
     enumerate_devices_with_known_record, new_hid_api, open_device, DeviceDiscoveryError,
     DeviceRecord, DeviceSummary, HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
-use crate::protocol::{AuthInfo, Status};
+use crate::protocol::{AuthInfo, DynamicCapabilities, Status};
 
 /// A stable, serializable error envelope used by every frontend command.
 ///
@@ -181,6 +181,17 @@ impl From<ClientError> for CommandError {
                 "length_exceeded",
                 "The slot text exceeds the protocol limit.",
             ),
+            ClientError::EmptyDynamicText => {
+                Self::new("dynamic_empty", "Dynamic text must not be empty.")
+            }
+            ClientError::InvalidDynamicTtl { .. } => Self::new(
+                "dynamic_ttl_invalid",
+                "The Dynamic Macro TTL is outside the supported range.",
+            ),
+            ClientError::DynamicKeepAfterExecuteUnsupported => Self::new(
+                "dynamic_keep_unsupported",
+                "This device does not support keep-after-execute.",
+            ),
             ClientError::InvalidConfiguration(_) => Self::new(
                 "invalid_configuration",
                 "The client configuration is invalid.",
@@ -340,6 +351,54 @@ impl From<SlotInfo> for SlotMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicCapabilitiesMetadata {
+    pub capability_version: u8,
+    pub dynamic_object_count: u8,
+    pub lifecycle_flags: u16,
+    pub max_dynamic_length: u16,
+    pub default_ttl_seconds: u32,
+    pub min_ttl_seconds: u32,
+    pub max_ttl_seconds: u32,
+    pub transaction_timeout_seconds: u32,
+    pub clear_on_boot: bool,
+    pub clear_on_ttl_expiry: bool,
+    pub clear_on_execution_accept: bool,
+    pub clear_on_usb_disconnect: bool,
+    pub clear_on_ble_profile_change: bool,
+    pub clear_on_selected_endpoint_change: bool,
+    pub supports_keep_after_execute: bool,
+}
+
+impl From<DynamicCapabilities> for DynamicCapabilitiesMetadata {
+    fn from(capabilities: DynamicCapabilities) -> Self {
+        Self {
+            capability_version: capabilities.capability_version,
+            dynamic_object_count: capabilities.dynamic_object_count,
+            lifecycle_flags: capabilities.lifecycle_flags,
+            max_dynamic_length: capabilities.max_dynamic_length,
+            default_ttl_seconds: capabilities.default_ttl_seconds,
+            min_ttl_seconds: capabilities.min_ttl_seconds,
+            max_ttl_seconds: capabilities.max_ttl_seconds,
+            transaction_timeout_seconds: capabilities.transaction_timeout_seconds,
+            clear_on_boot: capabilities.lifecycle_flags
+                & crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_BOOT
+                != 0,
+            clear_on_ttl_expiry: capabilities.lifecycle_flags
+                & crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_TTL_EXPIRY
+                != 0,
+            clear_on_execution_accept: capabilities.lifecycle_flags
+                & crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_EXECUTION_ACCEPT
+                != 0,
+            clear_on_usb_disconnect: capabilities.clear_on_usb_disconnect(),
+            clear_on_ble_profile_change: capabilities.clear_on_ble_profile_change(),
+            clear_on_selected_endpoint_change: capabilities.clear_on_selected_endpoint_change(),
+            supports_keep_after_execute: capabilities.supports_keep_after_execute(),
+        }
+    }
+}
+
 fn safe_product_name(product_name: Option<&str>) -> Option<String> {
     let product_name = product_name?;
     let mut safe = String::new();
@@ -440,6 +499,32 @@ pub trait MacroSession: Send {
     fn set_slot(&mut self, slot: u8, data: &[u8]) -> Result<(), ClientError>;
     fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError>;
 
+    /// Dynamic operations intentionally do not share the static management
+    /// access gate. The device protocol allows them in OPEN, PROTECTED, and
+    /// ERROR_LOCKED states without refreshing the static auth session.
+    fn dynamic_capabilities(&mut self) -> Result<DynamicCapabilities, ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement dynamic macro protocol",
+        ))
+    }
+
+    fn upload_dynamic(
+        &mut self,
+        _text: &[u8],
+        _ttl_seconds: Option<u32>,
+        _keep_after_execute: bool,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement dynamic macro protocol",
+        ))
+    }
+
+    fn clear_dynamic(&mut self) -> Result<(), ClientError> {
+        Err(ClientError::InvalidConfiguration(
+            "session does not implement dynamic macro protocol",
+        ))
+    }
+
     /// Authentication methods are part of the backend session boundary so
     /// the next Tauri command layer cannot accidentally bypass v2. Custom
     /// test sessions remain source-compatible until they opt into auth.
@@ -483,6 +568,23 @@ impl MacroSession for RuntimeMacroClient<HidTransport> {
 
     fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError> {
         RuntimeMacroClient::clear_slot(self, slot)
+    }
+
+    fn dynamic_capabilities(&mut self) -> Result<DynamicCapabilities, ClientError> {
+        RuntimeMacroClient::dynamic_capabilities(self)
+    }
+
+    fn upload_dynamic(
+        &mut self,
+        text: &[u8],
+        ttl_seconds: Option<u32>,
+        keep_after_execute: bool,
+    ) -> Result<(), ClientError> {
+        RuntimeMacroClient::upload_dynamic(self, text, ttl_seconds, keep_after_execute)
+    }
+
+    fn clear_dynamic(&mut self) -> Result<(), ClientError> {
+        RuntimeMacroClient::clear_dynamic(self)
     }
 
     fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
@@ -839,7 +941,10 @@ impl<F: SessionFactory> AppState<F> {
             | ClientError::InvalidConfiguration(_)
             | ClientError::InvalidSlot(_)
             | ClientError::InvalidText(_)
-            | ClientError::LengthExceeded { .. } => self.connection.is_some(),
+            | ClientError::LengthExceeded { .. }
+            | ClientError::EmptyDynamicText
+            | ClientError::InvalidDynamicTtl { .. }
+            | ClientError::DynamicKeepAfterExecuteUnsupported => self.connection.is_some(),
         }
     }
 
@@ -931,6 +1036,89 @@ impl<F: SessionFactory> AppState<F> {
         }
     }
 
+    pub fn dynamic_capabilities(&mut self) -> Result<DynamicCapabilitiesMetadata, CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .dynamic_capabilities();
+        match result {
+            Ok(capabilities) => Ok(capabilities.into()),
+            Err(error) => {
+                if !self.retain_connection_for_dynamic_error(&error) {
+                    self.connection = None;
+                }
+                Err(dynamic_command_error(error))
+            }
+        }
+    }
+
+    pub fn upload_dynamic(
+        &mut self,
+        text: &str,
+        ttl_seconds: Option<u32>,
+        keep_after_execute: bool,
+    ) -> Result<(), CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .upload_dynamic(text.as_bytes(), ttl_seconds, keep_after_execute);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !self.retain_connection_for_dynamic_error(&error) {
+                    self.connection = None;
+                }
+                Err(dynamic_command_error(error))
+            }
+        }
+    }
+
+    pub fn clear_dynamic(&mut self) -> Result<(), CommandError> {
+        if self.connection.is_none() {
+            return Err(CommandError::not_connected());
+        }
+        let result = self
+            .connection
+            .as_mut()
+            .expect("connection was checked above")
+            .session
+            .clear_dynamic();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !self.retain_connection_for_dynamic_error(&error) {
+                    self.connection = None;
+                }
+                Err(dynamic_command_error(error))
+            }
+        }
+    }
+
+    fn retain_connection_for_dynamic_error(&self, error: &ClientError) -> bool {
+        match error {
+            ClientError::Transport(_) | ClientError::Protocol(_) => false,
+            ClientError::Remote(_) => self.connection.is_some(),
+            ClientError::Auth(_)
+            | ClientError::InvalidSlot(_)
+            | ClientError::InvalidText(_)
+            | ClientError::LengthExceeded { .. }
+            | ClientError::EmptyDynamicText
+            | ClientError::InvalidDynamicTtl { .. }
+            | ClientError::DynamicKeepAfterExecuteUnsupported
+            | ClientError::InvalidConfiguration(_) => self.connection.is_some(),
+        }
+    }
+
     pub fn disconnect(&mut self) {
         if let Some(mut connection) = self.connection.take() {
             // LOCK is best-effort on disconnect. Dropping the session locally
@@ -969,6 +1157,27 @@ fn auth_state_for_error(error: &ClientError) -> Option<AuthState> {
         Status::AuthNotConfigured => Some(AuthState::Open),
         Status::CredentialInvalid => Some(AuthState::CredentialInvalid),
         _ => None,
+    }
+}
+
+fn dynamic_command_error(error: ClientError) -> CommandError {
+    match error {
+        ClientError::Remote(Status::BadOpcode | Status::BadVersion) => CommandError::new(
+            "dynamic_unsupported",
+            "This device does not support Dynamic Macro.",
+        ),
+        ClientError::Remote(
+            Status::AuthRequired
+            | Status::AuthFailed
+            | Status::AuthNotConfigured
+            | Status::RateLimited
+            | Status::AuthNoChallenge
+            | Status::CredentialInvalid,
+        ) => CommandError::new(
+            "dynamic_auth_boundary",
+            "The device returned an authentication status for a Dynamic Macro request.",
+        ),
+        other => CommandError::from(other),
     }
 }
 
@@ -1188,6 +1397,49 @@ pub async fn clear_slot(
     .await
 }
 
+#[tauri::command]
+pub async fn get_dynamic_capabilities(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<DynamicCapabilitiesMetadata, CommandError> {
+    let state = Arc::clone(state.inner());
+    run_on_hid_worker(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.dynamic_capabilities()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn upload_dynamic(
+    text: String,
+    ttl_seconds: Option<u32>,
+    keep_after_execute: bool,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), CommandError> {
+    let state = Arc::clone(state.inner());
+    run_on_hid_worker(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.upload_dynamic(&text, ttl_seconds, keep_after_execute)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_dynamic(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), CommandError> {
+    let state = Arc::clone(state.inner());
+    run_on_hid_worker(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        state.clear_dynamic()
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,6 +1449,7 @@ mod tests {
 
     type SetCall = (u8, Vec<u8>);
     type SetCalls = Arc<StdMutex<Vec<SetCall>>>;
+    type DynamicUploadCall = (Vec<u8>, Option<u32>, bool);
 
     fn record(path: &[u8], usage_page: u16, usage: u16, interface_number: i32) -> DeviceRecord {
         DeviceRecord::for_test(
@@ -1218,6 +1471,9 @@ mod tests {
         get_result: Result<Vec<u8>, ClientError>,
         set_result: Result<(), ClientError>,
         clear_result: Result<(), ClientError>,
+        dynamic_capabilities_result: Result<DynamicCapabilities, ClientError>,
+        dynamic_upload_result: Result<(), ClientError>,
+        dynamic_clear_result: Result<(), ClientError>,
         auth_info_result: Result<AuthInfo, ClientError>,
         auth_info_followup_result: Option<Result<AuthInfo, ClientError>>,
         authenticate_result: Result<(), ClientError>,
@@ -1232,6 +1488,9 @@ mod tests {
         get_calls: Arc<StdMutex<Vec<u8>>>,
         set_calls: SetCalls,
         clear_calls: Arc<StdMutex<Vec<u8>>>,
+        dynamic_capabilities_calls: Arc<StdMutex<usize>>,
+        dynamic_upload_calls: Arc<StdMutex<Vec<DynamicUploadCall>>>,
+        dynamic_clear_calls: Arc<StdMutex<usize>>,
     }
 
     struct FakeSession {
@@ -1239,6 +1498,9 @@ mod tests {
         get_result: Result<Vec<u8>, ClientError>,
         set_result: Result<(), ClientError>,
         clear_result: Result<(), ClientError>,
+        dynamic_capabilities_result: Result<DynamicCapabilities, ClientError>,
+        dynamic_upload_result: Result<(), ClientError>,
+        dynamic_clear_result: Result<(), ClientError>,
         auth_info_result: Result<AuthInfo, ClientError>,
         auth_info_followup_result: Option<Result<AuthInfo, ClientError>>,
         authenticate_result: Result<(), ClientError>,
@@ -1250,6 +1512,9 @@ mod tests {
         get_calls: Arc<StdMutex<Vec<u8>>>,
         set_calls: SetCalls,
         clear_calls: Arc<StdMutex<Vec<u8>>>,
+        dynamic_capabilities_calls: Arc<StdMutex<usize>>,
+        dynamic_upload_calls: Arc<StdMutex<Vec<DynamicUploadCall>>>,
+        dynamic_clear_calls: Arc<StdMutex<usize>>,
     }
 
     impl MacroSession for FakeSession {
@@ -1271,6 +1536,30 @@ mod tests {
         fn clear_slot(&mut self, slot: u8) -> Result<(), ClientError> {
             self.clear_calls.lock().unwrap().push(slot);
             self.clear_result.clone()
+        }
+
+        fn dynamic_capabilities(&mut self) -> Result<DynamicCapabilities, ClientError> {
+            *self.dynamic_capabilities_calls.lock().unwrap() += 1;
+            self.dynamic_capabilities_result.clone()
+        }
+
+        fn upload_dynamic(
+            &mut self,
+            text: &[u8],
+            ttl_seconds: Option<u32>,
+            keep_after_execute: bool,
+        ) -> Result<(), ClientError> {
+            self.dynamic_upload_calls.lock().unwrap().push((
+                text.to_vec(),
+                ttl_seconds,
+                keep_after_execute,
+            ));
+            self.dynamic_upload_result.clone()
+        }
+
+        fn clear_dynamic(&mut self) -> Result<(), ClientError> {
+            *self.dynamic_clear_calls.lock().unwrap() += 1;
+            self.dynamic_clear_result.clone()
         }
 
         fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
@@ -1314,6 +1603,9 @@ mod tests {
                 get_result: self.get_result.clone(),
                 set_result: self.set_result.clone(),
                 clear_result: self.clear_result.clone(),
+                dynamic_capabilities_result: self.dynamic_capabilities_result.clone(),
+                dynamic_upload_result: self.dynamic_upload_result.clone(),
+                dynamic_clear_result: self.dynamic_clear_result.clone(),
                 auth_info_result: self.auth_info_result.clone(),
                 auth_info_followup_result: self.auth_info_followup_result.clone(),
                 authenticate_result: self.authenticate_result.clone(),
@@ -1325,6 +1617,9 @@ mod tests {
                 get_calls: Arc::clone(&self.get_calls),
                 set_calls: Arc::clone(&self.set_calls),
                 clear_calls: Arc::clone(&self.clear_calls),
+                dynamic_capabilities_calls: Arc::clone(&self.dynamic_capabilities_calls),
+                dynamic_upload_calls: Arc::clone(&self.dynamic_upload_calls),
+                dynamic_clear_calls: Arc::clone(&self.dynamic_clear_calls),
             }))
         }
     }
@@ -1337,6 +1632,21 @@ mod tests {
                 get_result: Ok(Vec::new()),
                 set_result: Ok(()),
                 clear_result: Ok(()),
+                dynamic_capabilities_result: Ok(DynamicCapabilities {
+                    capability_version: 1,
+                    dynamic_object_count: 1,
+                    lifecycle_flags: crate::protocol::DYNAMIC_LIFECYCLE_REQUIRED_MASK
+                        | crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_USB_DISCONNECT
+                        | crate::protocol::DYNAMIC_LIFECYCLE_SUPPORTS_KEEP_AFTER_EXECUTE,
+                    max_dynamic_length: crate::protocol::MAX_TEXT_LENGTH as u16,
+                    default_ttl_seconds: crate::protocol::DYNAMIC_DEFAULT_TTL_SECONDS,
+                    min_ttl_seconds: crate::protocol::DYNAMIC_MIN_TTL_SECONDS,
+                    max_ttl_seconds: crate::protocol::DYNAMIC_MAX_TTL_SECONDS,
+                    transaction_timeout_seconds:
+                        crate::protocol::DYNAMIC_TRANSACTION_TIMEOUT_SECONDS,
+                }),
+                dynamic_upload_result: Ok(()),
+                dynamic_clear_result: Ok(()),
                 auth_info_result: Ok(AuthInfo {
                     password_configured: false,
                     session_authenticated: false,
@@ -1357,6 +1667,9 @@ mod tests {
                 get_calls: Arc::new(StdMutex::new(Vec::new())),
                 set_calls: Arc::new(StdMutex::new(Vec::new())),
                 clear_calls: Arc::new(StdMutex::new(Vec::new())),
+                dynamic_capabilities_calls: Arc::new(StdMutex::new(0)),
+                dynamic_upload_calls: Arc::new(StdMutex::new(Vec::new())),
+                dynamic_clear_calls: Arc::new(StdMutex::new(0)),
             },
             count,
         )
@@ -1741,6 +2054,104 @@ mod tests {
         assert!(get_calls.lock().unwrap().is_empty());
         assert!(set_calls.lock().unwrap().is_empty());
         assert!(clear_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn locked_dynamic_operations_bypass_static_auth_and_do_not_call_static_api() {
+        let (mut factory, _) = factory(Ok(vec![SlotInfo { slot: 0, length: 1 }]));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x71; crate::auth::SALT_SIZE],
+        });
+        let list_calls = Arc::clone(&factory.list_calls);
+        let get_calls = Arc::clone(&factory.get_calls);
+        let set_calls = Arc::clone(&factory.set_calls);
+        let clear_calls = Arc::clone(&factory.clear_calls);
+        let dynamic_capabilities_calls = Arc::clone(&factory.dynamic_capabilities_calls);
+        let dynamic_upload_calls = Arc::clone(&factory.dynamic_upload_calls);
+        let dynamic_clear_calls = Arc::clone(&factory.dynamic_clear_calls);
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"dynamic-locked",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        let capabilities = state.dynamic_capabilities().unwrap();
+        assert_eq!(capabilities.max_dynamic_length, 256);
+        state.upload_dynamic("x", Some(60), true).unwrap();
+        state.clear_dynamic().unwrap();
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert_eq!(*dynamic_capabilities_calls.lock().unwrap(), 1);
+        assert_eq!(
+            dynamic_upload_calls.lock().unwrap().as_slice(),
+            &[(b"x".to_vec(), Some(60), true)]
+        );
+        assert_eq!(*dynamic_clear_calls.lock().unwrap(), 1);
+        assert_eq!(*list_calls.lock().unwrap(), 0);
+        assert!(get_calls.lock().unwrap().is_empty());
+        assert!(set_calls.lock().unwrap().is_empty());
+        assert!(clear_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dynamic_auth_status_is_a_boundary_error_and_keeps_static_state() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x72; crate::auth::SALT_SIZE],
+        });
+        factory.dynamic_capabilities_result = Err(ClientError::Remote(Status::AuthRequired));
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"dynamic-auth-boundary",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+        assert_eq!(
+            state.dynamic_capabilities(),
+            Err(CommandError::new(
+                "dynamic_auth_boundary",
+                "The device returned an authentication status for a Dynamic Macro request.",
+            ))
+        );
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn dynamic_bad_opcode_is_unsupported_without_dropping_static_session() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_capabilities_result = Err(ClientError::Remote(Status::BadOpcode));
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"dynamic-unsupported",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+        assert_eq!(
+            state.dynamic_capabilities(),
+            Err(CommandError::new(
+                "dynamic_unsupported",
+                "This device does not support Dynamic Macro.",
+            ))
+        );
+        assert!(state.connection_state().connected);
     }
 
     #[test]
