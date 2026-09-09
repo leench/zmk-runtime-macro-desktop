@@ -1,145 +1,468 @@
-# Dynamic Macro 场景应用与本地服务开发计划
+# Runtime Macro Dynamic 场景应用与本地服务开发计划
 
-## 1. 文档目的
+## 1. 文档目的与当前决策
 
-本文规划 `zmk-runtime-macro-desktop` 从当前 Runtime Macro v2 slot 配置客户端，扩展为跨平台的 Dynamic Macro 场景应用和本地自动化服务。
+本文规划 `zmk-runtime-macro-desktop` 在现有 Runtime Macro v2 slot 配置客户端基础上，逐步增加 Dynamic Macro 场景管理、系统托盘和本地自动化服务。
 
 本文与固件模块中的以下文档配套使用：
 
-- `docs/DYNAMIC_PROTOCOL.md`：dynamic macro 的 wire contract；
-- `docs/DYNAMIC_DESKTOP_APP_SPEC.md`：当前 dynamic desktop integration 的行为和验收规范；
+- `docs/DYNAMIC_PROTOCOL.md`：Dynamic Macro wire contract；
+- `docs/DYNAMIC_DESKTOP_APP_SPEC.md`：Dynamic desktop integration 行为和验收规范；
 - `tools/runtime_macro_cli.py`：Python reference client；
-- 本文：desktop 产品形态、外部服务 API、场景模型和后续多 dynamic object 兼容计划。
+- 本文：desktop 产品形态、UI 交付顺序、服务边界、场景模型和后续多 Dynamic Object 兼容计划。
 
-本文不改变固件协议，也不把 dynamic macro 的复杂自动化逻辑写死在 UI 代码中。
+本文不修改固件协议，也不把复杂的自动化规则写死在 React UI 中。
 
-## 2. 产品目标
+当前已经确认的实施方向是：
 
-应用最终应同时满足以下目标：
+1. **先做托盘基础、窗口入口/生命周期和完整 Dynamic UI。**
+2. UI 阶段采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。
+3. UI 视觉验收通过后，才依次实现 contract/DTO、DynamicService、场景持久化、真实 HID 接入、设备 alias、托盘真实状态、自启、本地 HTTP API 和自动场景。
+4. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
+5. 当前已完成的 Dynamic v1 wire/client/upload/clear/retry 作为后续接入基线，不从零重写。
 
-1. 在 Windows、Linux 和 macOS 上运行；
-2. 常驻系统托盘，并提供完整配置窗口；
-3. 管理一个或多个 Runtime Macro 设备；
-4. 根据手动选择或自动场景向键盘上传 dynamic macro；
-5. 为其他本机服务提供稳定、版本化的调用接口；
-6. 让外部服务可以自行实现复杂的自动化逻辑，而不要求每增加一种场景就修改 desktop 应用；
-7. 兼容当前只有一个 dynamic object 的固件，并为未来多个 dynamic object 做好 API 和内部模型准备。
-
-产品的核心定位是：
+产品核心定位为：
 
 ```text
-场景管理器 + 本地自动化代理 + Runtime Macro HID bridge
+用户命名的场景模板 + 系统托盘入口 + Dynamic Macro HID bridge + 可选本地自动化服务
 ```
 
-应用不是宏内容的安全存储系统，也不是公网服务。
+应用不是宏内容的安全存储系统，也不是公网服务。Dynamic 文本只适合非 secret 内容。
+
+## 2. 术语和边界
+
+### 2.1 Scenario
+
+**Scenario（场景）**是用户在 desktop 应用中创建、自己命名和编辑的宏模板。例如用户可以自行创建一个名字为“工作终端”的场景；名称不是固件协议字段，也不是固件预置值。
+
+Scenario 可以包含：
+
+- 用户自定义名称；
+- Dynamic 宏正文；
+- TTL 和执行后保留策略；
+- 目标设备 alias；
+- 目标 Dynamic Object；
+- 后续自动场景所需的 source、priority 或匹配规则。
+
+Scenario 是 desktop 的逻辑对象。它不是固件里的 Dynamic Object，也不表示设备当前保存了同样的文本。
+
+### 2.2 Dynamic Object
+
+**Dynamic Object**是 firmware 中的 RAM-only 容器，接收一次 Dynamic Macro upload。它没有 static slot 的 LIST/GET readback 能力，可能因执行、TTL、USB disconnect、重启或 lifecycle policy 被清除。
+
+- Scenario 可以有多个；
+- 一个设备当前或未来可以有一个或多个 Dynamic Object；
+- 一个 Scenario 在某次操作中选择一个目标 Dynamic Object；
+- UI 以 Scenario 为主要管理对象，Dynamic Object 是目标资源；
+- 不把 Scenario 列表误画成 firmware object 列表，也不把 Dynamic Object 当作可读回的文本槽位。
+
+### 2.3 当前单 object alias
+
+当前 firmware 的 Dynamic v1 capability 只有一个 object。desktop 对它使用兼容 alias `default`：
+
+- `default` 是 desktop/API 的 alias，不是对未来 object 编号的猜测；
+- 当前单 object UI 仍显示目标 object 行，并以只读方式显示 `default`；
+- 未来 capability 返回多个 object 时，同一行变为 capability-driven selector；
+- 不硬编码未来 object 数量、数字编号、容量、TTL 边界或 wire contract。
+
+### 2.4 观察状态
+
+Desktop 只能表达本地观察到的 transaction 结果，不能声称知道 firmware 当前 Dynamic 文本。`CommittedLocally` 和 `ClearedLocally` 只表示本次连接收到对应 final ACK；disconnect、reconnect、应用重启、firmware 重启或结果不确定后都必须回到 `Unknown`。
+
+TTL 倒计时如果展示，必须标记为估计值，不能表示可靠的设备 readback。
 
 ## 3. 当前基线
 
-当前 dynamic macro 功能已经完成测试开发，desktop 应用的已有能力和约束如下：
+### 3.1 已完成的协议和 backend 基线
 
-- 使用 Tauri 2 + React + TypeScript + Rust；
-- Rust 后端负责 HID 枚举、连接、协议、重试和错误映射；
+当前仓库已经具备：
+
+- Tauri 2 + React + TypeScript + Rust；
+- Rust 负责 HID 枚举、连接、协议、重试和错误映射；
 - 前端不直接访问 HID；
-- dynamic object 只存在于固件 RAM；
-- 当前固件支持一个 dynamic object，最大长度、TTL 和 lifecycle flags 由 `CAPABILITIES` 返回；
-- dynamic macro 没有 readback；
-- 默认执行后消费，可选 `keep-after-execute`；
-- 当前协议只允许 printable ASCII、LF、Tab 和 Backspace；
-- dynamic 通道不经过 static slot password gate，也不加密；
-- dynamic 只允许承载非 secret 文本。
+- Runtime Macro v2 固定 32-byte frame；
+- Dynamic v1 `CAPABILITIES`、`DYNAMIC_BEGIN`、`DYNAMIC_DATA`、`DYNAMIC_CLEAR`；
+- capability 严格解析；
+- upload 的 22-byte DATA 分块和原子 transaction；
+- clear 和 upload retry；upload retry 使用新 request ID 并从 BEGIN 重启；
+- fake HID、protocol/client/command 相关测试；
+- Dynamic 绕过 static password gate，但不应触发 static login；
+- dynamic 文本仅允许 printable ASCII、LF、Tab 和 Backspace；
+- Dynamic 默认执行后消费，可选 `keep-after-execute`；
+- Dynamic 没有 readback，只能报告本地观察状态。
 
-当前 desktop 应用已经存在的 static slot、认证、隐私预览和 HID 安全边界继续有效，不因增加 dynamic 场景功能而放宽。
+相关现有实现主要位于：
 
-## 4. 应用形态
+```text
+src-tauri/src/protocol.rs
+src-tauri/src/client.rs
+src-tauri/src/commands.rs
+src/bridge.ts
+src/components/DynamicMacroPanel.tsx
+src/components/DynamicMacroModal.tsx
+src/pages/MacroWorkbench.tsx
+src/App.tsx
+```
 
-### 4.1 托盘应用
+后续功能必须审核、复用并接入这些基线，不能为了新 UI 另开一套绕过既有 validation/retry/auth boundary 的 Dynamic client。
 
-应用启动后默认常驻托盘，可以在没有打开主窗口时继续提供本地 API 和自动化能力。
+### 3.2 已认可的视觉基线
 
-托盘菜单至少包含：
+当前 `src` 中除 Dynamic 部分以外的 UI 视觉质量已认可，以下内容是后续所有 UI 的唯一视觉基准：
 
-- 打开主窗口；
-- 当前设备和连接状态；
-- 当前 active scenario；
-- 手动选择场景；
-- 上传当前场景；
-- 清除 dynamic macro；
-- 设置；
-- 退出应用。
+- MagicPatterns 设计来源；
+- `TitleBar`、`AppHeader`、Static Slots 的列表/编辑器布局；
+- 颜色 token、字体、字号、字重、间距、圆角、边框、阴影和按钮风格；
+- 当前的空状态、错误提示、确认操作、主题和窗口行为。
 
-关闭主窗口默认隐藏到托盘。只有明确选择“退出”才终止后台服务和 HID worker。
+本计划只重做 Dynamic 相关体验，不整体重写 `App.tsx`，不重做已认可的 Static Slots、认证和设置 UI。新增 Dynamic 页面必须看起来像原设计的一部分，而不是后加的独立工具。
 
-### 4.2 配置窗口
+### 3.3 当前 Dynamic UI 的产品方向
 
-第一阶段窗口提供：
+当前 `DynamicMacroModal.tsx` 和 `DynamicMacroPanel.tsx` 是不满意的临时实现：它们把正文、TTL、keep、capability、lifecycle、警告和 clear/upload 操作堆在一个弹窗中。
 
-- 设备选择和设备别名；
-- dynamic capability 状态；
-- 场景列表；
-- 场景编辑器；
-- TTL 和执行后保留选项；
-- 手动激活/上传/清除；
-- 本地 API 状态和 token 管理；
-- 最近一次操作状态。
+后续产品方向改为新的**页面级 Dynamic Workspace**：
 
-dynamic 状态只能表达本地观察结果，例如 `Ready`、`Uploading`、`CommittedLocally`、`ClearedLocally`、`Unknown` 和 `Error`，不能显示成“设备当前文本”，因为固件没有 dynamic readback。
+- 不再把 Dynamic 主体验设计成弹窗；
+- 保留旧入口作为过渡实现，直到新页面通过视觉验收；
+- 新 UI 验收后再移除或下线旧 `DynamicMacroModal`/`DynamicMacroPanel` 入口；
+- 不在新 UI 验收前把旧弹窗继续扩展成场景管理器。
 
-## 5. 总体架构
+## 4. 托盘优先的产品形态
+
+### 4.1 第一阶段托盘基础
+
+第一阶段先实现托盘基础和窗口生命周期，但此时不要求 DynamicService、场景持久化或 HTTP API 已完成。托盘可以使用静态/mock 状态进行视觉和菜单验收，但不得把 mock 结果标成真实设备操作结果。
+
+基础能力包括：
+
+- Tauri tray icon；
+- 打开/显示主窗口；
+- 隐藏主窗口到托盘；
+- 关闭窗口默认隐藏到托盘，而不是退出进程；
+- 明确的“退出”菜单项终止应用；
+- 单实例再次启动时恢复已有窗口；
+- 托盘菜单的视觉层级、禁用状态和错误状态。
+
+登录自启不属于第一阶段托盘基础，放在真实 DynamicService 和手动闭环稳定之后实现。
+
+### 4.2 托盘菜单的 UI-first 版本
+
+UI-only 阶段可以展示以下菜单结构和 mock 状态：
+
+```text
+打开 ZMK Runtime Macro
+──────────────────────
+设备                 当前设备
+Dynamic 状态         Ready / Unknown / Error
+当前场景             用户选中的场景
+──────────────────────
+选择场景             >
+上传当前场景
+清除 Dynamic Object
+──────────────────────
+设置
+退出
+```
+
+在 UI-only 阶段：
+
+- “上传当前场景”和“清除 Dynamic Object”只能触发 mock/presentation interaction；
+- 不打开 HID、不发送 protocol frame、不修改 firmware；
+- 不把菜单中的 `Ready`、`CommittedLocally` 或 `ClearedLocally` 当成真实 ACK；
+- 托盘真实设备状态和真实操作菜单在后续接入 DynamicService 后再启用。
+
+## 5. Presentation-first UI 阶段
+
+### 5.1 UI-only 的明确边界
+
+UI 阶段只完成高保真页面、状态展示和评审用交互。允许：
+
+- 使用 in-memory fixture；
+- 在开发预览中切换状态；
+- 点击场景、对象 selector、下拉框、确认对话框和按钮；
+- 在内存中切换 dirty、selected、mock operation 状态；
+- 使用单 object 和多 object fixture 做布局验收；
+- 使用截图、运行中的窗口和人工操作完成视觉评审。
+
+UI 阶段禁止：
+
+- 调用 HID 或 Tauri Dynamic command；
+- 访问或修改真实设备；
+- 实现场景持久化；
+- 写 `localStorage`；
+- 接入 HTTP API；
+- 生成或保存 API token；
+- 声称完成真实上传、清除、readback 或设备状态；
+- 把 mock fixture 当成 firmware 多 object contract。
+
+UI-only 场景正文只存在 React 内存中，应用刷新后可以消失。正式保存必须等 scenario store 阶段。
+
+### 5.2 不整体重写现有应用
+
+新增 UI 应以最小入口接入现有 `MacroWorkbench`，保留既有 static UI：
+
+```text
+src/features/dynamic/
+├── DynamicWorkspace.tsx
+├── DynamicWorkspaceHeader.tsx
+├── DynamicStatusCard.tsx
+├── DynamicTargetSelector.tsx
+└── DynamicCapabilityDetails.tsx
+
+src/features/scenarios/
+├── ScenarioList.tsx
+├── ScenarioListItem.tsx
+├── ScenarioEditor.tsx
+├── ScenarioActions.tsx
+├── ScenarioEmptyState.tsx
+└── ScenarioDialog.tsx
+
+src/types/dynamic.ts
+src/types/scenario.ts
+```
+
+文件名可以根据现有实现调整，但职责必须保持窄而清晰。不要为了 Dynamic UI 重写整个 `App.tsx` 或 Static Slots 组件。
+
+### 5.3 页面级 Dynamic Workspace
+
+Dynamic Workspace 与 Static Slots 并列，但保留现有 `TitleBar`、`AppHeader` 和整体页面边界：
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│ TitleBar / AppHeader                                     │
+│ Static Slots                         Dynamic Scenarios   │
+├──────────────────┬───────────────────────────────────────┤
+│ SCENARIOS        │ Scenario editor                       │
+│                  │                                       │
+│ 用户命名场景     │ 场景名称                              │
+│ 用户命名场景     │ Dynamic 宏正文                        │
+│ 用户命名场景     │                                       │
+│                  │ 目标设备 / Dynamic Object             │
+│ + New scenario   │ TTL / 执行后保留                       │
+│                  │ 本地观察状态                          │
+│                  │                                       │
+│                  │ Clear device  Save  Save & Upload      │
+└──────────────────┴───────────────────────────────────────┘
+```
+
+左侧列表的主要对象是 Scenario，而不是 Dynamic Object。右侧编辑器展示当前用户选中的 Scenario，并在目标区域选择一个 Dynamic Object。
+
+### 5.4 视觉和信息层级
+
+页面应遵循当前 MagicPatterns 风格：
+
+- 使用已有 canvas/surface、line、ink、accent、warning、danger、success token；
+- 保持当前静态页面的字号、圆角、间距、按钮高度和边框层级；
+- 页面级布局优先于大面积 modal；
+- 正文编辑器保持 monospace 和 byte count；
+- 状态使用简洁标签和明确辅助说明，不展示 raw opcode、request ID 或 generation 数字；
+- capability lifecycle 详情默认折叠，避免协议字段压过主要任务；
+- 非 secret 警告持续可见，但不占据比编辑器和主要操作更高的视觉层级。
+
+建议用户可见的核心摘要为：
+
+```text
+Dynamic Macro
+RAM-only · no readback
+Device ready · target: default
+```
+
+完整的 lifecycle、TTL 范围和 keep 支持情况放入 `Device behavior`/`Capability details` 展开区域。
+
+### 5.5 明确的操作语义
+
+UI 必须区分以下操作，不能使用一个模糊的“保存/上传”按钮代替：
+
+- **Save**：只保存当前 Scenario 模板；UI-only 阶段只更新内存 fixture，正式阶段才写 scenario store；
+- **Save & Upload**（也可在文案中称 Send）：保存 Scenario 后向选定的 Dynamic Object 上传；UI-only 阶段只展示 mock operation；
+- **Clear device**：清除 firmware Dynamic Object，不删除 Scenario；UI-only 阶段只展示确认和 mock result；
+- **Delete scenario**：删除 desktop 中的 Scenario 模板，不清除 firmware Dynamic Object，必须单独确认。
+
+应区分当前选中的 Scenario、未保存 dirty Scenario 和最近一次本地观察操作，不能用一个高亮状态混合表达三者。
+
+### 5.6 持续安全提示
+
+Dynamic channel 未加密，Scenario 正文和 firmware RAM 内容都不适合保存密码、OTP、token、API key、私钥或其他 secret。UI 需要持续提示：
+
+```text
+Dynamic macros are unencrypted and intended only for non-secret text.
+```
+
+该提示不应暗示应用已经识别或过滤所有 secret。
+
+## 6. 单 object 与未来多 object 的 UI 模型
+
+### 6.1 Presentation model
+
+UI 从第一天就使用 collection 形态，但这只是 desktop presentation model，不提前冻结未来 firmware wire contract：
+
+```ts
+type DynamicObjectPresentation = {
+  objectId: string;              // opaque id from capability/fixture
+  displayLabel: string;          // UI label, not a numeric assumption
+  maxLength?: number;
+  ttl?: {
+    defaultSeconds?: number;
+    minSeconds?: number;
+    maxSeconds?: number;
+  };
+  supportsKeepAfterExecute?: boolean;
+};
+
+type DynamicCapabilitiesPresentation = {
+  capabilityVersion?: number;
+  objects: DynamicObjectPresentation[];
+};
+```
+
+UI 不得根据 objectId 的格式猜测数字 slot，也不得预设未来一定有几个 object、各 object 的容量、TTL 或 lifecycle policy。mock fixture 中的对象数量和属性只用于布局和状态评审，必须明确标记为 preview data。
+
+### 6.2 当前单 object
+
+当前 firmware 只有一个 Dynamic Object 时：
+
+- `objects` collection 只有一个展示项；
+- desktop/API 目标 alias 使用 `default`；
+- 目标 object 行仍然保留，不因只有一个 object 而删除；
+- 该行以只读展示为主，例如 `Default` 或 `default`；
+- 不显示“当前设备文本”，因为没有 readback。
+
+### 6.3 未来多 object mock
+
+UI preview 必须至少提供：
+
+1. 一个 object 的 fixture；
+2. 多个 object 的 fixture；
+3. 当前 target object 缺失的 fixture。
+
+单 object 时目标行是只读信息；多 object 时同一位置变为 capability-driven selector：
+
+```text
+Dynamic Object
+[ capability-provided label ▾ ]
+```
+
+selector 的选项来自 `objects` collection，不来自硬编码数字列表。缺少目标 object 时显示明确错误并禁止上传，但保留 Scenario 正文和 dirty draft。
+
+正式多 object 功能必须等待 firmware 发布正式 capability/protocol contract，并同步 reference client 后再实现。此前只能保留 collection、opaque object id/display label、`target_object` 和当前 `default` alias。
+
+## 7. UI mock 状态矩阵
+
+UI preview 应可切换以下 fixture。状态名称是 presentation contract，不代表 UI-only 阶段已经具备对应 backend 功能。
+
+| 状态 | 页面表现和交互要求 |
+|---|---|
+| `empty` | 没有 Scenario；显示高质量空状态和 New scenario 入口；不显示虚假的设备内容。 |
+| `new` | 新建但尚未保存的 Scenario；显示默认编辑器结构和明确的 dirty/未保存提示。 |
+| `dirty` | 正文、名称或目标设置已改变；切换 Scenario、关闭窗口或执行危险操作前显示未保存确认。 |
+| `disconnected` | 设备栏显示断开；保留 Scenario draft；禁用真实设备操作；不把上次 ACK 当作当前设备状态。 |
+| `unknown` | 设备、应用重启或 reconnect 后的本地观察未知；明确显示“设备当前状态未知”，不显示 Dynamic 文本。 |
+| `discovering` | capability 区域 loading；目标 object、TTL 和 keep 控件等待能力信息；上传/clear 禁用。 |
+| `unsupported` | 设备不支持 Dynamic 或 capability 不兼容；保留正文和 Scenario；显示原因和可恢复提示。 |
+| `ready` | capability 已知且目标有效；允许 mock Save、Save & Upload、Clear device。 |
+| `uploading` | 显示正在上传和当前操作来源；禁止重复 upload/clear；不显示不可信的伪精确进度。 |
+| `committed locally` | 显示“本次连接已收到 final ACK”或等价文案；不写“设备当前内容”，不提供 readback。 |
+| `clearing` | 显示正在清除；禁止重复操作；Scenario 不被删除。 |
+| `cleared locally` | 显示“本次连接已收到 clear ACK”；不声称设备永远为空。 |
+| `error` | 保留正文、目标和 dirty draft；显示可重试/返回 Unknown 的路径；错误信息不包含 raw frame、path 或 serial。 |
+| static locked / dynamic available | static slot 正文继续隐藏或不可管理，但 Dynamic Workspace 仍可用；清楚说明 Dynamic 与 static auth gate 分离。 |
+| keep unsupported | keep-after-execute 控件禁用并解释 firmware capability 不支持；不得静默改写用户选择。 |
+| target object missing | 目标 object 不在最新 collection 中；保留 Scenario，要求用户重新选择，不自动映射到另一个 object。 |
+| capability changed | capability 变化后重新检查正文长度、TTL、keep 和目标 object；显示可恢复提示，保留 draft。 |
+| oversize | 正文超过当前目标 object 的 max length；显示 byte count 和明确错误；在 HID write 前禁止上传。 |
+
+TTL 倒计时只在拥有本次 commit 的本地观察记录时展示，并必须标记为“估计”。disconnect、重启、TTL lifecycle 或状态不确定时停止倒计时并转为 `Unknown`。
+
+## 8. 后续架构和统一服务
+
+UI 视觉验收之后，所有真实来源必须共用一个 Rust `DynamicService`：
 
 ```text
 ┌──────────────────────────────────────────┐
-│ Tauri 2 application                      │
+│ Tauri application                        │
 │                                          │
-│  React/TypeScript UI                     │
-│       │ Tauri invoke/events              │
-│       ▼                                  │
-│  Rust application core                   │
-│   ├─ tray/window lifecycle               │
-│   ├─ scenario store and rule runner      │
-│   ├─ local HTTP API                      │
-│   ├─ per-device serialized write queue   │
-│   └─ Runtime Macro protocol client       │
-│       │                                  │
-│       ▼                                  │
-│  hidapi / Runtime Macro management HID   │
+│ React Dynamic Workspace                  │
+│ tray menu / future rules / local API     │
+│              │                           │
+│              ▼                           │
+│ Rust DynamicService                      │
+│   ├─ capability collection               │
+│   ├─ observed state                      │
+│   ├─ generation / last-write-wins        │
+│   ├─ per-device serialized writer        │
+│   └─ existing Dynamic v1 client          │
+│              │                           │
+│              ▼                           │
+│ Runtime Macro management HID             │
 └──────────────────────────────────────────┘
-                    ▲
-                    │ HTTP/JSON on loopback
-       external scripts and automation services
 ```
 
-关键边界：
+边界要求：
 
-- Tauri command 是 UI 与 Rust backend 的内部 IPC，不是外部服务 API；
-- 外部服务只调用 local HTTP API，不接触 HID path、report、request frame 或密码；
-- 每个设备只有一个 HID writer；所有 upload、clear 和 capability request 必须经过同一个串行队列；
-- UI、内置规则和外部 API 都通过同一个 backend service 写入，禁止各自打开 HID。
+- frontend 只通过 Tauri command/event 使用 backend，不直接访问 HID；
+- UI、tray、自动规则和 HTTP API 不得各自创建 HID session；
+- 一个设备只有一个 HID writer；capability、upload、clear 共用同一串行 queue；
+- Dynamic retry 必须遵循已有 v1 client 规则：新 request ID，并从 BEGIN 重启；
+- generation 用于淘汰尚未开始的旧请求并阻止过期 operation 覆盖当前 state；
+- disconnect、reconnect 和应用重启后 observed state 为 `Unknown`；
+- Dynamic 操作绕过 static auth gate，但不调用、刷新或自动登录 static auth；
+- Dynamic 与 static slot/auth 状态机保持隔离。
 
-## 6. 外部服务 API
+建议职责拆分如下，实际命名可按仓库现有结构调整：
 
-### 6.1 第一版协议选择
+```text
+src-tauri/src/
+├── protocol.rs          # 已有 wire protocol
+├── client.rs            # 已有 capability/upload/clear/retry client
+├── dynamic_service.rs   # 后续统一队列、generation、observed state
+├── scenario.rs          # 后续 Scenario 模型和原子持久化
+├── tray.rs              # tray/window lifecycle 和真实状态菜单
+├── autostart.rs         # 后续 login autostart
+├── api.rs               # 后续 loopback HTTP API
+├── credentials.rs       # 后续 API token OS credential storage
+├── commands.rs          # Tauri bridge
+└── lib.rs
+```
 
-第一版使用：
+## 9. Scenario 模型与持久化方向
 
-> **版本化 REST/JSON API，通过 `127.0.0.1` 提供服务。**
+UI-only 阶段不保存 Scenario。正式功能阶段采用带 schema version 的原子文件存储：
 
-选择原因：
+```json
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "opaque-desktop-id",
+      "name": "用户自定义名称",
+      "text": "git status\n",
+      "ttl_seconds": 300,
+      "keep_after_execute": true,
+      "target_device": "configured-alias",
+      "target_object": "default"
+    }
+  ]
+}
+```
 
-- Python、Shell、Go、Node.js 和其他自动化工具都能直接调用；
-- `curl` 即可调试；
-- 不需要为每种语言维护 SDK；
-- 适合当前主要操作：写入、清除、查看能力和查看本地状态；
-- 与 Tauri 前端解耦，未来替换 UI 不影响自动化服务。
+要求：
 
-WebSocket 不是第一版必需项。若未来需要实时推送设备连接、上传进度和状态变化，再增加 SSE 或 WebSocket；它们不应替代写入 API。
+- `name` 是用户自定义显示名称，不是 firmware object 名称；
+- `target_object` 保存 opaque object id 或当前兼容 alias，不保存进程内 HID candidate ID；
+- 场景正文明确属于用户选择保存的非 secret 明文；
+- 写入使用临时文件加原子替换；
+- 配置损坏时保留原文件并报告可恢复错误；
+- 正文不进入日志、诊断、窗口标题、错误消息、CI artifacts 或无关持久化数据；
+- 不使用 `localStorage` 作为正式 Scenario store。
 
-Unix Domain Socket 和 Windows Named Pipe 可以作为后续可选 transport，用于更严格的本机 ACL 场景，但不作为第一版唯一接口。
+如果未来设备有多个 object，而 Scenario 的目标 object 不再存在，必须报告明确输入/绑定错误，不自动改到其他 object。
 
-### 6.2 API 路径
+## 10. 本地 HTTP API（UI 和手动闭环之后）
 
-API 使用 `/api/v1` 前缀。设备使用用户配置的 alias，不直接把 serial 或 HID path 暴露给调用方。
+### 10.1 版本和路径
 
-建议接口：
+第一版 API 采用版本化 REST/JSON，通过 loopback 提供：
 
 ```text
 GET    /api/v1/health
@@ -151,582 +474,324 @@ DELETE /api/v1/devices/{device}/dynamic-objects/{object}
 GET    /api/v1/operations/{operation_id}
 ```
 
-当前单 object 固件使用 object alias `default`。即使当前只有一个 object，也使用复数路径和 object 标识，避免未来增加多个 dynamic object 时重新设计外部 API。
+设备使用用户配置的 alias，不暴露 serial 或 HID path。当前单 object 使用 `default` alias，并保留复数路径和 object 标识。
 
-### 6.3 写入请求
+### 10.2 API 行为
 
-示例：
+写入请求可以包含：
 
-```http
-PUT http://127.0.0.1:<port>/api/v1/devices/totem/dynamic-objects/default
-Content-Type: application/json
-Authorization: Bearer <local-api-token>
-Idempotency-Key: terminal-2026-01-01-0001
-```
+- `text`：必填，非空，字符集和长度由 capability 约束；
+- `ttl_seconds`：可选，经过本地范围校验；
+- `keep_after_execute`：可选，仅 capability 支持时允许；
+- `source`、`priority`：用于冲突诊断和仲裁，不写入正文；
+- `Idempotency-Key`：避免调用方重试造成不必要的重复 upload。
 
-```json
-{
-  "text": "git status\n",
-  "ttl_seconds": 300,
-  "keep_after_execute": true,
-  "source": "terminal-automation",
-  "priority": 50
-}
-```
+默认等待 Dynamic transaction final ACK 后返回成功；调用方明确使用 `Prefer: respond-async` 时才返回 `202` 和 `operation_id`。响应可以返回长度、TTL 和本地观察状态，但不得返回 Dynamic text。
 
-字段约束：
+`committed_locally` 只表示本次连接收到 final ACK，不保证 object 仍存在，也不是 readback。
 
-- `text`：必填，允许的字节集合和长度由 firmware capability 约束；
-- `ttl_seconds`：可选，必须经过本地范围校验；
-- `keep_after_execute`：可选，只有 firmware capability 支持时才允许；
-- `source`：可选，用于冲突诊断和状态显示，不写入宏正文；
-- `priority`：可选，用于多来源仲裁；
-- `Idempotency-Key`：建议支持，避免调用方重试造成不必要的重复上传。
+### 10.3 API 安全
 
-请求成功时，应用应等待 dynamic transaction 的最终 ACK 后返回成功，而不是只返回“已排队”。如果操作需要异步执行，则返回 `202 Accepted` 和 `operation_id`，调用方通过 operation endpoint 查询结果。
-
-成功响应示例：
-
-```json
-{
-  "operation_id": "op_7f2c",
-  "status": "committed_locally",
-  "device": "totem",
-  "object": "default",
-  "length": 11,
-  "ttl_seconds": 300
-}
-```
-
-`committed_locally` 只表示 desktop 在本次连接中收到 firmware final ACK，不表示应用可以 read back 或保证 object 没有随后因 TTL、重启、USB disconnect 或 lifecycle policy 被清除。
-
-### 6.4 清除和状态
-
-清除使用：
-
-```text
-DELETE /api/v1/devices/{device}/dynamic-objects/{object}
-```
-
-状态接口只返回本地观察信息，例如：
-
-```json
-{
-  "device": "totem",
-  "object": "default",
-  "state": "committed_locally",
-  "length": 11,
-  "observed_at": "<timestamp>",
-  "source": "terminal-automation"
-}
-```
-
-状态接口不得返回 dynamic text，也不得通过猜测提供“设备当前内容”。设备断开、应用重启、固件重启或无法确定 transaction 结果时，状态必须变为 `unknown`。
-
-### 6.5 API 安全
-
-第一版必须遵守：
-
+- API 默认关闭，由用户主动启用；
 - 只绑定 `127.0.0.1`，不绑定 `0.0.0.0`；
-- 使用随机或可配置端口，避免固定端口冲突；
-- 使用本机生成的 Bearer token，token 放入操作系统安全凭据存储，不放入普通配置文件；
-- 不把 token、宏正文、密码、完整 HID frame 写入日志；
+- 使用随机端口，runtime metadata 只暴露 API version、host、port 和 PID，不含 token；
+- Bearer token 第一次启用时生成，存入 OS 安全凭据存储，不写普通配置；
+- API token 与 firmware static management password 完全独立；
+- API 不自动触发 static login；
+- 不把 token、Authorization header、密码、正文、完整 HID frame、serial 或 HID path 写入日志；
 - 不依赖 CORS 作为安全措施；
-- API 文档明确 dynamic 不适合密码、OTP、token、API key、私钥和其他 secret；
-- 诊断信息只记录 source、长度、operation 类型、request id、结果类别和脱敏设备 alias。
+- operation/idempotency cache 不保存正文，具备 TTL 和容量上限；
+- API 文档明确 Dynamic 不适合密码、OTP、token、API key、私钥或其他 secret。
 
-本地 API token 与键盘 firmware 的 static management password 是两套完全独立的凭据，不能混用，也不应由 API 自动触发 firmware login。
+## 11. 多来源和并发规则
 
-## 7. 场景模型
+当前 firmware 只有一个 Dynamic Object，同一时刻不能并行写入。后续服务必须：
 
-场景是 desktop 或外部服务中的逻辑对象，不等同于 firmware dynamic object。
+1. 每个设备只有一个 serialized HID writer；
+2. capability、upload、clear 共享同一 queue；
+3. 新场景到达时丢弃尚未发送的旧 pending upload；
+4. 已开始的 upload 可以完成，但完成后按 generation 判断是否仍然有效；
+5. stale response、malformed response、timeout 和 disconnect 不得污染新的 generation；
+6. UI、tray、自动规则和 HTTP API 不能绕过 DynamicService。
 
-建议的最小模型：
-
-```json
-{
-  "id": "terminal",
-  "name": "Terminal",
-  "text": "git status\n",
-  "ttl_seconds": 300,
-  "keep_after_execute": true,
-  "target_device": "totem",
-  "target_object": "default",
-  "match": {
-    "bundle_ids": [
-      "com.apple.Terminal",
-      "com.googlecode.iterm2"
-    ],
-    "priority": 100
-  }
-}
-```
-
-场景激活来源分为：
-
-1. 用户在托盘或窗口中手动激活；
-2. desktop 内置规则根据前台应用或窗口标题激活；
-3. 外部服务通过 HTTP API 激活或直接写入；
-4. 未来由插件或其他自动化系统激活。
-
-第一版内置规则只建议支持前台应用 identifier/bundle id 和窗口标题。浏览器 URL、编辑器项目、Git 分支等复杂上下文交给外部服务实现，避免把场景系统做成不可维护的插件框架。
-
-## 8. 多来源和并发规则
-
-当前 firmware 只有一个 dynamic object，同一时刻不能让多个来源并行写入。
-
-backend 必须：
-
-1. 为每个设备维护一个串行 operation queue；
-2. 让 capability、upload 和 clear 共享同一 queue；
-3. 一次 upload 的 retry 必须从新的 `BEGIN` 开始；
-4. 新场景到达时丢弃尚未发送的旧场景请求；
-5. 已经开始的 upload 完成后，再按 generation 检查结果是否仍然有效；
-6. 不允许 UI、内置规则和外部 API 分别创建 HID session。
-
-第一版可以采用明确的 last-write-wins 规则，但 UI 和 API 必须显示 source。后续多来源场景建议增加：
-
-- source priority；
-- 临时 lease/claim；
-- lease TTL；
-- 用户手动 override；
-- override 到期后的自动恢复。
-
-建议优先级：
+首期功能阶段可使用明确的 last-write-wins；source 必须进入本地状态显示和后续 API contract。自动仲裁的建议顺序为：
 
 ```text
 用户手动 override > 外部服务 lease > 外部普通请求 > desktop 内置自动规则
 ```
 
-该优先级必须在 API 文档中固定，不能只存在于 UI 行为中。
+source priority、lease TTL、override 到期恢复属于自动场景阶段，不在 UI-only 阶段实现。
 
-## 9. 多 dynamic object 兼容计划
+## 12. 实施阶段和验收闸门
 
-固件后续会增加多个动态宏。desktop 不能把当前单 object 假设扩散到 UI、场景存储和 API。
+### 阶段 1：托盘基础 + 高保真 Dynamic UI（先做）
 
-### 9.1 内部模型
+这一阶段是 presentation-first，先让用户看到并验收完整产品形态：
 
-从第一版开始使用 collection 模型：
+1. 托盘 icon、打开/隐藏/退出、close-to-tray、单实例窗口入口；
+2. 保持现有 TitleBar、AppHeader、Static Slots 和全局 MagicPatterns 视觉风格；
+3. 用页面级 Dynamic Workspace 替代旧 Dynamic modal 的产品方向；
+4. Scenario 列表、空状态、新建、编辑器、dirty 状态和操作栏；
+5. 单 object `default` alias 与多 object capability-driven selector 的 mock；
+6. capability details、非 secret 警告、无 readback 文案；
+7. 全部状态矩阵和确认对话框的 mock/in-memory interaction；
+8. 不接 HID、不写 localStorage、不持久化 Scenario、不接 HTTP API；
+9. 新 UI 通过人工视觉和交互验收后，才移除旧 Dynamic modal 入口。
+
+**UI 视觉验收点 A：**
+
+- 页面与现有 Static Slots 的视觉质量一致；
+- 单 object 和多 object mock 均不破坏布局；
+- empty/new/dirty/disconnected/unknown/discovering/unsupported/ready/uploading/committed locally/clearing/cleared locally/error 等状态可检查；
+- static locked 但 Dynamic 可用、keep unsupported、target missing、capability change/oversize 可检查；
+- Save、Save & Upload、Clear device、Delete scenario 语义清楚；
+- 没有 readback 假象，mock 不被描述成真实业务完成。
+
+### 阶段 2：Contract/DTO 与 CI 基线
+
+UI 视觉验收通过后：
+
+- 冻结 `DynamicObject` collection、`DynamicCapabilities`、`DynamicObservedState`、`DynamicUploadRequest`、`Scenario` 和 `OperationStatus`；
+- 固定 current single object 到 `default` alias 的映射；
+- 定义状态、错误和 operation metadata，不在 DTO 中放正文、HID path、serial 或 token；
+- 从已有 Python reference client 和 Dynamic v1 文档建立 golden frame fixtures；
+- 增加适用于当前主机的 frontend build、Rust fmt/test/clippy、Tauri no-bundle 和 privacy checks；
+- 保留现有 release workflow；
+- Linux、macOS、Windows 的平台专属构建和行为验证继续由对应 runner/平台完成。
+
+### 阶段 3：DynamicService、队列和 generation
+
+- 复用已有 Dynamic v1 client/protocol/upload/clear/retry；
+- 将 capability、upload、clear 接入统一 Rust DynamicService；
+- 只维护一个 active device 和一个 HID writer；
+- 每次新连接重新 discovery；
+- 实现 `Unknown`、`Discovering`、`Unsupported`、`Ready`、`Uploading`、`CommittedLocally`、`Clearing`、`ClearedLocally`、`Error`；
+- 实现 generation-based last-write-wins、pending 淘汰和 stale completion 保护；
+- 不改变 static/auth command boundary。
+
+### 阶段 4：Scenario 原子持久化
+
+- 实现场景 schema version；
+- 使用临时文件和原子替换；
+- 保存 user-named Scenario、target device alias、target object、正文和策略；
+- 配置损坏可恢复；
+- 保持正文不进入日志、诊断、错误和无关持久化；
+- 仍然提示仅适合非 secret 文本。
+
+### 阶段 5：UI 接入真实 DynamicService/HID
+
+- 将 UI mock adapter 替换为 Tauri/DynamicService bridge；
+- 主窗口和未来托盘调用同一个 service；
+- 接入真实 capability、upload、clear、retry、generation 和 observed state；
+- 保留 static locked 但 Dynamic 可用的边界；
+- 真实 ACK 只更新本地观察状态，不添加 readback；
+- 完成硬件前的 fake-HID regression tests。
+
+### 阶段 6：Device alias
+
+- 为当前 active device 建立用户配置 alias；
+- Scenario 和后续 API 使用 alias，不暴露 serial 或 HID path；
+- alias 对应多个候选设备时不得自动选择；
+- 设备摘要变化后要求用户重新确认绑定；
+- 首期仍只保持一个并行 HID session。
+
+### 阶段 7：托盘接入真实状态
+
+- 将托盘菜单从 mock 状态接入 DynamicService 和 Scenario store；
+- 显示当前设备 alias、active Scenario、observed state 和可用操作；
+- 托盘上传、clear、选择 Scenario 与主窗口共用同一 service；
+- 关闭窗口仍只隐藏到托盘；明确退出才停止 worker/service。
+
+### 阶段 8：Login autostart
+
+- 默认关闭，由用户主动启用；
+- 使用官方 autostart plugin 或平台等价适配；
+- 只授予 `enable`、`disable`、`isEnabled` 所需权限；
+- 普通启动显示主窗口，login autostart 使用后台参数只显示托盘；
+- 设置页显示实际 OS 注册状态；
+- 启动后 dynamic observed state 先为 `Unknown`，不得假设上次 Dynamic 仍存在。
+
+**手动闭环验收点 B：**
+
+- 主窗口和托盘可打开、隐藏和明确退出；
+- Scenario 创建、编辑、删除、持久化和手动 Save & Upload 正常；
+- Dynamic upload/clear 经过同一 DynamicService 和 HID writer；
+- static slot/auth 无回归，locked 状态仍符合 Dynamic 边界；
+- restart/reconnect/disconnect 后状态为 Unknown；
+- 对应平台完成 tray、autostart、窗口生命周期和真实 HID 人工验收。
+
+**HTTP API 前验收点 C：**
+
+Gate C 是 Gate B 通过后、正式投入 HTTP API 开发前的明确 go/no-go 检查：
+
+- UI、托盘、自启和真实 service 已共用一个 writer/queue；
+- Scenario store 和 device alias 行为稳定；
+- HTTP API 安全 contract 已冻结：默认关闭、仅 loopback、token 与 firmware password 独立，且不得进入普通配置或日志；
+- status 不提供 readback 假象；
+- 三平台适用构建和平台生命周期检查已通过。
+
+### 阶段 9：Local HTTP API
+
+Gate C 通过后实现：
+
+- HTTP lifecycle、随机 loopback port、runtime metadata；
+- OS credential store 中的独立 token、复制和轮换；
+- health、devices、capabilities、status、upload、clear；
+- operation endpoint、Prefer async、idempotency、错误映射；
+- curl、Python 和 Shell 示例；
+- API server 停止、端口冲突、应用重启和 stale metadata 测试；
+- API 永远不自动 login static auth，不返回 Dynamic text。
+
+### 阶段 10：自动场景
+
+第一版只实现：
+
+- 前台应用 identifier/bundle ID；
+- 窗口标题；
+- debounce；
+- generation；
+- manual override；
+- external lease。
+
+浏览器 URL、IDE project、Git branch、插件系统、脚本执行引擎和云同步继续后置。自动规则必须通过 DynamicService，不能直接打开 HID。
+
+### 阶段 11：正式多 Dynamic Object
+
+只有 firmware 发布正式多 object capability/protocol contract 且 reference client 同步后才能实现：
+
+- capability-driven object collection；
+- 多 object fake-HID、并发、TTL、clear 和 lifecycle tests；
+- object-specific validation；
+- UI/API 的真实 object selector；
+- 新 protocol version 或 capability negotiation。
+
+在此之前不猜测 object 数量、数字编号、容量、TTL 或 wire contract，不使用 static slot fallback。
+
+## 13. Pull Request 拆分
+
+每个 PR 只承担一个主要目标，不在同一个 PR 中同时修改协议、托盘、UI、持久化和 HTTP API。
+
+| PR | 主要目标 | 依赖 | 验收重点 |
+|---|---|---|---|
+| PR-01 | Tauri tray 基础、窗口入口、close-to-tray、明确退出、单实例恢复 | 无 | tray/window 生命周期；不接真实 Dynamic service |
+| PR-02 | Dynamic Workspace 页面壳和 Static/Dynamic 入口 | PR-01 | 保持现有 MagicPatterns/static 视觉；不改旧 static UI |
+| PR-03 | Scenario 列表、编辑器、目标 object 区域和操作栏 | PR-02 | Scenario 与 Dynamic Object 概念清楚；Save/Upload/Clear/Delete 语义清楚 |
+| PR-04 | UI mock fixture、单/多 object preview、状态矩阵和对话框 | PR-03 | UI 视觉验收点 A；不接 HID、localStorage、HTTP |
+| **Gate A** | **用户视觉/交互验收** | PR-04 | **验收通过后才移除旧 Dynamic modal 入口** |
+| PR-05 | Dynamic contract/DTO、golden fixtures、CI/本机验证基线 | Gate A | DTO、frame fixture、privacy checks |
+| PR-06 | DynamicService、serialized writer、queue、generation、observed state | PR-05 | 复用现有 client；fake-HID regression |
+| PR-07 | Scenario schema、原子持久化和损坏恢复 | PR-06 | 正文只作为用户选择的非 secret 数据保存 |
+| PR-08 | UI bridge 接入真实 DynamicService/HID | PR-07 | 真实 capability/upload/clear；无 readback |
+| PR-09 | 当前 active device alias | PR-08 | alias 不暴露 serial/path；多候选不自动选择 |
+| PR-10 | 托盘菜单接入真实 Scenario/service 状态 | PR-09 | 主窗口和 tray 共用 service；手动闭环准备 |
+| PR-11 | Login autostart 和后台启动参数 | PR-10 | 默认关闭；普通启动和自启入口区分 |
+| **Gate B** | **首期手动闭环验收** | PR-11 | **真实 tray、autostart、Scenario、HID 和 static/auth 无回归** |
+| **Gate C** | **HTTP API 前验收** | Gate B | **确认 UI/tray/service/store/alias 已稳定，再决定是否开始 HTTP API** |
+| PR-12 | HTTP lifecycle、loopback、token credential、health、metadata | Gate C | API 默认关闭；token 不进普通配置/日志 |
+| PR-13 | HTTP devices/status/capabilities/upload/clear | PR-12 | API 只调用 DynamicService；不返回正文 |
+| PR-14 | operations、idempotency、错误映射和调用示例 | PR-13 | final ACK、async operation、request digest |
+| PR-15 | 自动场景基础规则和仲裁 | PR-14 | debounce、generation、manual override、external lease |
+| PR-16 | 正式多 Dynamic Object 支持 | firmware contract | 只实现已发布 contract，不猜测、不 fallback |
+| PR-17 | 跨平台人工验收、发布文档和 release hardening | 对应交付阶段 | Windows/Linux/macOS tray、autostart、打包和真实设备 |
+
+## 14. 验证策略
+
+### 14.1 当前主机可执行的检查
+
+当前主机没有“禁止编译、测试或打包”的限制。适用时直接运行：
 
 ```text
-Device
-  └─ DynamicCapabilities
-       └─ DynamicObject[]
-            ├─ object_id
-            ├─ max_length
-            ├─ ttl policy
-            └─ lifecycle policy
+npm ci
+npm run build
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+npm run tauri build -- --no-bundle
+git diff --check
 ```
 
-当前 v1 capability 只有一个 object 时，应用仍构造一个 `DynamicObject`，并映射为 object alias `default`。
+UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗口/截图/人工交互验收。若本机环境缺少特定平台依赖，应记录原因并在对应 runner 补充验证，而不是把“当前主机不可验证”写成项目限制。
 
-### 9.2 能力探测
+### 14.2 CI 和平台验证
 
-每次设备连接后必须重新执行 capability discovery。应用不能硬编码：
+普通分支/PR CI 应覆盖适用的 frontend build、Rust fmt/test/clippy、Tauri no-bundle 和 privacy scan；保留现有 tag release workflow。
 
-- object 数量；
-- object id；
-- 最大长度；
-- TTL 边界；
-- keep-after-execute 支持状态；
-- lifecycle flags。
+平台专属行为必须在对应环境验证：
 
-遇到未知 capability version、malformed response 或不兼容 object metadata 时，应用应报告 protocol mismatch，不能静默降级为 static slot，也不能把多个 object 合并成一个文本。
+- Windows：tray、close-to-tray、autostart、窗口恢复、设备拔插和安装后首次启动；
+- Linux：hidraw/udev、GNOME/KDE/Wayland/X11 tray、WebKitGTK 依赖、权限变化；
+- macOS：tray、login autostart、现有 transparent/private API window 行为和 HID 发现限制。
 
-### 9.3 API 兼容
+三平台 CI 通过不能替代 tray、autostart、窗口生命周期和真实 HID 的人工验收。
 
-API 使用：
-
-```text
-/devices/{device}/dynamic-objects/{object}
-```
-
-而不是：
-
-```text
-/devices/{device}/dynamic-macro
-```
-
-当前单 object 固件的 `default` 只是兼容 alias。未来 object id 由 capability 返回，外部服务不应假定 object 一定是数字 slot，也不应把 dynamic object 映射到 static slot。
-
-场景模型同时保存 `target_device` 和 `target_object`。如果调用方不提供 object，只有在设备明确只有一个 object 时才可以使用 `default`；多个 object 时必须返回明确的输入错误。
-
-### 9.4 固件协议演进
-
-未来多个 dynamic object 如果需要新的 wire contract，应通过 capability version 或新 protocol version 协商。desktop 应保留协议适配层，但不复制一套绕过现有 validation/retry 规则的快捷实现。
-
-新增 object 后仍需保留：
-
-- 原子 BEGIN/DATA commit；
-- 单 object transaction timeout；
-- 明确的 TTL 和 lifecycle 语义；
-- 没有 readback 的限制；
-- stale response、retry 和 disconnect 状态处理；
-- dynamic 与 static/auth 状态机隔离。
-
-## 10. 跨平台计划
-
-### 10.1 Windows
-
-- Tauri tray、window hide/show 和启动到托盘；
-- hidapi Runtime Macro interface discovery；
-- Windows x64 package；
-- 本地 HTTP server 生命周期和 Windows 防火墙提示控制；
-- 设备拔插、睡眠恢复和应用重启后的 `Unknown` 状态处理。
-
-### 10.2 Linux
-
-- x86_64 baseline；
-- hidraw backend 和 udev rule 文档；
-- AppImage/deb 的依赖说明；
-- GNOME、KDE 和常见 Wayland/X11 环境的 tray 验证；
-- WebKitGTK 运行时依赖说明；
-- 设备拔插、权限变化和多 HID interface 选择。
-
-### 10.3 macOS
-
-- 继续保持现有 Tauri window 和 HID 行为；
-- 托盘常驻和登录启动；
-- 不把 HID path、serial 或正文写入偏好；
-- 继续遵守当前 macOS private API 与分发限制。
-
-所有平台都必须使用 HID report descriptor 和 Usage 进行 Runtime Macro interface 识别，不能只根据 VID/PID、interface number 或设备名称猜测。
-
-## 11. 开发阶段
-
-### 阶段 0：协议和模型冻结
-
-- 确认 local HTTP API v1 路径、字段、错误模型和认证方式；
-- 确认 `DynamicObject` collection 模型；
-- 明确 current single-object 到 `default` alias 的映射；
-- 明确 source、priority、generation 和 Unknown 状态语义；
-- 增加 fake backend/API contract tests。
-
-### 阶段 1：Rust dynamic service
-
-- 把已有 dynamic protocol client 接入统一 Rust backend service；
-- 第一阶段同时只维护一个 active device 和一个 serialized HID writer；
-- 内部 collection、device alias 和 API path 从一开始兼容未来多设备；
-- 实现 capability、upload、clear、retry、generation 和状态机；
-- 不改变现有 static/auth command boundary；
-- 完成 dynamic fake-HID regression tests。
-
-### 阶段 2：Tauri 托盘、自启和场景窗口
-
-- 优先增加 tray icon、tray menu、startup-to-tray 和 close-to-tray；
-- 增加默认关闭、由用户主动启用的 login autostart；
-- 普通启动显示窗口，login autostart 使用后台参数且只显示托盘；
-- 托盘和自启稳定后，再增加场景列表、编辑器、手动激活和 clear；
-- 增加 active scenario、source、TTL 和本地观察状态；
-- 场景正文作为明确的非 secret 数据持久化到用户应用数据目录；
-- 保持现有 MagicPatterns 和 privacy boundary；
-- 不把 dynamic text 写入普通日志、诊断或无关的持久化数据。
-
-### 阶段 3：本地 HTTP API
-
-- 本地 HTTP API 作为手动 UI、托盘和自启完成后的独立里程碑；
-- API 默认关闭，只能由用户主动启用；
-- 启用后绑定 `127.0.0.1` 随机端口，并通过不含 token 的 runtime metadata 暴露实际端口；
-- token 存入 OS 安全凭据存储，不写普通配置；
-- 在 Rust backend 中实现 `/api/v1/health`、设备、capabilities、status、upload、clear 和 operation API；
-- 实现请求校验、错误映射和 idempotency；
-- 提供 curl、Python 和 Shell 示例；
-- 增加 API server 关闭、端口冲突和应用重启测试。
-
-### 阶段 4：自动场景
-
-- 支持前台应用 identifier/bundle id 规则；
-- 支持窗口标题规则；
-- 支持 debounce、generation 和外部 override；
-- 自动场景不能覆盖有效的用户手动 override；
-- 复杂场景继续通过外部服务调用 HTTP API。
-
-### 阶段 5：多 dynamic object
-
-- 等 firmware 发布多 object capability/protocol 后再实现；
-- 保持 object collection、target object 和 capability-driven UI；
-- 增加多 object fake-HID、并发、TTL、clear 和 lifecycle 测试；
-- 不为了兼容旧固件而改用 static slot 或未经验证的 fallback。
-
-## 12. 测试和验收
-
-### 12.1 自动测试
+### 14.3 Dynamic 和隐私回归
 
 至少覆盖：
 
-- API JSON schema 和版本前缀；
-- 本地非法字符、空文本、长度和 TTL 在 HID write 前被拒绝；
-- HTTP upload/clear 映射到正确的 dynamic protocol；
+- Dynamic v1 capability、upload、clear、22-byte DATA、retry 和 stale/malformed response；
 - 每个设备只有一个 writer；
-- upload retry 使用新 request id 并从 BEGIN 重启；
-- stale response 和 malformed response；
-- idempotency key；
-- 新场景丢弃旧 pending request；
-- disconnect/reconnect 后状态为 `Unknown`；
-- 应用重启不假设 dynamic object 仍存在；
+- 新 generation 淘汰 pending 旧请求；
+- disconnect/reconnect/restart 后 `Unknown`；
 - 单 object `default` alias；
-- 多 object capability 和 object selection；
-- HTTP token 不出现在日志；
-- dynamic text、serial、HID path 和 raw report 不进入诊断输出。
+- mock/正式 object collection 和目标选择；
+- capability change、keep unsupported、oversize 和 target missing；
+- dynamic auth status 不触发 static login；
+- API token、密码、Dynamic 正文、serial、HID path 和 raw frame 不进入日志、诊断、CI artifacts 或错误返回；
+- static slot/auth、隐私预览和既有 MagicPatterns UI 无回归。
 
-### 12.2 手工平台测试
+## 15. 暂不实现
 
-在 Windows、Linux 和 macOS 至少验证：
+以下内容不属于当前 UI-first 和首期功能范围：
 
-1. 应用启动到托盘；
-2. 窗口显示、隐藏和退出；
-3. Runtime Macro HID 设备发现；
-4. 多 HID interface 和 Raw HID 共存时选择正确；
-5. 外部 `curl`/Python 服务写入 dynamic macro；
-6. 用户手动场景和外部 API 同时请求时仲裁正确；
-7. 设备拔出、重新插入、睡眠恢复；
-8. Linux udev 权限和托盘环境；
-9. Windows 防火墙、端口冲突和安装后首次启动；
-10. 当前 static slot/auth 功能没有回归。
-
-### 12.3 完成标准
-
-- UI、内置规则和外部服务都使用同一 Rust dynamic service；
-- API 只提供 loopback 服务，不暴露公网监听；
-- dynamic 上传成功只报告本地观察状态，不提供 readback 假象；
-- 多来源请求不会并行写 HID；
-- 未来 firmware 增加多个 dynamic object 时无需重做 API 路径和核心数据模型；
-- Windows、Linux 和 macOS 的构建/打包验证分别在对应平台或 runner 完成；
-- 文档、测试、日志和诊断不包含真实设备标识、用户正文或凭据。
-
-## 13. 暂不实现
-
-以下内容不属于第一阶段：
-
-- 公网 HTTP API；
-- 自动上传密码、OTP、token 或其他 secret；
-- dynamic text readback；
-- static slot 和 dynamic object 的隐式 fallback；
+- 公网 HTTP API 或绑定 `0.0.0.0`；
+- 自动上传密码、OTP、token、API key、私钥或其他 secret；
+- Dynamic text readback 或把本地 ACK 包装成设备当前内容；
+- static slot 与 Dynamic Object 的隐式 fallback；
 - 为每种自动化软件开发 desktop 内置插件；
 - 浏览器 URL、IDE project、Git branch 等复杂上下文的内置识别；
-- gRPC、消息队列或云端同步；
-- 在 firmware 尚未发布多 object contract 前提前假设 object 编号和容量。
+- gRPC、消息队列、云端同步；
+- 在 firmware 正式多 object contract 发布前猜测 object 编号、数量、容量、TTL 或 wire contract；
+- 在 UI-only 阶段调用 HID、写 localStorage、Scenario 持久化或接 HTTP API。
 
-## 14. 已确认的实施计划
+## 16. 完成定义
 
-本节记录 2026-09-09 确认的交付范围和执行顺序。若本节与前文对阶段优先级的描述冲突，以本节为准。
+### 16.1 UI 视觉阶段完成
 
-### 14.1 已确认决策
+满足以下条件才算阶段 1 完成：
 
-| 决策项 | 结论 |
-|---|---|
-| 首期范围 | 完整的手动场景闭环 |
-| 实施优先级 | dynamic 核心 → 托盘/自启 → 场景 UI → 本地 HTTP API |
-| 设备模型 | 第一阶段同时只连接一个 active device |
-| 多设备兼容 | collection、alias、场景 target 和 API path 预留多设备 |
-| 登录自启 | 默认关闭，由用户主动启用；自启时后台启动，不弹主窗口 |
-| HTTP API | 默认关闭，启用后只绑定 `127.0.0.1` 随机端口 |
-| API token | 存入 OS 安全凭据存储 |
-| 场景正文 | 作为非 secret 明文保存到用户应用数据目录 |
-| 自动场景 | 手动闭环和本地 API 稳定后再实现 |
-| 多 dynamic object | 等待 firmware 发布正式 contract |
-| 编译环境 | 不在当前机器编译，使用 GitHub Actions 或对应平台 runner |
+1. tray 基础、窗口入口、close-to-tray、明确退出和单实例恢复可用；
+2. Dynamic Workspace 与现有 Static Slots、TitleBar、AppHeader 的视觉质量一致；
+3. 新 UI 已替代旧 Dynamic modal 的产品方向，但旧入口在验收前仍可保留；
+4. Scenario 是主要管理对象，Dynamic Object 明确为上传目标；
+5. 单 object `default` 和多 object collection mock 均可展示；
+6. 规定的状态矩阵、对话框和操作语义可人工检查；
+7. UI-only 阶段没有 HID、localStorage、HTTP API 或真实业务完成假象；
+8. 用户完成视觉/交互验收后，旧 Dynamic modal 入口才可移除。
 
-这里的“本地服务稍后实现”只指 loopback HTTP API。UI、托盘和未来 HTTP API 共用的 Rust `DynamicService` 仍需先完成，以确保所有来源共用同一个 HID writer、队列、generation 和状态机。
+### 16.2 首期手动闭环完成
 
-### 14.2 目标代码结构
+阶段 1 之后，完成 PR-05 至 PR-11 并满足：
 
-Rust 后端按最小充分职责拆分：
+1. Dynamic v1 已复用并接入统一 DynamicService；
+2. UI、tray 和后续来源共用一个 serialized writer/queue；
+3. Scenario 可创建、编辑、删除、原子持久化和手动 Save & Upload；
+4. 支持当前 active device alias；
+5. static locked/auth 边界无回归，Dynamic 不自动 login；
+6. restart/reconnect/disconnect 后状态为 `Unknown`；
+7. close-to-tray、明确退出和 login autostart 在对应平台正常；
+8. 日志、诊断、DTO 和 artifacts 不包含正文、凭据或真实设备标识；
+9. Windows、Linux、macOS 的适用构建和平台人工验收完成。
 
-```text
-src-tauri/src/
-├── protocol.rs
-├── dynamic.rs          # dynamic wire contract 和严格解析
-├── client.rs           # capability、upload、clear 和 retry
-├── dynamic_service.rs  # 状态机、generation 和统一调用入口
-├── scenario.rs         # 场景模型和持久化
-├── tray.rs             # 托盘和窗口生命周期
-├── autostart.rs        # login autostart 适配
-├── api.rs              # 后续 loopback HTTP API
-├── credentials.rs      # 后续 API token 凭据存储
-├── commands.rs         # Tauri command 适配层
-└── lib.rs
-```
+首期手动闭环完成不要求 HTTP API、自动规则或正式多 Dynamic Object。
 
-React 前端只拆分新增功能，不提前整体重写现有 `App.tsx`：
+### 16.3 最终产品完成
 
-```text
-src/features/dynamic/
-src/features/scenarios/
-src/types/dynamic.ts
-src/types/scenario.ts
-src/bridge.ts
-```
+最终完成还需要：
 
-### 14.3 里程碑
-
-#### M0：远程 CI 和 contract
-
-- 新增普通分支及 pull request CI；
-- Linux 执行 frontend build、format、unit tests 和 clippy；
-- macOS、Windows 执行 Rust tests 和 Tauri no-bundle build；
-- 保留现有 tag release workflow；
-- 冻结 `DynamicCapabilities`、`DynamicObject`、`DynamicObservedState`、`DynamicUploadRequest`、`Scenario` 和 `OperationStatus`；
-- 从 Python reference client 建立 golden frame fixtures；
-- CI 日志和 artifacts 不得包含正文、token、HID path、serial 或 raw report。
-
-#### M1：Dynamic wire protocol
-
-- 实现 `CAPABILITIES`、`DYNAMIC_BEGIN`、`DYNAMIC_DATA` 和 `DYNAMIC_CLEAR`；
-- 严格校验 capability version、object metadata、flags、长度和 TTL；
-- DATA 按 22 bytes 分块；
-- BEGIN 和 DATA 使用同一 request ID；
-- upload retry 必须使用新 request ID 并从 BEGIN 重启；
-- clear 按幂等操作整体重试；
-- dynamic auth status 作为 protocol mismatch；
-- dynamic 操作不得调用、修改或刷新 static auth session；
-- 使用 fake HID 覆盖边界长度、非法字符、timeout、stale 和 malformed response。
-
-#### M2：统一 DynamicService
-
-- 复用当前长期 HID worker；
-- UI、托盘、自动规则和 HTTP API 只能调用统一 service；
-- 第一阶段只维护一个 active device；
-- 每次新连接重新发现 capability；
-- 维护 `Unknown`、`Discovering`、`Unsupported`、`Ready`、`Uploading`、`CommittedLocally`、`Clearing`、`ClearedLocally` 和 `Error`；
-- 实现 generation-based last-write-wins；
-- 新请求淘汰尚未开始的旧 upload；
-- 已开始的过期 operation 可以完成，但不得覆盖当前 active state；
-- disconnect、reconnect 和 app restart 后 observed state 必须为 `Unknown`。
-
-#### M3：托盘、窗口生命周期和自启
-
-- 使用 Tauri 2 tray API 创建托盘和菜单；
-- 托盘提供打开窗口、状态、上传、clear、设置和明确退出；
-- 关闭主窗口只隐藏到托盘；
-- 有未保存草稿时关闭窗口必须先确认；
-- 只有托盘“退出”才停止 worker 和应用；
-- 单实例再次启动时恢复已有窗口；
-- 使用官方 autostart plugin；
-- 只授予 `enable`、`disable` 和 `isEnabled` 权限；
-- 普通启动显示窗口，login autostart 通过后台参数只显示托盘；
-- 自启默认关闭，设置页显示实际 OS 注册状态。
-
-#### M4：Dynamic UI 和手动场景闭环
-
-- 展示 capability、`default` object、byte count、TTL、keep 和 lifecycle flags；
-- 提供 Upload 和独立 Clear 操作；
-- dynamic 在 static locked 状态下仍可使用；
-- `CommittedLocally` 明确表示本次连接的本地观察结果，不伪装成 readback；
-- TTL 倒计时标为估计；
-- 实现场景创建、编辑、删除、保存、选择和手动激活；
-- 主窗口和托盘使用同一个场景及 operation service；
-- 场景文件带 schema version，采用临时文件加原子替换；
-- 配置损坏时保留原文件并报告可恢复错误；
-- 场景正文不进入 localStorage、日志、诊断、窗口标题或错误信息；
-- UI 持续提示 dynamic 和场景存储只适合非 secret 内容。
-
-#### M5：设备 alias
-
-- 为当前活动设备建立用户配置 alias；
-- 场景和 API 使用 alias，不暴露 serial 或 HID path；
-- 场景不得保存进程内 opaque candidate ID；
-- alias 对应多个候选设备时不得自动选择；
-- 设备摘要变化后必须由用户重新确认绑定；
-- 内部保持 `ConfiguredDevice[]` 和 `ActiveDeviceId?`，但首期不保持多个并行 HID session。
-
-完成 M0 至 M5 后，首期手动闭环完成，并在进入 HTTP API 前设置一次明确验收点。
-
-#### M6：本地 HTTP API
-
-- 默认关闭，由用户主动启用；
-- 只绑定 `127.0.0.1`，默认请求随机端口；
-- runtime metadata 只记录 API version、host、port 和 PID，不记录 token；
-- server 停止时删除 metadata，启动时清理属于已死亡进程的 stale metadata；
-- token 第一次启用时生成，存入 OS 凭据库，并支持复制和轮换；
-- 默认等待 final ACK 后返回成功；
-- 调用方使用 `Prefer: respond-async` 时返回 `202` 和 `operation_id`；
-- operation API 不返回 dynamic text；
-- idempotency cache 保存 request digest，不保存正文，并设置 TTL 和容量上限；
-- 限制 request body 大小，不记录 Authorization header 或正文；
-- API 不得自动触发 static login。
-
-#### M7：自动场景
-
-第一版只实现前台应用 identifier/bundle ID、窗口标题、debounce、generation、manual override 和 external lease。仲裁顺序为：
-
-```text
-manual override > external lease > external request > built-in rule
-```
-
-浏览器 URL、Git branch、IDE project、插件系统、脚本执行引擎和云同步继续后置。
-
-#### M8：多 dynamic object
-
-只有 firmware 发布正式 capability/protocol 且 reference client 同步后才能实施。此前只保留 collection、`target_object`、复数 API path 和当前单 object 的 `default` alias，不猜测 object ID、数量或容量。
-
-### 14.4 Pull request 拆分
-
-| PR | 内容 | 依赖 |
-|---|---|---|
-| PR-01 | CI workflow、contract DTO、golden fixtures | 无 |
-| PR-02 | Capability protocol/client | PR-01 |
-| PR-03 | Dynamic upload、clear 和 retry | PR-02 |
-| PR-04 | DynamicService、状态机和 generation | PR-03 |
-| PR-05 | Tray 和 close-to-tray | PR-04 |
-| PR-06 | Login autostart 和后台启动参数 | PR-05 |
-| PR-07 | Dynamic UI | PR-04 |
-| PR-08 | Scenario store 和编辑器 | PR-07 |
-| PR-09 | Tray 场景菜单和手动完整闭环 | PR-06、PR-08 |
-| PR-10 | Device alias 和单活动设备绑定 | PR-09 |
-| PR-11 | HTTP lifecycle、token、health 和 runtime metadata | PR-10 |
-| PR-12 | HTTP devices、status、upload 和 clear | PR-11 |
-| PR-13 | Operations、idempotency 和调用示例 | PR-12 |
-| PR-14 | 自动场景基础 | PR-13 |
-| PR-15 | 跨平台人工验收和发布文档 | 对应交付阶段 |
-
-每个 PR 只承担一个主要目标，不在同一 PR 中同时修改协议、托盘、UI 和 HTTP API。
-
-### 14.5 CI-only 验证
-
-当前机器不执行项目编译、测试或打包。所有代码 PR 通过 GitHub Actions 或对应平台 runner 执行：
-
-```text
-Frontend:
-  npm ci
-  npm run build
-
-Rust:
-  cargo fmt --check
-  cargo test
-  cargo clippy --all-targets -- -D warnings
-
-Tauri:
-  tauri build --no-bundle
-
-Repository:
-  git diff --check
-  privacy/secret scan
-```
-
-平台相关要求：
-
-- Linux、macOS 和 Windows 都执行 Rust tests 与 Tauri no-bundle build；
-- tray、autostart、window lifecycle 变更必须等待三平台 runner；
-- installer 和签名只在 release workflow 中执行；
-- 真实 HID、tray、login autostart、拔插、睡眠恢复和安装后行为由对应平台人工验证；
-- CI 通过不能替代真实硬件与桌面生命周期验收。
-
-### 14.6 首期完成定义
-
-M0 至 M5 同时满足以下条件时，首期“完整手动闭环”完成：
-
-1. capability、upload、clear、strict retry 已实现；
-2. UI 和托盘共用同一个 `DynamicService`；
-3. 同时只维护一个 active device 和一个 HID writer；
-4. 支持设备 alias；
-5. 支持场景创建、编辑、删除、持久化和手动激活；
-6. 支持从主窗口和托盘上传或 clear；
-7. close-to-tray、明确退出和 login autostart 正常；
-8. static slot/auth 无回归；
-9. restart/reconnect 后状态为 `Unknown`；
-10. Linux、macOS、Windows CI 通过；
-11. 对应平台 tray/autostart 和真实 HID 人工验收完成；
-12. 日志、诊断、DTO 和 artifacts 不包含真实设备标识、正文或凭据。
-
-首期完成不要求 HTTP API、自动规则或多 dynamic object。
+- loopback HTTP API 默认关闭并通过独立 token 保护；
+- API、tray、UI 和自动规则都通过同一 DynamicService；
+- HTTP status/operation 不提供 readback 假象；
+- 自动场景遵守 generation 和仲裁优先级；
+- firmware 发布正式多 object contract 后完成 capability-driven 多 object 支持；
+- 三平台构建、打包、tray/autostart、真实 HID 和 static/auth 回归全部验收；
+- 文档、测试、日志、诊断和 artifacts 持续符合公开仓库隐私边界。
