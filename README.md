@@ -15,6 +15,7 @@ The current version includes a Tauri 2 + React + TypeScript desktop GUI, Runtime
 For the full project constraints, validation boundaries, and release process, see the Chinese documentation:
 
 - [`docs/GUI-DEVELOPMENT.md`](docs/GUI-DEVELOPMENT.md) — GUI development and protocol constraints (中文)
+- [`docs/DYNAMIC-AUTOMATION-PLAN.md`](docs/DYNAMIC-AUTOMATION-PLAN.md) — dynamic macro scenarios, local HTTP API, and multi-object roadmap (中文)
 - [`docs/RELEASING.md`](docs/RELEASING.md) — release process and platform packaging (中文)
 - [`docs/HARDWARE-VERIFICATION.md`](docs/HARDWARE-VERIFICATION.md) — hardware and platform verification (中文)
 
