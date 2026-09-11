@@ -150,9 +150,21 @@ UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object �
 - 托盘跟随 UI locale：`init` 先用英文默认 labels 建菜单并把 `MenuItem` handles 交给 Tauri managed state；受限 command `set_tray_locale` 只接受精确的 `"en"` / `"zh-CN"`（其他值返回稳定错误 `unsupported_locale`，不 fallback、不把任意字符串写进菜单），再用 `MenuItem::set_text` 更新已有菜单项，菜单结构、ID 和 disabled 状态不变。`App.tsx` 在 Tauri 环境启动时以及 locale 变化时把 `resolveLocale` 的结果同步给托盘，无需重启，失败静默处理；浏览器预览不调用 invoke。Rust 不读环境变量、localStorage 或设备信息来猜语言；
 - 真实行为只有窗口生命周期和菜单文本同步：`Open ZMK Runtime Macro` 和 tray icon 左键点击显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 绕过 close-to-tray，退出时由 `AppState` 的 drop 继续执行 best-effort LOCK；第二次启动由 single-instance plugin 恢复已有窗口；
 - close-to-tray：`onCloseRequested` 始终 `preventDefault`，dirty 时弹出与原来相同的确认 modal，确认后经 best-effort disconnect/LOCK（正常 Disconnect 路径，同时把本地状态回到 disconnected）再 `hide()`；窗口不再被 destroy，因此 close 路径会对下一次关闭请求重新生效，浏览器预览继续使用 `beforeunload`；
-- preview 占位（disabled）：`Device`、`Dynamic status`、`Current scenario` 状态行以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 操作项，英文标签直接写明 `preview only` / `(preview)`，中文标签写明“仅预览”或“（预览）”。当前没有 DynamicService，托盘不读取设备状态、不打开 HID、不发送 protocol frame、不调用 dynamic command，也不显示 HID path、serial 或正文；启用它们需要阶段 7（托盘接入真实状态）；
-- 未实现：托盘真实状态、tray 上传/clear、autostart、DynamicService、场景持久化和 HTTP API；
+- preview 占位（disabled）：`Device`、`Dynamic status`、`Current scenario` 状态行以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 操作项，英文标签直接写明 `preview only` / `(preview)`，中文标签写明“仅预览”或“（预览）”。托盘不读取 DynamicService 状态（状态层已存在于 §4.9，托盘接入属后续阶段），不读取设备状态、不打开 HID、不发送 protocol frame、不调用 dynamic command，也不显示 HID path、serial 或正文；启用它们需要阶段 7（托盘接入真实状态）；
+- 未实现：托盘真实状态、tray 上传/clear、autostart、DynamicService 的 UI/托盘接入（状态层本身已见 §4.9）、场景持久化和 HTTP API；
 - 平台差异：Linux appindicator 在任意点击都会弹出菜单（`show_menu_on_left_click(false)` 在该平台无效），部分 Linux 桌面（如无托盘扩展的 GNOME）不提供 `TrayIconEvent::Click`，此时菜单内的 `Open ZMK Runtime Macro` 是兜底入口；这些需要在对应平台人工验收。
+
+### 4.9 DynamicService 状态层与 DTO（backend）
+
+`src-tauri/src/dynamic_service.rs` 实现窄职责的 `DynamicService` 状态层，是 dynamic 观察状态的唯一来源；`commands.rs` 只做桥接，不新增第二个 HID writer：
+
+- capability、upload、clear 仍通过 `Arc<Mutex<AppState>>` 和单一 HID worker 串行访问同一个 `MacroSession`，没有第二个 writer、线程或 queue；Dynamic commands 继续绕过 static auth gate（不调用、不刷新、不自动登录 static auth），static slot/auth 状态机不变；
+- service status 序列化值为 `unknown`、`discovering`、`ready`、`unsupported`、`uploading`、`committedLocally`、`clearing`、`clearedLocally`、`error`；per-object 观察只记录 wire slot、状态、byte length（upload 后为本次长度，clear 后为 0）和可选 TTL/keep，不保存也不返回正文；
+- capability metadata 只有一份 `DynamicCapabilitiesMetadata`（从 `commands.rs` 迁入该模块，`commands.rs` 用 `pub use` 保持旧路径可用），JSON 字段仍为 camelCase，现有 `bridge.ts` 的 `DynamicCapabilities` 不变；
+- `generation` 是本地 last-write-wins 计数器，不是 firmware 值、protocol request id 或设备版本：每次 capability/upload/clear 分配新 generation，过期完成不覆盖当前状态；新操作开始时清除被取代操作遗留的 in-flight object 状态，已确认的观察（含 byte length）保留；
+- 状态迁移：connect/disconnect/设备替换/应用退出（`AppState` drop）后为 `unknown`；capability 成功为 `ready`（并按 `dynamic_object_count` 生成 object 行），`BAD_OPCODE`/`BAD_VERSION` 为 `unsupported`，其他失败为 `error`；upload/clear 开始时为 `uploading`/`clearing`，成功只记录本地 ACK（`committedLocally`/`clearedLocally`）；Remote status 失败保留 session 并进入 `error`/`unsupported`，transport/protocol 失败丢弃 session 并回到 `unknown`；backend 不保存 draft，也不保存任何 dynamic 正文；
+- command：只读 `get_dynamic_state`（无 HID I/O）返回该无正文 DTO；`get_dynamic_capabilities`/`upload_dynamic`/`clear_dynamic` 与它共用同一状态层，返回值和错误映射不变；
+- 未接入：page-level Dynamic Workspace 仍使用 preview fixture（§4.7），Scenario 持久化、托盘真实状态（§4.8 仍是 disabled preview 占位）和 HTTP API 仍未实现；连接后的自动 capability discovery 也仍未实现（仍由显式 command 触发）。
 
 ## 5. 后端与前端边界
 
@@ -167,7 +179,7 @@ Rust command layer
 Runtime Macro protocol v2 / hidapi
 ```
 
-前端只调用 `bridge.ts` 中的 Tauri commands。Rust 负责设备发现、显式候选选择、AUTH_INFO、认证 KDF/proof、static LIST/GET/SET/CLEAR、dynamic capability/upload/clear（含 object slot 校验）、重试、事务边界和错误映射。Dynamic commands 不经过 `ensure_management_access`，但仍复用同一 HID session/串行队列；Tauri IPC 使用 camelCase 参数（包括 `slot`、`ttlSeconds`、`keepAfterExecute`）。`set_tray_locale` 是唯一的托盘 command：参数名为 `locale`（前端按 camelCase 传 `{ locale }`），只更新原生菜单文本，不接 HID、不调用 DynamicService、不持久化任何配置。Tauri command 不返回 salt、iterations、K、nonce、proof、密码、dynamic readback 或 raw report。
+前端只调用 `bridge.ts` 中的 Tauri commands。Rust 负责设备发现、显式候选选择、AUTH_INFO、认证 KDF/proof、static LIST/GET/SET/CLEAR、dynamic capability/upload/clear（含 object slot 校验）、重试、事务边界和错误映射。Dynamic commands 不经过 `ensure_management_access`，但仍复用同一 HID session/串行队列；Tauri IPC 使用 camelCase 参数（包括 `slot`、`ttlSeconds`、`keepAfterExecute`）。Dynamic 的本地观察状态由 `src-tauri/src/dynamic_service.rs` 的 `DynamicService` 维护（§4.9），只读 command `get_dynamic_state` 不做 HID I/O，只返回当前 session 的无正文观察状态。`set_tray_locale` 是唯一的托盘 command：参数名为 `locale`（前端按 camelCase 传 `{ locale }`），只更新原生菜单文本，不接 HID、不调用 DynamicService、不持久化任何配置。Tauri command 不返回 salt、iterations、K、nonce、proof、密码、dynamic 正文、dynamic readback 或 raw report。
 
 ## 6. Tauri window 权限
 
@@ -191,7 +203,8 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 5. 文档、跨平台行为/安装器配置检查和最终验证（含硬件边界检查）；
 6. Dynamic Macro v2 多槽位 capability（slot-aware capability/upload/clear、512-byte object、逐槽 clear）、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix；
 7. Dynamic Workspace page-level UI-only 阶段（Scenario 列表/编辑器、capability-driven target 行、18 个 preview 状态、in-memory only）；真实 dynamic 操作仍走旧 modal；
-8. 托盘基础（Tauri 2 tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复）和菜单文本多语言（`en` / `zh-CN` 两套 labels，`set_tray_locale` 跟随 UI locale，Rust 只接受这两个精确 tag）；设备/Dynamic/Scenario 状态行和 Dynamic 操作项为 disabled preview 占位，不接 DynamicService。
+8. 托盘基础（Tauri 2 tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复）和菜单文本多语言（`en` / `zh-CN` 两套 labels，`set_tray_locale` 跟随 UI locale，Rust 只接受这两个精确 tag）；设备/Dynamic/Scenario 状态行和 Dynamic 操作项为 disabled preview 占位，不接 DynamicService；
+9. DynamicService 状态层和 DTO（`src-tauri/src/dynamic_service.rs`、`get_dynamic_state` command、`bridge.ts` 类型 wrapper、generation 与单一 HID writer 边界，见 §4.9）；UI Workspace 真实数据、Scenario store、托盘真实状态和 HTTP API 仍未接入，后续阶段见 `docs/DYNAMIC-AUTOMATION-PLAN.md` §12。
 
 所有阶段均只支持 v2，不提供 Legacy v1 管理。MagicPatterns 是唯一视觉基准；仅在真实功能、v2 协议、安全约束或 Tauri 平台行为冲突时适配，并记录冲突原因。
 
@@ -200,7 +213,7 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 自动验证至少包括：
 
 - `npm run build`；
-- `npm test`（前端 dynamic object 状态模型和 page-level scenario model，含 `tests/scenario-model.test.ts` 的 target/scenario 解析、阻塞条件和 preview fixture 检查；Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
+- `npm test`（前端 dynamic object 状态模型、Dynamic service DTO contract（`tests/dynamic-service-state.test.ts`）和 page-level scenario model，含 `tests/scenario-model.test.ts` 的 target/scenario 解析、阻塞条件和 preview fixture 检查；Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
 - `cargo fmt --check`、`cargo test`、`cargo clippy --all-targets -- -D warnings`；
 - `npm run tauri build -- --no-bundle`；
 - `git diff --check` 和隐私/secret scan。
@@ -211,6 +224,6 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 
 ## 9. 当前剩余工作与发布边界
 
-阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复、菜单文本跟随 UI locale），本机自动验证已通过（含两套 labels、`preview` 标记和非法 locale 的单元测试），但托盘图标/菜单交互、菜单文本在实际系统上的渲染与切换、close-to-tray、Wayland/X11 和单实例行为仍需在对应平台人工验收；托盘菜单中的设备/Dynamic/Scenario 状态和 Dynamic 操作仍是 preview 占位，需要先完成 DynamicService 和托盘真实状态阶段。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
+阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复、菜单文本跟随 UI locale），本机自动验证已通过（含两套 labels、`preview` 标记和非法 locale 的单元测试），但托盘图标/菜单交互、菜单文本在实际系统上的渲染与切换、close-to-tray、Wayland/X11 和单实例行为仍需在对应平台人工验收；托盘菜单中的设备/Dynamic/Scenario 状态和 Dynamic 操作仍是 preview 占位，需要先完成 DynamicService 的 UI/托盘接入和托盘真实状态阶段。DynamicService 状态层和 `get_dynamic_state` DTO（§4.9）已实现并接入现有 dynamic commands：它只发布本地观察状态（service/object 状态、byte length、本地 generation、可选 TTL/keep），不保存也不返回正文、HID path、serial 或 raw frame；本机 Rust/前端测试覆盖了初始/`unknown`、capability 成功与 `unsupported`/`error`、多 object、upload/clear 成功与失败、过期 generation 和 DTO 字段集合检查。page-level Dynamic Workspace、Scenario store、托盘真实状态和 HTTP API 仍未接入，动态功能仍只用 fake-HID/单元测试验证。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
 
 后续维护必须继续遵守 v2-only 边界，不得恢复 Legacy v1 管理或把密码、K、正文、HID path、serial、raw report 写入持久化、日志和诊断。

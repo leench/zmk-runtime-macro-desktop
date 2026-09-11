@@ -153,6 +153,76 @@ export function clearDynamic(slot: number): Promise<void> {
   return invoke("clear_dynamic", { slot });
 }
 
+/**
+ * Serialized status of the Rust Dynamic service for the current session.
+ *
+ * These status values are the serialized backend contract. The UI-only scenario
+ * model (`src/types/dynamic.ts`) keeps its own presentation vocabulary until the
+ * Dynamic Workspace is wired to the real service (plan §12 stage 5).
+ */
+export type DynamicServiceStatus =
+  | "unknown"
+  | "discovering"
+  | "ready"
+  | "unsupported"
+  | "uploading"
+  | "committedLocally"
+  | "clearing"
+  | "clearedLocally"
+  | "error";
+
+/** Local observation status of one dynamic object in the current session. */
+export type DynamicObjectStatus =
+  | "unknown"
+  | "uploading"
+  | "committedLocally"
+  | "clearing"
+  | "clearedLocally"
+  | "error";
+
+/**
+ * Local observation of one dynamic object. Only the byte length of the uploaded
+ * text is known to the backend: there is no readback and no stored text.
+ */
+export type DynamicObjectObservation = {
+  /** Wire slot reported by `CAPABILITIES` (`0..dynamicObjectCount-1`). */
+  slot: number;
+  status: DynamicObjectStatus;
+  /** Byte length of the last upload, `0` after a clear, `null` when unobserved. */
+  textLength: number | null;
+  /** Requested TTL of the last upload; `null` for the device default. */
+  ttlSeconds: number | null;
+  keepAfterExecute: boolean;
+};
+
+/**
+ * Body-free Dynamic service state of the connected device.
+ *
+ * `status` and the per-object observations are local facts of this session, not
+ * firmware state: a committed/cleared object only means the device acknowledged
+ * the operation. `generation` is the backend's local last-write-wins counter and
+ * must never be presented as a device value.
+ */
+export type DynamicServiceState = {
+  status: DynamicServiceStatus;
+  capabilities: DynamicCapabilities | null;
+  generation: number;
+  objects: DynamicObjectObservation[];
+  /** Sanitized error of the newest failed dynamic operation, if any. */
+  error: CommandError | null;
+};
+
+/**
+ * Read the observed Dynamic service state.
+ *
+ * The command performs no HID I/O; it reports the state of the current session
+ * and returns `unknown` while no session observed anything. It never returns
+ * dynamic text, HID paths or device serials.
+ */
+export function getDynamicState(): Promise<DynamicServiceState> {
+  return invoke<DynamicServiceState>("get_dynamic_state");
+}
+
 export function getSettings(): Promise<ClientSettings> {
   return invoke<ClientSettings>("get_settings");
 }

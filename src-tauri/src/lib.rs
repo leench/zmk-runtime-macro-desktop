@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod commands;
+pub mod dynamic_service;
 pub mod error;
 pub mod hid;
 pub mod protocol;
@@ -31,6 +32,7 @@ pub fn run() {
             commands::set_slot,
             commands::clear_slot,
             commands::get_dynamic_capabilities,
+            commands::get_dynamic_state,
             commands::upload_dynamic,
             commands::clear_dynamic,
             commands::get_settings,

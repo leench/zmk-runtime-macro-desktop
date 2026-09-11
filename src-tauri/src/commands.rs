@@ -7,6 +7,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::client::{ClientConfig, RuntimeMacroClient, SlotInfo};
+use crate::dynamic_service::{
+    DynamicFailure, DynamicService, DynamicServiceError, DynamicServiceState,
+};
 use crate::error::{ClientError, TransportError};
 use crate::hid::{
     enumerate_devices_with_known_record, new_hid_api, open_device, DeviceDiscoveryError,
@@ -14,6 +17,10 @@ use crate::hid::{
 };
 use crate::protocol::{AuthInfo, DynamicCapabilities, Status};
 use crate::tray::{TrayLocale, TrayMenuItems};
+
+// The dynamic capability DTO lives in the service state layer, which is its only
+// definition. The crate path of the command module stays a valid alias for it.
+pub use crate::dynamic_service::DynamicCapabilitiesMetadata;
 
 /// A stable, serializable error envelope used by every frontend command.
 ///
@@ -205,6 +212,18 @@ impl From<ClientError> for CommandError {
     }
 }
 
+impl From<CommandError> for DynamicServiceError {
+    /// The service publishes the same sanitized envelope the command returns, so
+    /// a state snapshot never carries backend details the frontend could not
+    /// already see.
+    fn from(error: CommandError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+        }
+    }
+}
+
 type HidJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Run every application-state command on one long-lived thread.
@@ -352,54 +371,6 @@ impl From<SlotInfo> for SlotMetadata {
         Self {
             slot: slot.slot,
             length: slot.length,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DynamicCapabilitiesMetadata {
-    pub capability_version: u8,
-    pub dynamic_object_count: u8,
-    pub lifecycle_flags: u16,
-    pub max_dynamic_length: u16,
-    pub default_ttl_seconds: u32,
-    pub min_ttl_seconds: u32,
-    pub max_ttl_seconds: u32,
-    pub transaction_timeout_seconds: u32,
-    pub clear_on_boot: bool,
-    pub clear_on_ttl_expiry: bool,
-    pub clear_on_execution_accept: bool,
-    pub clear_on_usb_disconnect: bool,
-    pub clear_on_ble_profile_change: bool,
-    pub clear_on_selected_endpoint_change: bool,
-    pub supports_keep_after_execute: bool,
-}
-
-impl From<DynamicCapabilities> for DynamicCapabilitiesMetadata {
-    fn from(capabilities: DynamicCapabilities) -> Self {
-        Self {
-            capability_version: capabilities.capability_version,
-            dynamic_object_count: capabilities.dynamic_object_count,
-            lifecycle_flags: capabilities.lifecycle_flags,
-            max_dynamic_length: capabilities.max_dynamic_length,
-            default_ttl_seconds: capabilities.default_ttl_seconds,
-            min_ttl_seconds: capabilities.min_ttl_seconds,
-            max_ttl_seconds: capabilities.max_ttl_seconds,
-            transaction_timeout_seconds: capabilities.transaction_timeout_seconds,
-            clear_on_boot: capabilities.lifecycle_flags
-                & crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_BOOT
-                != 0,
-            clear_on_ttl_expiry: capabilities.lifecycle_flags
-                & crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_TTL_EXPIRY
-                != 0,
-            clear_on_execution_accept: capabilities.lifecycle_flags
-                & crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_EXECUTION_ACCEPT
-                != 0,
-            clear_on_usb_disconnect: capabilities.clear_on_usb_disconnect(),
-            clear_on_ble_profile_change: capabilities.clear_on_ble_profile_change(),
-            clear_on_selected_endpoint_change: capabilities.clear_on_selected_endpoint_change(),
-            supports_keep_after_execute: capabilities.supports_keep_after_execute(),
         }
     }
 }
@@ -646,6 +617,10 @@ pub struct AppState<F: SessionFactory = HidSessionFactory> {
     connection: Option<ConnectedSession>,
     factory: F,
     client_config: ClientConfig,
+    /// Locally observed Dynamic Macro state of the current session. It is a
+    /// state layer only: every dynamic operation still runs on the single
+    /// session above, serialized by this mutex and the HID worker thread.
+    dynamic: DynamicService,
 }
 
 impl Default for AppState<HidSessionFactory> {
@@ -661,6 +636,7 @@ impl<F: SessionFactory> AppState<F> {
             connection: None,
             factory,
             client_config: ClientConfig::default(),
+            dynamic: DynamicService::new(),
         }
     }
 
@@ -1044,10 +1020,16 @@ impl<F: SessionFactory> AppState<F> {
         }
     }
 
+    /// Snapshot of the observed dynamic state; never contains dynamic text.
+    pub fn dynamic_state(&self) -> DynamicServiceState {
+        self.dynamic.state()
+    }
+
     pub fn dynamic_capabilities(&mut self) -> Result<DynamicCapabilitiesMetadata, CommandError> {
         if self.connection.is_none() {
             return Err(CommandError::not_connected());
         }
+        let generation = self.dynamic.begin_capability_discovery();
         let result = self
             .connection
             .as_mut()
@@ -1055,13 +1037,15 @@ impl<F: SessionFactory> AppState<F> {
             .session
             .dynamic_capabilities();
         match result {
-            Ok(capabilities) => Ok(capabilities.into()),
-            Err(error) => {
-                if !self.retain_connection_for_dynamic_error(&error) {
-                    self.connection = None;
-                }
-                Err(dynamic_command_error(error))
+            Ok(capabilities) => {
+                // The state mutex already serializes every command; the service
+                // still rejects a completion whose generation was superseded, so
+                // a stale result can never overwrite a newer observation.
+                self.dynamic
+                    .complete_capability_discovery(generation, capabilities);
+                Ok(capabilities.into())
             }
+            Err(error) => Err(self.note_dynamic_failure(generation, None, error)),
         }
     }
 
@@ -1075,6 +1059,10 @@ impl<F: SessionFactory> AppState<F> {
         if self.connection.is_none() {
             return Err(CommandError::not_connected());
         }
+        // Only the byte length reaches the service state. The dynamic text stays
+        // inside this call and is never stored, logged or returned.
+        let text_length = u16::try_from(text.len()).unwrap_or(u16::MAX);
+        let generation = self.dynamic.begin_upload(slot);
         let result = self
             .connection
             .as_mut()
@@ -1082,13 +1070,17 @@ impl<F: SessionFactory> AppState<F> {
             .session
             .upload_dynamic(slot, text.as_bytes(), ttl_seconds, keep_after_execute);
         match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if !self.retain_connection_for_dynamic_error(&error) {
-                    self.connection = None;
-                }
-                Err(dynamic_command_error(error))
+            Ok(()) => {
+                self.dynamic.complete_upload(
+                    generation,
+                    slot,
+                    text_length,
+                    ttl_seconds,
+                    keep_after_execute,
+                );
+                Ok(())
             }
+            Err(error) => Err(self.note_dynamic_failure(generation, Some(slot), error)),
         }
     }
 
@@ -1096,6 +1088,7 @@ impl<F: SessionFactory> AppState<F> {
         if self.connection.is_none() {
             return Err(CommandError::not_connected());
         }
+        let generation = self.dynamic.begin_clear(slot);
         let result = self
             .connection
             .as_mut()
@@ -1103,14 +1096,49 @@ impl<F: SessionFactory> AppState<F> {
             .session
             .clear_dynamic(slot);
         match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if !self.retain_connection_for_dynamic_error(&error) {
-                    self.connection = None;
-                }
-                Err(dynamic_command_error(error))
+            Ok(()) => {
+                self.dynamic.complete_clear(generation, slot);
+                Ok(())
             }
+            Err(error) => Err(self.note_dynamic_failure(generation, Some(slot), error)),
         }
+    }
+
+    /// Apply a failed dynamic call to the service state and map it for the
+    /// frontend.
+    ///
+    /// A remote status keeps the HID session and publishes `Unsupported` or
+    /// `Error` with the sanitized command error, exactly like the returned
+    /// `CommandError`. A transport or protocol failure drops the session, which
+    /// resets the observed state to `Unknown`: no observation survives a lost
+    /// session. A completion of a superseded operation is rejected by the
+    /// generation check inside the service instead of overwriting newer state.
+    fn note_dynamic_failure(
+        &mut self,
+        generation: u64,
+        slot: Option<u8>,
+        error: ClientError,
+    ) -> CommandError {
+        let failure = dynamic_failure(&error);
+        let retains_connection = self.retain_connection_for_dynamic_error(&error);
+        let command_error = dynamic_command_error(error);
+        if retains_connection {
+            let service_error = DynamicServiceError::from(command_error.clone());
+            match slot {
+                Some(slot) => {
+                    self.dynamic
+                        .fail_object_operation(generation, slot, failure, service_error);
+                }
+                None => {
+                    self.dynamic
+                        .fail_capability_discovery(generation, failure, service_error);
+                }
+            }
+        } else {
+            self.connection = None;
+            self.dynamic.reset();
+        }
+        command_error
     }
 
     fn retain_connection_for_dynamic_error(&self, error: &ClientError) -> bool {
@@ -1135,6 +1163,10 @@ impl<F: SessionFactory> AppState<F> {
             // is the authoritative lifecycle action even if the HID write fails.
             let _ = connection.session.lock();
         }
+        // Every observed dynamic fact belongs to the session that was just
+        // dropped, so the service returns to `Unknown` and in-flight
+        // completions become stale.
+        self.dynamic.reset();
     }
 }
 
@@ -1188,6 +1220,18 @@ fn dynamic_command_error(error: ClientError) -> CommandError {
             "The device returned an authentication status for a Dynamic Macro request.",
         ),
         other => CommandError::from(other),
+    }
+}
+
+/// Classify a failed dynamic session call for the service state layer.
+///
+/// This mirrors [`dynamic_command_error`]: only an explicit protocol
+/// incompatibility is `Unsupported`, every other failure is an operational
+/// error.
+fn dynamic_failure(error: &ClientError) -> DynamicFailure {
+    match error {
+        ClientError::Remote(Status::BadOpcode | Status::BadVersion) => DynamicFailure::Unsupported,
+        _ => DynamicFailure::Error,
     }
 }
 
@@ -1454,6 +1498,20 @@ pub async fn clear_dynamic(
     .await
 }
 
+#[tauri::command]
+pub async fn get_dynamic_state(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<DynamicServiceState, CommandError> {
+    let state = Arc::clone(state.inner());
+    run_on_hid_worker(move || {
+        let state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        Ok(state.dynamic_state())
+    })
+    .await
+}
+
 /// Switches the native tray menu labels to the frontend's resolved UI locale.
 ///
 /// The locale always comes from the frontend's `resolveLocale` result: this
@@ -1492,6 +1550,9 @@ fn tray_locale_from_tag(tag: &str) -> Result<TrayLocale, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dynamic_service::{
+        DynamicObjectObservation, DynamicObjectStatus, DynamicServiceStatus,
+    };
     use crate::hid::DeviceSummary;
     use crate::protocol::Status;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -2822,6 +2883,346 @@ mod tests {
             state.clear_slot(0).unwrap_err(),
             CommandError::not_connected()
         );
+    }
+
+    const FORBIDDEN_DYNAMIC_KEYS: &[&str] = &[
+        "text",
+        "draftText",
+        "path",
+        "serial",
+        "password",
+        "token",
+        "secret",
+        "salt",
+        "nonce",
+        "proof",
+        "raw",
+        "frame",
+    ];
+
+    /// Connect one fake device and return the state after the AUTH_INFO handshake.
+    fn connected_state(factory: FakeFactory) -> AppState<FakeFactory> {
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"dynamic-service",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+        state
+    }
+
+    fn collect_json_keys(value: &serde_json::Value, keys: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    keys.push(key.clone());
+                    collect_json_keys(child, keys);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_json_keys(item, keys);
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+
+    /// Assert that a dynamic service state only exposes the documented keys, then
+    /// return its serialized form for body checks.
+    fn assert_state_is_body_free(state: &DynamicServiceState) -> String {
+        let value = serde_json::to_value(state).unwrap();
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<String>>(),
+            vec!["capabilities", "error", "generation", "objects", "status"]
+        );
+        for object in value["objects"].as_array().unwrap() {
+            assert_eq!(
+                object
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                vec![
+                    "keepAfterExecute",
+                    "slot",
+                    "status",
+                    "textLength",
+                    "ttlSeconds"
+                ]
+            );
+        }
+        let mut keys = Vec::new();
+        collect_json_keys(&value, &mut keys);
+        for key in &keys {
+            assert!(
+                !FORBIDDEN_DYNAMIC_KEYS.contains(&key.as_str()),
+                "dynamic service state exposes forbidden key {key}"
+            );
+        }
+        serde_json::to_string(state).unwrap()
+    }
+
+    #[test]
+    fn dynamic_state_dto_is_unknown_until_a_session_observes_something() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let mut state = AppState::new(factory);
+        let initial = state.dynamic_state();
+        assert_eq!(initial.status, DynamicServiceStatus::Unknown);
+        assert_eq!(initial.capabilities, None);
+        assert!(initial.objects.is_empty());
+        assert_eq!(initial.error, None);
+        assert_state_is_body_free(&initial);
+
+        // A dynamic command without a connection fails without inventing a
+        // device fact or a new generation.
+        assert_eq!(
+            state.dynamic_capabilities(),
+            Err(CommandError::not_connected())
+        );
+        assert_eq!(state.dynamic_state(), initial);
+    }
+
+    #[test]
+    fn dynamic_state_resets_on_disconnect_and_device_switch() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let mut state = AppState::new(factory);
+        let candidates = state.refresh_records(vec![
+            record(
+                b"dynamic-first",
+                RUNTIME_MACRO_USAGE_PAGE,
+                RUNTIME_MACRO_USAGE,
+                1,
+            ),
+            record(
+                b"dynamic-second",
+                RUNTIME_MACRO_USAGE_PAGE,
+                RUNTIME_MACRO_USAGE,
+                2,
+            ),
+        ]);
+        state.connect(&candidates[0].id).unwrap();
+        state.dynamic_capabilities().unwrap();
+        let ready = state.dynamic_state();
+        assert_eq!(ready.status, DynamicServiceStatus::Ready);
+
+        // Replacing the device drops every observation of the old session.
+        state.connect(&candidates[1].id).unwrap();
+        let replaced = state.dynamic_state();
+        assert_eq!(replaced.status, DynamicServiceStatus::Unknown);
+        assert_eq!(replaced.capabilities, None);
+        assert!(replaced.objects.is_empty());
+        assert_eq!(replaced.error, None);
+        assert!(replaced.generation > ready.generation);
+
+        state.disconnect();
+        assert_eq!(state.dynamic_state().status, DynamicServiceStatus::Unknown);
+        state.disconnect();
+        assert_eq!(state.dynamic_state().status, DynamicServiceStatus::Unknown);
+    }
+
+    #[test]
+    fn dynamic_capabilities_publish_the_service_state_and_the_stable_metadata() {
+        let (device_factory, _) = factory(Ok(Vec::new()));
+        let mut state = connected_state(device_factory);
+        let metadata = state.dynamic_capabilities().unwrap();
+        assert_eq!(metadata.dynamic_object_count, 8);
+
+        let observed = state.dynamic_state();
+        assert_eq!(observed.status, DynamicServiceStatus::Ready);
+        assert_eq!(observed.capabilities, Some(metadata));
+        assert_eq!(observed.objects.len(), 8);
+        assert!(observed
+            .objects
+            .iter()
+            .enumerate()
+            .all(|(index, object)| object.slot as usize == index
+                && object.status == DynamicObjectStatus::Unknown
+                && object.text_length.is_none()));
+        let serialized = assert_state_is_body_free(&observed);
+        assert!(serialized.contains(r#""status":"ready""#));
+        assert!(serialized.contains(r#""dynamicObjectCount":8"#));
+
+        // A single-object device reports exactly one object, never a guess.
+        let (mut single_factory, _) = factory(Ok(Vec::new()));
+        if let Ok(capabilities) = single_factory.dynamic_capabilities_result.as_mut() {
+            capabilities.dynamic_object_count = 1;
+        }
+        let mut single = connected_state(single_factory);
+        single.dynamic_capabilities().unwrap();
+        let observed = single.dynamic_state();
+        assert_eq!(observed.objects.len(), 1);
+        assert_eq!(observed.objects[0].slot, 0);
+    }
+
+    #[test]
+    fn dynamic_upload_and_clear_publish_local_observations_per_slot() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let upload_calls = Arc::clone(&factory.dynamic_upload_calls);
+        let clear_calls = Arc::clone(&factory.dynamic_clear_calls);
+        let mut state = connected_state(factory);
+        state.dynamic_capabilities().unwrap();
+
+        state.upload_dynamic(7, "fixture", Some(60), true).unwrap();
+        let after_upload = state.dynamic_state();
+        assert_eq!(after_upload.status, DynamicServiceStatus::CommittedLocally);
+        assert_eq!(
+            after_upload.objects[7],
+            DynamicObjectObservation {
+                slot: 7,
+                status: DynamicObjectStatus::CommittedLocally,
+                text_length: Some(7),
+                ttl_seconds: Some(60),
+                keep_after_execute: true,
+            }
+        );
+        assert_eq!(after_upload.objects[0].status, DynamicObjectStatus::Unknown);
+        assert_eq!(after_upload.objects[0].text_length, None);
+        assert_state_is_body_free(&after_upload);
+
+        state.clear_dynamic(7).unwrap();
+        let after_clear = state.dynamic_state();
+        assert_eq!(after_clear.status, DynamicServiceStatus::ClearedLocally);
+        assert_eq!(
+            after_clear.objects[7],
+            DynamicObjectObservation {
+                slot: 7,
+                status: DynamicObjectStatus::ClearedLocally,
+                text_length: Some(0),
+                ttl_seconds: None,
+                keep_after_execute: false,
+            }
+        );
+        // The text only ever existed on the way to the fake transport.
+        assert_eq!(
+            upload_calls.lock().unwrap().as_slice(),
+            &[(7, b"fixture".to_vec(), Some(60), true)]
+        );
+        assert_eq!(clear_calls.lock().unwrap().as_slice(), &[7]);
+        assert_state_is_body_free(&after_clear);
+    }
+
+    #[test]
+    fn dynamic_upload_failure_publishes_error_state_without_the_dynamic_text() {
+        const MARKER: &str = "marker-payload";
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_upload_result = Err(ClientError::Remote(Status::BadLength));
+        let mut state = connected_state(factory);
+        state.dynamic_capabilities().unwrap();
+
+        assert_eq!(
+            state.upload_dynamic(7, MARKER, None, false).unwrap_err(),
+            CommandError::new("bad_length", "The device rejected the data length.")
+        );
+        let observed = state.dynamic_state();
+        assert_eq!(observed.status, DynamicServiceStatus::Error);
+        assert_eq!(
+            observed.error.as_ref(),
+            Some(&DynamicServiceError {
+                code: "bad_length".to_string(),
+                message: "The device rejected the data length.".to_string(),
+            })
+        );
+        assert_eq!(observed.objects[7].status, DynamicObjectStatus::Error);
+        assert_eq!(observed.objects[7].text_length, None);
+        // A remote status keeps the session, the capability metadata and the
+        // static auth boundary untouched.
+        assert!(state.connection_state().connected);
+        assert_eq!(state.connection_state().auth_state, AuthState::Open);
+        assert_eq!(observed.capabilities.unwrap().dynamic_object_count, 8);
+        let serialized = assert_state_is_body_free(&observed);
+        assert!(!serialized.contains(MARKER));
+    }
+
+    #[test]
+    fn dynamic_unsupported_failure_publishes_the_unsupported_status() {
+        let (mut capabilities_factory, _) = factory(Ok(Vec::new()));
+        capabilities_factory.dynamic_capabilities_result =
+            Err(ClientError::Remote(Status::BadOpcode));
+        let mut state = connected_state(capabilities_factory);
+        assert_eq!(
+            state.dynamic_capabilities().unwrap_err().code,
+            "dynamic_unsupported"
+        );
+        let observed = state.dynamic_state();
+        assert_eq!(observed.status, DynamicServiceStatus::Unsupported);
+        assert_eq!(observed.capabilities, None);
+        assert_eq!(observed.error.as_ref().unwrap().code, "dynamic_unsupported");
+        assert!(state.connection_state().connected);
+        assert_state_is_body_free(&observed);
+
+        // An upload rejected as unsupported is reported the same way.
+        let (mut unsupported_factory, _) = factory(Ok(Vec::new()));
+        unsupported_factory.dynamic_upload_result = Err(ClientError::Remote(Status::BadVersion));
+        let mut state = connected_state(unsupported_factory);
+        assert_eq!(
+            state
+                .upload_dynamic(7, "fixture", None, false)
+                .unwrap_err()
+                .code,
+            "dynamic_unsupported"
+        );
+        let observed = state.dynamic_state();
+        assert_eq!(observed.status, DynamicServiceStatus::Unsupported);
+        // No capability exchange succeeded, so the failed upload only adds its
+        // own slot entry instead of guessing the other objects.
+        assert_eq!(observed.objects.len(), 1);
+        assert_eq!(observed.objects[0].slot, 7);
+        assert_eq!(observed.objects[0].status, DynamicObjectStatus::Error);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn dynamic_transport_failure_resets_the_service_state_to_unknown() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_upload_result = Err(ClientError::Transport(TransportError::Timeout));
+        let mut state = connected_state(factory);
+        state.dynamic_capabilities().unwrap();
+
+        assert_eq!(
+            state
+                .upload_dynamic(7, "fixture", None, false)
+                .unwrap_err()
+                .code,
+            "timeout"
+        );
+        // A lost session cannot keep device facts, so the connection is dropped
+        // and the observed state returns to Unknown.
+        assert!(!state.connection_state().connected);
+        let observed = state.dynamic_state();
+        assert_eq!(observed.status, DynamicServiceStatus::Unknown);
+        assert_eq!(observed.capabilities, None);
+        assert!(observed.objects.is_empty());
+        assert_eq!(observed.error, None);
+        assert_state_is_body_free(&observed);
+    }
+
+    #[test]
+    fn dynamic_object_slot_failure_marks_the_object_and_keeps_capabilities() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_clear_result = Err(ClientError::InvalidDynamicSlot { slot: 3 });
+        let mut state = connected_state(factory);
+        state.dynamic_capabilities().unwrap();
+
+        assert_eq!(state.clear_dynamic(3).unwrap_err().code, "invalid_slot");
+        let observed = state.dynamic_state();
+        assert_eq!(observed.status, DynamicServiceStatus::Error);
+        assert_eq!(observed.objects[3].status, DynamicObjectStatus::Error);
+        assert_eq!(observed.objects[3].text_length, None);
+        assert_eq!(observed.capabilities.unwrap().dynamic_object_count, 8);
+        assert!(state.connection_state().connected);
     }
 
     #[test]

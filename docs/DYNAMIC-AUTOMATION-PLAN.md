@@ -89,13 +89,15 @@ TTL 倒计时如果展示，必须标记为估计值，不能表示可靠的设�
 - Dynamic 绕过 static password gate，但不应触发 static login；
 - dynamic 文本仅允许 printable ASCII、LF、Tab 和 Backspace；
 - Dynamic 默认执行后消费，可选 `keep-after-execute`；
-- Dynamic 没有 readback，只能报告本地观察状态。
+- Dynamic 没有 readback，只能报告本地观察状态；
+- Dynamic 状态层 `DynamicService`（capability、upload、clear 的本地观察状态、generation、唯一 DTO 和 `get_dynamic_state` command）已落地并在本阶段迁移完成；UI Workspace、Scenario store、托盘真实状态和 HTTP API 仍未接入。
 
 相关现有实现主要位于：
 
 ```text
 src-tauri/src/protocol.rs
 src-tauri/src/client.rs
+src-tauri/src/dynamic_service.rs
 src-tauri/src/commands.rs
 src/bridge.ts
 src/components/DynamicMacroPanel.tsx
@@ -425,7 +427,7 @@ UI 视觉验收之后，所有真实来源必须共用一个 Rust `DynamicServic
 src-tauri/src/
 ├── protocol.rs          # 已有 wire protocol
 ├── client.rs            # 已有 capability/upload/clear/retry client
-├── dynamic_service.rs   # 后续统一队列、generation、observed state
+├── dynamic_service.rs   # 已落地：状态层、generation、observed state、唯一 DTO
 ├── scenario.rs          # 后续 Scenario 模型和原子持久化
 ├── tray.rs              # tray/window lifecycle 和真实状态菜单
 ├── autostart.rs         # 后续 login autostart
@@ -434,6 +436,20 @@ src-tauri/src/
 ├── commands.rs          # Tauri bridge
 └── lib.rs
 ```
+
+### 8.1 当前实现状态（状态层已落地）
+
+`src-tauri/src/dynamic_service.rs` 已实现窄职责的 `DynamicService` 状态层和唯一 DTO，`src-tauri/src/commands.rs` 只做桥接：
+
+- capability metadata 只定义一份：`DynamicCapabilitiesMetadata` 位于 `dynamic_service.rs`，`commands.rs` 通过 `pub use` 保持旧路径可用，Tauri JSON 字段仍为 camelCase，现有 `bridge.ts` 兼容；
+- service status 序列化值固定为 `unknown` / `discovering` / `ready` / `unsupported` / `uploading` / `committedLocally` / `clearing` / `clearedLocally` / `error`；
+- per-object 观察只记录 wire slot、状态、byte length（upload 后为本次长度，clear 后为 0）和可选 TTL/keep，状态和 DTO 都不保存也不返回正文；
+- `generation` 是本地 last-write-wins 计数器，不是 firmware 值、不是 protocol request id：每次 capability/upload/clear 分配新 generation，过期完成不覆盖当前状态，新操作开始时清除被取代操作遗留的 in-flight object 状态；
+- 不新增第二个 HID writer、线程或队列：所有 command 仍通过 `Arc<Mutex<AppState>>` + 单一 HID worker 串行访问同一个 `MacroSession`，因此没有也不假装实现并行 writer；
+- connect/disconnect/设备替换/应用退出（`AppState` drop）后状态回到 `Unknown`；transport/protocol 失败会丢弃 session，因此同样回到 `Unknown`，Remote status 保留 session 并进入 `unsupported` 或 `error`；
+- `get_dynamic_capabilities` / `upload_dynamic` / `clear_dynamic` 与新的只读 command `get_dynamic_state` 共用这一状态层；Dynamic 仍绕过 static auth gate，不调用、不刷新也不自动登录 static auth，static slot/auth 状态机不变；
+- 新增 `get_dynamic_state` command 和 `bridge.ts` 类型 wrapper，但 page-level Dynamic Workspace 尚未接入真实 command；
+- 尚未接入：UI Workspace 真实数据（阶段 5）、Scenario store（阶段 4）、托盘真实状态（阶段 7）、HTTP API（阶段 9）。
 
 ## 9. Scenario 模型与持久化方向
 
@@ -532,6 +548,8 @@ GET    /api/v1/operations/{operation_id}
 
 source priority、lease TTL、override 到期恢复属于自动场景阶段，不在 UI-only 阶段实现。
 
+本阶段已落地的部分：第 1、2、4、5 条由 `DynamicService` 状态层配合既有的单一 HID worker 覆盖（每次操作新 generation、过期完成不覆盖状态、stale/timeout/disconnect 不污染新 generation）；第 3 条的 pending 淘汰和第 6 条的多来源（tray、自动规则、HTTP）仍未实现，因为目前只有 UI 的 Tauri command 使用该状态层。
+
 ## 12. 实施阶段和验收闸门
 
 ### 阶段 1：presentation-first Dynamic Workspace（已完成，待人工视觉验收）+ 托盘基础（已实现，待平台人工验收）
@@ -576,6 +594,8 @@ UI 视觉验收通过后：
 - 保留现有 release workflow；
 - Linux、macOS、Windows 的平台专属构建和行为验证继续由对应 runner/平台完成。
 
+**已完成（Dynamic 部分）：** `src-tauri/src/dynamic_service.rs` 冻结了 Dynamic 侧的稳定 contract：`DynamicCapabilitiesMetadata`（唯一的 capability DTO，camelCase，兼容现有 `bridge.ts`）、状态值 `unknown` / `discovering` / `ready` / `unsupported` / `uploading` / `committedLocally` / `clearing` / `clearedLocally` / `error`、per-object 观察（slot、状态、byte length、可选 TTL/keep）、 sanitized `error` 和本地 `generation`；`get_dynamic_state` 是新的只读 command，`bridge.ts` 已有类型 wrapper。DTO 不含正文、HID path、serial 或 token，Rust 测试直接断言序列化字段集合而不是打印正文。`Scenario`、`DynamicUploadRequest` 和 source metadata 的正式 contract、golden frame fixtures、Tauri no-bundle 的 CI 基线仍未完成（属后续阶段）。
+
 ### 阶段 3：DynamicService、队列和 generation
 
 - 复用已有 Dynamic v2 slot-aware client/protocol/upload/clear/retry；
@@ -585,6 +605,10 @@ UI 视觉验收通过后：
 - 实现 `Unknown`、`Discovering`、`Unsupported`、`Ready`、`Uploading`、`CommittedLocally`、`Clearing`、`ClearedLocally`、`Error`；
 - 实现 generation-based last-write-wins、pending 淘汰和 stale completion 保护；
 - 不改变 static/auth command boundary。
+
+**已完成（状态层）：** `DynamicService` 已接入 `AppState`，capability/upload/clear 在开始时进入 `Discovering`/`Uploading`/`Clearing`，成功只记录本次本地观察（`CommittedLocally`/`ClearedLocally`，以及 slot、byte length、TTL/keep），失败按 Remote status 进入 `Unsupported`/`Error` 并保留 session，transport/protocol 失败丢弃 session 并回到 `Unknown`；connect/disconnect/设备替换/`AppState` drop 后 reset 为 `Unknown`；generation 为本地 last-write-wins，过期完成被丢弃，新操作清除被取代操作遗留的 in-flight 状态；仍然只使用既有单一 HID worker 和 `MacroSession`，没有第二个 writer/线程/queue；static/auth command boundary 未改变（Dynamic 仍绕过 static auth gate）。backend 不保存 draft，也不保存任何 dynamic 正文。
+
+**仍未实现：** 连接后的自动 capability discovery（目前仍是显式 command）、pending 淘汰所需的待发送队列（目前只有 UI 的同步 command 调用方）、UI Workspace 的真实接入（阶段 5）和 source metadata。
 
 ### 阶段 4：Scenario 原子持久化
 
@@ -749,6 +773,7 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 - 每个设备只有一个 writer；
 - 新 generation 淘汰 pending 旧请求；
 - disconnect/reconnect/restart 后 `Unknown`；
+- Dynamic 状态层 DTO 的字段集合和隐私回归：service state 只含 status、capabilities、generation、objects、error，per-object 只含 slot、状态、byte length、TTL/keep，测试断言序列化字段集合而不打印正文；
 - capability 驱动的 object 数量（含 count = 1）与目标选择；
 - mock/正式 object collection 和目标选择；
 - capability change、keep unsupported、oversize 和 target missing；
