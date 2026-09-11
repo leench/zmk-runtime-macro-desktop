@@ -1387,14 +1387,23 @@ function App() {
     setCloseConfirmOpen(false);
   }, []);
 
-  const closeWindowWithBestEffortLock = useCallback(() => {
+  // Closing the window hides it to the tray instead of quitting the app. The
+  // existing semantics stay: dirty confirmation first, then a best-effort LOCK
+  // through the normal disconnect path. Because the window survives the hide,
+  // the local state is returned to the disconnected state as well, and the
+  // close path re-arms for the next close request.
+  const hideWindowWithBestEffortLock = useCallback(() => {
     if (!inTauri() || closingRef.current) return;
     closingRef.current = true;
     const windowHandle = getCurrentWindow();
-    const lockAttempt = disconnectDeviceCommand().catch(() => undefined);
-    const closeDeadline = new Promise<void>((resolve) => { window.setTimeout(resolve, 250); });
-    void Promise.race([lockAttempt, closeDeadline])
-      .then(() => windowHandle.destroy())
+    const lockAttempt = disconnectDevice().catch(() => undefined);
+    const hideDeadline = new Promise<void>((resolve) => { window.setTimeout(resolve, 250); });
+    void Promise.race([lockAttempt, hideDeadline])
+      .then(() => windowHandle.hide())
+      .then(() => {
+        closingRef.current = false;
+        closeConfirmRef.current = false;
+      })
       .catch(() => {
         closingRef.current = false;
         if (mounted.current) {
@@ -1402,13 +1411,13 @@ function App() {
           setCloseConfirmOpen(true);
         }
       });
-  }, []);
+  }, [disconnectDevice]);
 
-  const closeWithoutSaving = useCallback(() => {
+  const hideWithoutSaving = useCallback(() => {
     closeConfirmRef.current = false;
     setCloseConfirmOpen(false);
-    closeWindowWithBestEffortLock();
-  }, [closeWindowWithBestEffortLock]);
+    hideWindowWithBestEffortLock();
+  }, [hideWindowWithBestEffortLock]);
 
   useEffect(() => {
     writePageZoomPercent(pageZoomPercent);
@@ -1451,14 +1460,18 @@ function App() {
     let unlisten: (() => void) | undefined;
     try {
       void getCurrentWindow().onCloseRequested((event) => {
-        if (closingRef.current) return;
+        // Closing never destroys the window anymore: it hides to the tray, and
+        // the explicit tray quit bypasses this listener. Keep preventing the
+        // platform close even while a hide is already in flight, otherwise a
+        // second close request would destroy the window.
         event.preventDefault();
+        if (closingRef.current) return;
         if (dirtyRef.current && !closeConfirmRef.current) {
           closeConfirmRef.current = true;
           setCloseConfirmOpen(true);
           return;
         }
-        closeWindowWithBestEffortLock();
+        hideWindowWithBestEffortLock();
       }).then((stopListening) => {
         if (active) unlisten = stopListening;
         else stopListening();
@@ -1473,7 +1486,7 @@ function App() {
       unlisten?.();
       window.removeEventListener("beforeunload", beforeUnload);
     };
-  }, [closeWindowWithBestEffortLock]);
+  }, [hideWindowWithBestEffortLock]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1784,7 +1797,7 @@ function App() {
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-6 py-8 backdrop-blur-[2px]" role="presentation">
           <section className="w-full max-w-[440px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title" aria-describedby="close-dialog-message">
             <p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.closeUnsavedTitle}</p><h2 id="close-dialog-title" className="mt-1.5 text-xl font-semibold text-ink">{copy.closeUnsavedTitle}</h2><p id="close-dialog-message" className="mt-3 text-sm leading-relaxed text-ink-muted">{copy.closeUnsavedMessage}</p>
-            <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={cancelClose} autoFocus className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2">{copy.cancel}</button><button type="button" onClick={closeWithoutSaving} className="inline-flex h-11 items-center rounded-xl bg-danger px-4 text-sm font-medium text-white hover:opacity-90">{copy.closeWithoutSaving}</button></div>
+            <div className="mt-6 flex justify-end gap-3"><button type="button" onClick={cancelClose} autoFocus className="inline-flex h-11 items-center rounded-xl border border-line-strong px-4 text-sm font-medium text-ink-muted hover:bg-surface-2">{copy.cancel}</button><button type="button" onClick={hideWithoutSaving} className="inline-flex h-11 items-center rounded-xl bg-danger px-4 text-sm font-medium text-white hover:opacity-90">{copy.closeWithoutSaving}</button></div>
           </section>
         </div>
       ) : null}

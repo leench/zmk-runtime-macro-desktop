@@ -6,7 +6,7 @@
 
 首版目标平台：Linux x86_64、macOS Intel/Apple Silicon、Windows x64。前端不直接访问 HID，所有枚举、认证、协议和传输都在 Rust/Tauri command 层完成。
 
-当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）已完成 presentation-first UI-only 阶段：Scenario 列表/编辑器、capability-driven target 行、18 个 in-memory preview 状态和确认对话框全部来自内存 fixture，不接真实 workspace command，真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供。该工作区仍待人工视觉验收。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
+当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）已完成 presentation-first UI-only 阶段：Scenario 列表/编辑器、capability-driven target 行、18 个 in-memory preview 状态和确认对话框全部来自内存 fixture，不接真实 workspace command，真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供。该工作区仍待人工视觉验收。阶段 1 托盘基础（§4.8）已实现：Tauri 2 tray icon/原生菜单、打开/隐藏/明确退出、close-to-tray 和单实例窗口恢复；托盘菜单的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接 DynamicService、不调用 HID。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
 
 ## 2. 固件和协议约束
 
@@ -74,7 +74,7 @@ Page `0xff60`、Usage `0x61`，输入 Usage `0x62`、输出 Usage `0x63`，固�
 
 当前产品是精密、克制、安静的桌面硬件配置工具，不是网页 Dashboard、SaaS 页面或卡片堆叠：
 
-- 使用自绘 TitleBar；Tauri window `decorations: false`，标题栏支持拖动、最小化、最大化/还原和关闭。关闭请求使用 `onCloseRequested`；dirty 时同步阻止并显示应用内确认 modal，确认后调用 `destroy` 绕过重复的 close event。浏览器预览环境安全 no-op，监听失败回退到 `beforeunload`；
+- 使用自绘 TitleBar；Tauri window `decorations: false`，标题栏支持拖动、最小化、最大化/还原和关闭。关闭请求使用 `onCloseRequested`，始终阻止平台默认关闭；dirty 时显示应用内确认 modal，确认后经既有 best-effort disconnect/LOCK 隐藏到托盘（`hide`，不销毁窗口、不退出进程，见 §4.8），明确退出只由托盘 `Quit` 触发。浏览器预览环境安全 no-op，监听失败回退到 `beforeunload`；
 - 顶部为小型设备状态栏：当前设备摘要、连接/认证状态、由 LIST 的 SlotMetadata 汇总出的“已配置宏字节数”、刷新、System/Light/Dark、设置和更多操作；该摘要只统计设备已保存的 byte length，不把 dirty draft 算入，不显示未知固件上限、分母、百分比或 progressbar role；状态色只用于语义，不铺满区域；
 - 主体是连续的 `Macro Slots + Inspector` 两栏。左侧显示动态 slot 编号、本机 label、`Empty`/byte length 和 dirty 点；正文列表预览由隐私设置控制，默认不显示真实字符；右侧只显示当前 slot 的 inspector；
 - inspector 默认遮罩正文，只有用户主动 Reveal 才显示 token。列表预览仅使用已加载的内存内容，并按隐私设置显示；完整正文不进入标题、状态、tooltip、title、aria label、error、toast、诊断或 localStorage。切换 slot、设备、disconnect、Lock 或 auth 过期都会隐藏已显示内容；
@@ -139,7 +139,19 @@ UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object �
 - 本阶段不接真实 workspace command：不调用 HID、不持久化 Scenario、不接 HTTP API，也不显示设备 readback；
 - 旧 `DynamicMacroModal`/`DynamicMacroPanel` 仍是真实 dynamic handler，从已连接 workbench 打开的 workspace header 保留 `Legacy dialog` fallback 按钮（无设备预览入口不提供该按钮），旧入口在新 UI 通过人工视觉验收后才移除；
 - target 行按 capability 驱动：单 object（count = 1）为只读行，多 object 为 selector；saved target 不在最新 capability 时显示 saved target unavailable / target missing 并保留正文和 dirty draft，单 object 设备也不会自动采用唯一 object，必须由用户主动点击 `Use this object` 重新绑定，绑定前 upload/clear 保持禁用；
-- 场景持久化、真实 DynamicService 接入、托盘入口和 v2 多 object 真实数据（§4.5）属于后续阶段。
+- 场景持久化、真实 DynamicService 接入、v2 多 object 真实数据（§4.5）和托盘真实状态（§4.8）属于后续阶段。
+
+### 4.8 托盘基础与窗口生命周期
+
+阶段 1 托盘基础已实现，代码位于 `src-tauri/src/tray.rs`（Tauri 2 `TrayIconBuilder`/`MenuBuilder`/`TrayIconEvent`）和 `src/App.tsx` 的 close handler：
+
+- tray icon 复用 `tauri.conf.json` 中 `bundle.icon` 嵌入的默认窗口 PNG，不新增图片资源或 Tauri plugin 依赖；
+- 原生菜单只有英文标签（不进入 UI locale 文件），menu item ID 稳定：`tray-open-main`、`tray-status-device`、`tray-status-dynamic`、`tray-status-scenario`、`tray-choose-scenario`、`tray-upload-scenario`、`tray-clear-dynamic`、`tray-settings`、`tray-quit`；
+- 真实行为只有窗口生命周期：`Open ZMK Runtime Macro` 和 tray icon 左键点击显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 绕过 close-to-tray，退出时由 `AppState` 的 drop 继续执行 best-effort LOCK；第二次启动由 single-instance plugin 恢复已有窗口；
+- close-to-tray：`onCloseRequested` 始终 `preventDefault`，dirty 时弹出与原来相同的确认 modal，确认后经 best-effort disconnect/LOCK（正常 Disconnect 路径，同时把本地状态回到 disconnected）再 `hide()`；窗口不再被 destroy，因此 close 路径会对下一次关闭请求重新生效，浏览器预览继续使用 `beforeunload`；
+- preview 占位（disabled）：`Device`、`Dynamic status`、`Current scenario` 状态行以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 操作项，标签直接写明 `preview only` / `(preview)`。当前没有 DynamicService，托盘不读取设备状态、不打开 HID、不发送 protocol frame、不调用 dynamic command，也不显示 HID path、serial 或正文；启用它们需要阶段 7（托盘接入真实状态）；
+- 未实现：托盘真实状态、tray 上传/clear、autostart、DynamicService、场景持久化和 HTTP API；
+- 平台差异：Linux appindicator 在任意点击都会弹出菜单（`show_menu_on_left_click(false)` 在该平台无效），部分 Linux 桌面（如无托盘扩展的 GNOME）不提供 `TrayIconEvent::Click`，此时菜单内的 `Open ZMK Runtime Macro` 是兜底入口；这些需要在对应平台人工验收。
 
 ## 5. 后端与前端边界
 
@@ -162,7 +174,10 @@ Runtime Macro protocol v2 / hidapi
 
 - `core:event:allow-listen`、`core:event:allow-unlisten`（关闭请求监听）；
 - `core:webview:allow-set-webview-zoom`（设置页实时调整 `80–150%` 页面缩放，默认 `100%`）；
-- `core:window:allow-close`、`allow-destroy`、`allow-minimize`、`allow-toggle-maximize`、`allow-start-dragging`。
+- `core:window:allow-close`、`allow-destroy`、`allow-minimize`、`allow-toggle-maximize`、`allow-start-dragging`；
+- `core:window:allow-hide`（close-to-tray：窗口关闭时隐藏到托盘，而不是销毁窗口）。
+
+tray icon、原生菜单、`show`/`unminimize`/`set_focus` 和 `Quit`（`app.exit(0)`）都在 Rust 侧执行，不需要前端权限；Tauri command 列表和 invoke handler 没有为托盘新增 entry。
 
 不得为了方便恢复 `core:default` 全量权限。浏览器开发环境不能因为不存在 Tauri internals 而报错。
 
@@ -174,7 +189,8 @@ Runtime Macro protocol v2 / hidapi
 4. 列表隐私预览、认证窗口倒计时、`AUTH_REQUIRED`/错误恢复、自动重连和正常关闭 best-effort LOCK；
 5. 文档、跨平台行为/安装器配置检查和最终验证（含硬件边界检查）；
 6. Dynamic Macro v2 多槽位 capability（slot-aware capability/upload/clear、512-byte object、逐槽 clear）、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix；
-7. Dynamic Workspace page-level UI-only 阶段（Scenario 列表/编辑器、capability-driven target 行、18 个 preview 状态、in-memory only）；真实 dynamic 操作仍走旧 modal。
+7. Dynamic Workspace page-level UI-only 阶段（Scenario 列表/编辑器、capability-driven target 行、18 个 preview 状态、in-memory only）；真实 dynamic 操作仍走旧 modal；
+8. 托盘基础（Tauri 2 tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复）；设备/Dynamic/Scenario 状态行和 Dynamic 操作项为 disabled preview 占位，不接 DynamicService。
 
 所有阶段均只支持 v2，不提供 Legacy v1 管理。MagicPatterns 是唯一视觉基准；仅在真实功能、v2 协议、安全约束或 Tauri 平台行为冲突时适配，并记录冲突原因。
 
@@ -194,6 +210,6 @@ Runtime Macro protocol v2 / hidapi
 
 ## 9. 当前剩余工作与发布边界
 
-阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础是下一个待实现阶段。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
+阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复），本机自动验证已通过，但托盘图标/菜单交互、close-to-tray、Wayland/X11 和单实例行为仍需在对应平台人工验收；托盘菜单中的设备/Dynamic/Scenario 状态和 Dynamic 操作仍是 preview 占位，需要先完成 DynamicService 和托盘真实状态阶段。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
 
 后续维护必须继续遵守 v2-only 边界，不得恢复 Legacy v1 管理或把密码、K、正文、HID path、serial、raw report 写入持久化、日志和诊断。

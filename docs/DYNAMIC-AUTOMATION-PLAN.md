@@ -16,7 +16,7 @@
 
 1. **Dynamic Protocol v2 backend、bridge/multislot model 和 presentation-first Dynamic Workspace 均已完成。** Rust protocol/client/commands 已按 v2 多槽位实现（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；`src/bridge.ts` 与 `src/types/dynamic.ts` 已提供 slot-aware dynamic command 和 per-object 状态模型；`src/features/dynamic/` 的页面级 Dynamic Workspace 已按 in-memory fixture 实现（Scenario 列表/编辑器、capability-driven target 行、状态矩阵和确认对话框），但**仍待人工视觉验收**。
 2. Dynamic Workspace 采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。这些边界目前仍然成立，workspace 尚未调用任何真实 workspace command；真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供，旧入口作为 fallback 保留到视觉验收通过。
-3. **当前下一阶段是托盘基础**：tray icon、窗口入口/生命周期、close-to-tray、单实例恢复，可用静态/mock 状态完成视觉和菜单验收。
+3. **托盘基础已实现**（`src-tauri/src/tray.rs`、`src-tauri/src/lib.rs`、`src/App.tsx`）：Tauri 2 tray icon 和原生菜单、打开/隐藏/明确退出、close-to-tray、单实例窗口恢复；菜单中的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接真实状态。平台专属托盘行为仍需在对应平台人工验收。
 4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、DynamicService、场景持久化、UI 接入真实 HID、设备 alias、托盘真实状态、自启、本地 HTTP API 和自动场景。
 5. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
 6. 上面已完成的 v2 多槽位 backend 和 bridge 是后续接入基线，不从零重写，也不降级回单槽 v1。
@@ -144,11 +144,13 @@ src/App.tsx
 - 单实例再次启动时恢复已有窗口；
 - 托盘菜单的视觉层级、禁用状态和错误状态。
 
+这些基础能力已实现（§4.2 列出真实行为与 preview 占位的区别）；托盘图标和菜单在 GNOME/KDE、Wayland/X11、Windows 和 macOS 上的实际表现仍需要对应平台人工验收。
+
 登录自启不属于第一阶段托盘基础，放在真实 DynamicService 和手动闭环稳定之后实现。
 
 ### 4.2 托盘菜单的 UI-first 版本
 
-UI-only 阶段可以展示以下菜单结构和 mock 状态：
+UI-only 阶段可以展示以下菜单结构和 mock 状态（下图为计划中的菜单结构，实际原生菜单为英文标签）：
 
 ```text
 打开 ZMK Runtime Macro
@@ -171,6 +173,14 @@ Dynamic 状态         Ready / Unknown / Error
 - 不打开 HID、不发送 protocol frame、不修改 firmware；
 - 不把菜单中的 `Ready`、`CommittedLocally` 或 `ClearedLocally` 当成真实 ACK；
 - 托盘真实设备状态和真实操作菜单在后续接入 DynamicService 后再启用。
+
+当前的托盘基础实现遵循这些边界，并明确区分“真实”和“preview”：
+
+- **真实行为**：`Open ZMK Runtime Macro`（以及 tray icon 左键点击）显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 终止应用（绕过 close-to-tray，退出时仍由 `AppState` 的 drop 执行 best-effort LOCK）；普通窗口关闭隐藏到托盘；第二次启动由 single-instance plugin 恢复已有窗口。
+- **preview 占位（disabled）**：`Device`、`Dynamic status`、`Current scenario` 三个状态行，以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 三个操作项。菜单标签直接写明 `preview only` / `(preview)`，因为当前没有 DynamicService，托盘不读取设备状态、不打开 HID、不发送 protocol frame、不调用任何 dynamic command，也不显示 HID path、serial 或正文。
+- 启用条件：状态行需要阶段 7（托盘接入真实状态）和阶段 3 的 DynamicService；托盘上传/clear 与主窗口共用同一 service 后才能去掉 disabled。
+- 原生菜单当前只有英文标签（不进入 UI locale 文件）；状态值不使用 `Ready`/`CommittedLocally`/`ClearedLocally` 等会被误读为真实 ACK 的措辞。
+- 未实现：托盘真实状态、autostart、DynamicService、场景持久化和 HTTP API。
 
 ## 5. Presentation-first UI 阶段
 
@@ -524,7 +534,7 @@ source priority、lease TTL、override 到期恢复属于自动场景阶段，�
 
 ## 12. 实施阶段和验收闸门
 
-### 阶段 1：presentation-first Dynamic Workspace（已完成，待人工视觉验收）+ 托盘基础（下一步）
+### 阶段 1：presentation-first Dynamic Workspace（已完成，待人工视觉验收）+ 托盘基础（已实现，待平台人工验收）
 
 **本阶段已完成的 presentation-first Dynamic Workspace（UI-only）：**
 
@@ -536,10 +546,12 @@ source priority、lease TTL、override 到期恢复属于自动场景阶段，�
 6. 不接 HID、不写 localStorage、不持久化 Scenario、不接 HTTP API；真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供；
 7. 新 UI 通过人工视觉和交互验收后，才移除旧 Dynamic modal 入口。
 
-**本阶段剩余工作：托盘基础。**
+**本阶段托盘基础（已实现）。**
 
 1. 托盘 icon、打开/隐藏/退出、close-to-tray、单实例窗口入口；
 2. 可使用静态/mock 状态完成托盘菜单的视觉和菜单验收，但不得把 mock 结果标成真实设备操作结果。
+
+实现说明：`src-tauri/src/tray.rs` 提供 tray icon、原生菜单和 `show_main_window` helper（tray、菜单和 single-instance plugin 共用）；普通窗口关闭经 `onCloseRequested` 的 dirty 确认和 best-effort LOCK 后 `hide()` 到托盘，明确退出走 `app.exit(0)`；菜单状态行和 Dynamic 操作项是 disabled 的 preview 占位（§4.2）。本机自动验证（fmt/test/clippy/`npm test`/`npm run build`/`tauri build --no-bundle`）已通过；托盘图标、菜单交互、close-to-tray 和单实例恢复仍需要在 Windows/Linux（GNOME/KDE、Wayland/X11）和 macOS 上人工验收。
 
 **UI 视觉验收点 A（尚未完成）：**
 
