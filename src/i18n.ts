@@ -173,6 +173,13 @@ export type MessageTable = {
   millisecondsRange: (min: number, max: number) => string;
   transportRetriesRange: (max: number) => string;
   settingsHelp: string;
+  deviceAlias: string;
+  deviceAliasHelp: string;
+  deviceAliasScope: string;
+  deviceAliasDisconnected: string;
+  deviceAliasTooLong: (max: number) => string;
+  deviceAliasInvalid: string;
+  deviceAliasDuplicate: string;
   previewCharacterCount: string;
   previewCharacterCountHelp: string;
   hoverRevealDelay: string;
@@ -263,7 +270,11 @@ export type MessageTable = {
   dynamicTarget: string;
   dynamicTargetDevice: string;
   dynamicTargetDeviceHelp: string;
-  dynamicTargetDeviceRealHelp: string;
+  dynamicDeviceAliasUnset: string;
+  dynamicDeviceAliasRequiredHelp: string;
+  dynamicDeviceBound: string;
+  dynamicDeviceUnbound: string;
+  dynamicDeviceBind: string;
   dynamicTargetObject: string;
   dynamicTargetChoose: string;
   dynamicTargetUnavailable: string;
@@ -348,6 +359,8 @@ export type MessageTable = {
   dynamicBlockerDisconnected: string;
   dynamicBlockerUnknown: string;
   dynamicBlockerOperating: string;
+  dynamicBlockerDeviceAliasMissing: string;
+  dynamicBlockerDeviceUnbound: string;
   dynamicTextHelpPending: string;
   dynamicSampleScenarioWork: string;
   dynamicSampleScenarioBuild: string;
@@ -522,6 +535,13 @@ const english: MessageTable = {
   millisecondsRange: (min, max) => `Milliseconds · ${min}–${max}`,
   transportRetriesRange: (max) => `Transport retries · 0–${max}`,
   settingsHelp: "Timeout and retries apply on the next connection. Macro content is never stored in preferences.",
+  deviceAlias: "Device alias",
+  deviceAliasHelp: "A name for this keyboard on this machine. Scenarios bind to it, and the tray menu shows it.",
+  deviceAliasScope: "Stored locally for this device only. It is never written to the keyboard, never sent over HID, and clearing it removes the binding.",
+  deviceAliasDisconnected: "Connect a device to give it a local alias.",
+  deviceAliasTooLong: (max) => `The alias cannot exceed ${max} bytes.`,
+  deviceAliasInvalid: "The alias cannot contain control characters.",
+  deviceAliasDuplicate: "Another device already uses this alias. Aliases must be unique.",
   previewCharacterCount: "Preview character count",
   previewCharacterCountHelp: "Show up to five leading characters from each loaded slot.",
   hoverRevealDelay: "Hover reveal delay",
@@ -630,8 +650,12 @@ const english: MessageTable = {
   dynamicDeviceReady: "Device ready",
   dynamicTarget: "Upload target",
   dynamicTargetDevice: "Target device",
-  dynamicTargetDeviceHelp: "Device aliases arrive in a later stage; preview data uses a fixed name.",
-  dynamicTargetDeviceRealHelp: "Device aliases arrive in a later stage, so the connected device summary is shown instead.",
+  dynamicTargetDeviceHelp: "Preview data uses a fixed sample name; a connected workspace shows the local device alias.",
+  dynamicDeviceAliasUnset: "No device alias",
+  dynamicDeviceAliasRequiredHelp: "Give this device an alias in Settings before a scenario can target it.",
+  dynamicDeviceBound: "This scenario is bound to the connected device.",
+  dynamicDeviceUnbound: "This scenario is not bound to the connected device.",
+  dynamicDeviceBind: "Use this device",
   dynamicTargetObject: "Dynamic object",
   dynamicTargetChoose: "Choose a target object…",
   dynamicTargetUnavailable: "Saved target is unavailable",
@@ -716,6 +740,8 @@ const english: MessageTable = {
   dynamicBlockerDisconnected: "Connect a device to upload or clear.",
   dynamicBlockerUnknown: "The device state is unknown after a reconnect. Reopen the device to continue.",
   dynamicBlockerOperating: "An operation is already running.",
+  dynamicBlockerDeviceAliasMissing: "This device has no alias yet. Set one in Settings, then bind the scenario to it.",
+  dynamicBlockerDeviceUnbound: "This scenario is not bound to the connected device. Use \"Use this device\" to bind it explicitly.",
   dynamicTextHelpPending: "Printable US ASCII, LF, Tab, and Backspace. The length limit follows the device capability.",
   dynamicSampleScenarioWork: "Work terminal",
   dynamicSampleScenarioBuild: "Build watch",
@@ -888,6 +914,13 @@ const chinese: MessageTable = {
   millisecondsRange: (min, max) => `毫秒 · ${min}–${max}`,
   transportRetriesRange: (max) => `传输重试 · 0–${max}`,
   settingsHelp: "超时和重试次数将在下次连接时生效。宏正文不会存入偏好设置。",
+  deviceAlias: "设备别名",
+  deviceAliasHelp: "仅在本机使用的设备名称。场景会绑定到该名称，托盘菜单也会显示它。",
+  deviceAliasScope: "只在本机按该设备保存，不会写入键盘，也不会通过 HID 发送；清空后会同时解除场景绑定。",
+  deviceAliasDisconnected: "请先连接设备，再为它设置本机别名。",
+  deviceAliasTooLong: (max) => `别名不能超过 ${max} bytes。`,
+  deviceAliasInvalid: "别名不能包含控制字符。",
+  deviceAliasDuplicate: "另一台设备已使用该别名。别名必须唯一。",
   previewCharacterCount: "列表预览字符数",
   previewCharacterCountHelp: "显示每个已加载宏开头的最多五个字符。",
   hoverRevealDelay: "悬停显示延迟",
@@ -996,8 +1029,12 @@ const chinese: MessageTable = {
   dynamicDeviceReady: "设备就绪",
   dynamicTarget: "上传目标",
   dynamicTargetDevice: "目标设备",
-  dynamicTargetDeviceHelp: "设备别名将在后续阶段实现；预览使用固定名称。",
-  dynamicTargetDeviceRealHelp: "设备别名将在后续阶段实现，当前显示已连接设备的安全摘要。",
+  dynamicTargetDeviceHelp: "预览使用固定示例名称；已连接的工作区会显示本机设备别名。",
+  dynamicDeviceAliasUnset: "未设置设备别名",
+  dynamicDeviceAliasRequiredHelp: "请先在设置中为该设备设置别名，场景才能以它为目标。",
+  dynamicDeviceBound: "该场景已绑定当前连接的设备。",
+  dynamicDeviceUnbound: "该场景未绑定当前连接的设备。",
+  dynamicDeviceBind: "使用此设备",
   dynamicTargetObject: "动态对象",
   dynamicTargetChoose: "选择目标对象…",
   dynamicTargetUnavailable: "已保存的目标当前不可用",
@@ -1082,6 +1119,8 @@ const chinese: MessageTable = {
   dynamicBlockerDisconnected: "请先连接设备，再上传或清除。",
   dynamicBlockerUnknown: "重新连接后设备状态未知。请重新打开设备后再继续。",
   dynamicBlockerOperating: "已有操作正在进行。",
+  dynamicBlockerDeviceAliasMissing: "该设备尚未设置别名。请先在设置中设置别名，再把场景绑定到它。",
+  dynamicBlockerDeviceUnbound: "该场景未绑定当前连接的设备。请点击“使用此设备”显式绑定。",
   dynamicTextHelpPending: "支持可打印 US ASCII、LF、Tab 和 Backspace；长度上限以设备能力为准。",
   dynamicSampleScenarioWork: "工作终端",
   dynamicSampleScenarioBuild: "构建监视",

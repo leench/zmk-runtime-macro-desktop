@@ -40,6 +40,7 @@ const RUNTIME_STATE_KEYS = [
   "canClearDynamic",
   "canUploadScenario",
   "currentScenarioName",
+  "deviceAlias",
   "deviceConnected",
   "dynamicStatus",
 ] as const;
@@ -66,6 +67,7 @@ function runtimeState(overrides: Partial<TrayRuntimeState> = {}): TrayRuntimeSta
     deviceConnected: true,
     dynamicStatus: "ready",
     currentScenarioName: "Work terminal",
+    deviceAlias: "Work keyboard",
     canChooseScenario: true,
     canUploadScenario: true,
     canClearDynamic: true,
@@ -103,6 +105,9 @@ test("the runtime state exposes only the bounded display fields", () => {
   // The name is a display label and may be absent, never a body.
   assert.equal(state.currentScenarioName, "Work terminal");
   assert.equal(runtimeState({ currentScenarioName: null }).currentScenarioName, null);
+  // The alias is the local device display name and may be absent as well.
+  assert.equal(state.deviceAlias, "Work keyboard");
+  assert.equal(runtimeState({ deviceAlias: null }).deviceAlias, null);
 });
 
 test("the tray actions are exactly the three camelCase tags", () => {
@@ -182,12 +187,14 @@ test("setTrayRuntimeState sends exactly the bounded camelCase fields", async () 
     await setTrayRuntimeState(runtimeState());
     assert.equal(host.calls.length, 1);
     assert.equal(host.calls[0].cmd, "set_tray_runtime_state");
-    // The IPC argument names are the Rust command parameters, and no field can
-    // carry text, a HID path, a serial or a device id.
-    assert.deepEqual(host.calls[0].args, {
+    // The state is the command's single input object, and no field can carry
+    // text, a HID path, a serial or a device id.
+    assert.deepEqual(Object.keys(host.calls[0].args), ["runtime"]);
+    assert.deepEqual(host.calls[0].args.runtime, {
       deviceConnected: true,
       dynamicStatus: "ready",
       currentScenarioName: "Work terminal",
+      deviceAlias: "Work keyboard",
       canChooseScenario: true,
       canUploadScenario: true,
       canClearDynamic: true,
@@ -196,18 +203,26 @@ test("setTrayRuntimeState sends exactly the bounded camelCase fields", async () 
       deviceConnected: false,
       dynamicStatus: "unknown",
       currentScenarioName: null,
+      deviceAlias: null,
       canChooseScenario: false,
       canUploadScenario: false,
       canClearDynamic: false,
     });
-    assert.deepEqual(host.calls[1].args, {
+    assert.deepEqual(host.calls[1].args.runtime, {
       deviceConnected: false,
       dynamicStatus: "unknown",
       currentScenarioName: null,
+      deviceAlias: null,
       canChooseScenario: false,
       canUploadScenario: false,
       canClearDynamic: false,
     });
+    // A connected device without an alias is still allowed, and the alias is a
+    // display string, never an object or a device handle.
+    await setTrayRuntimeState(runtimeState({ deviceAlias: null }));
+    const third = host.calls[2].args.runtime as Record<string, unknown>;
+    assert.equal(third.deviceAlias, null);
+    assert.equal(typeof (host.calls[0].args.runtime as Record<string, unknown>).deviceAlias, "string");
   } finally {
     host.restore();
   }

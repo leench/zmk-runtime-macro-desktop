@@ -262,6 +262,11 @@ export type TrayRuntimeState = {
   dynamicStatus: DynamicServiceStatus;
   /** Current scenario display name, or `null` when nothing is selected. */
   currentScenarioName: string | null;
+  /**
+   * Local alias of the connected device, or `null` while it has none or nothing
+   * is connected. Rust re-validates it as a bounded, control-free display name.
+   */
+  deviceAlias: string | null;
   canChooseScenario: boolean;
   canUploadScenario: boolean;
   canClearDynamic: boolean;
@@ -272,17 +277,11 @@ export type TrayRuntimeState = {
  *
  * The tray only stores the validated context and rewrites menu text and enabled
  * flags: it never opens HID, never calls the Dynamic service and never reads the
- * scenario store.
+ * scenario store. The whole state travels as the command's single input object,
+ * so the IPC contract stays one bounded payload.
  */
 export function setTrayRuntimeState(state: TrayRuntimeState): Promise<void> {
-  return invoke("set_tray_runtime_state", {
-    deviceConnected: state.deviceConnected,
-    dynamicStatus: state.dynamicStatus,
-    currentScenarioName: state.currentScenarioName,
-    canChooseScenario: state.canChooseScenario,
-    canUploadScenario: state.canUploadScenario,
-    canClearDynamic: state.canClearDynamic,
-  });
+  return invoke("set_tray_runtime_state", { runtime: state });
 }
 
 /** Stable global event name the native tray uses for its three real actions. */

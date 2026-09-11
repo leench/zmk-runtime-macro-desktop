@@ -58,9 +58,9 @@ export type ScenarioFields = {
   /** Target object id or `null` while no target has been chosen. */
   targetObjectId: string | null;
   /**
-   * Opaque device alias the user bound earlier, or `null`. Reserved for a later
-   * stage: it is preserved through the persisted store but there is no editor
-   * for it yet. Never a serial number or a HID path.
+   * Alias of the device this Scenario is bound to, or `null` while it is not
+   * bound to any device. It is the user's local alias, never a serial number or
+   * a HID path, and it is only set by an explicit user action.
    */
   targetDeviceId: string | null;
 };
@@ -185,6 +185,11 @@ export type DynamicWorkspaceBackend = {
   schemaVersion: number;
   /** Safe connected-device display name; never a HID path or serial. */
   deviceName: string;
+  /**
+   * Alias of the connected device, or `null` while it has none. Scenario upload
+   * and clear require the selected Scenario to be bound to exactly this alias.
+   */
+  deviceAlias: string | null;
   device: PreviewDeviceState;
   /** Static management may be locked while dynamic objects stay available. */
   staticLocked: boolean;

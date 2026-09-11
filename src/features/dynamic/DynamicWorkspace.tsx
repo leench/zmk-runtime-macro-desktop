@@ -19,10 +19,12 @@ import type {
 } from "../../types/scenario";
 import {
   type ScenarioIssue,
+  bindScenarioToDevice,
   clearActionIssues,
   createScenario,
   createSerialRunner,
   DEFAULT_WORKSPACE_TRAY_CONTEXT,
+  deviceBindingIssues,
   editScenario,
   hasScenarioContent,
   isScenarioDirty,
@@ -179,6 +181,9 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, f
   const notice = backend ? null : fixture.notice;
   const capability = backend ? backend.capability : fixture.capability;
   const deviceName = backend ? backend.deviceName : copy.dynamicPreviewDeviceName;
+  // The device-free preview has no device and therefore no alias: it neither
+  // shows a binding nor derives one.
+  const deviceAlias = backend ? backend.deviceAlias : null;
 
   const selectedScenario = scenarios.find((scenario) => scenario.id === selectedId) ?? null;
   const targetObjectId = selectedScenario?.draft.targetObjectId ?? null;
@@ -220,14 +225,25 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, f
     ...storeReadyIssues,
     ...(backend && selectedScenario ? storeBlockers(selectedScenario.draft) : []),
   ];
+  // Binding the Scenario to the connected device is the user's decision, so an
+  // unbound Scenario blocks the two device actions but never the local save.
+  const bindingIssues: ScenarioIssue[] = deviceBindingIssues({
+    mode: previewMode ? "preview" : "device",
+    deviceAlias,
+    scenario: selectedScenario,
+  });
   const uploadReasons: ScenarioIssue[] = [
     ...busyIssues,
     ...storeIssues,
+    ...bindingIssues,
     ...uploadBlockers({ device, capability, scenario: selectedScenario, observation }),
   ];
   // Clear device only talks to the device: store availability and the save-schema
   // limits of the current draft never disable it.
-  const clearReasons: ScenarioIssue[] = clearActionIssues({ operation, device, capability, scenario: selectedScenario, observation });
+  const clearReasons: ScenarioIssue[] = [
+    ...bindingIssues,
+    ...clearActionIssues({ operation, device, capability, scenario: selectedScenario, observation }),
+  ];
   const saveReasons: ScenarioIssue[] = [...busyIssues, ...storeIssues];
 
   // The native tray mirrors this workspace through a bounded summary: the
@@ -335,6 +351,19 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, f
 
   const requestDelete = () => {
     if (selectedScenario) setDialog({ kind: "delete", id: selectedScenario.id });
+  };
+
+  /**
+   * Explicitly bind the selected Scenario to the connected device.
+   *
+   * The draft is the only thing that changes, so the binding is a normal unsaved
+   * edit and the user still has to save it.
+   */
+  const bindSelectedToDevice = () => {
+    if (!backend || !selectedScenario) return;
+    const bound = bindScenarioToDevice(selectedScenario, backend.deviceAlias);
+    if (bound === selectedScenario) return;
+    setScenarios((previous) => previous.map((scenario) => scenario.id === bound.id ? bound : scenario));
   };
 
   const requestClose = () => {
@@ -620,6 +649,7 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, f
             copy={copy}
             mode={previewMode ? "preview" : "device"}
             deviceName={deviceName}
+            deviceAlias={deviceAlias}
             scenario={selectedScenario}
             device={device}
             staticLocked={staticLocked}
@@ -637,6 +667,7 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, f
             onTtlChange={(value) => updateSelected({ ttlSeconds: value })}
             onKeepChange={(value) => updateSelected({ keepAfterExecute: value })}
             onTargetChange={(objectId) => updateSelected({ targetObjectId: objectId })}
+            onBindDevice={bindSelectedToDevice}
             onSave={() => { void commitSelectedSave(); }}
             onUploadRequest={requestUpload}
             onClearRequest={requestClear}

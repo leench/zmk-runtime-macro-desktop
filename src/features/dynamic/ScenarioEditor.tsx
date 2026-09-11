@@ -1,4 +1,4 @@
-import { AlertCircle, CloudUpload, Eraser, Info, RotateCcw, Save, Trash2 } from "lucide-react";
+import { AlertCircle, CloudUpload, Eraser, Info, Link2, RotateCcw, Save, Trash2 } from "lucide-react";
 import type { Messages } from "../../i18n";
 import type {
   DynamicCapabilitiesPresentation,
@@ -14,6 +14,7 @@ import {
   type ScenarioIssue,
   SCENARIO_NAME_LIMIT_BYTES,
   SCENARIO_TEXT_LIMIT_BYTES,
+  deviceBindingState,
   hasScenarioContent,
   isScenarioDirty,
   objectLimits,
@@ -30,6 +31,8 @@ type ScenarioEditorProps = {
   mode: ScenarioEditorMode;
   /** Safe connected-device display name; the preview passes its fixed name. */
   deviceName: string;
+  /** Alias of the connected device, or `null` while it has none or in preview. */
+  deviceAlias: string | null;
   scenario: Scenario;
   device: PreviewDeviceState;
   staticLocked: boolean;
@@ -49,6 +52,8 @@ type ScenarioEditorProps = {
   onTtlChange: (value: number | null) => void;
   onKeepChange: (value: boolean) => void;
   onTargetChange: (objectId: string | null) => void;
+  /** Explicitly binds the Scenario to the connected device. */
+  onBindDevice: () => void;
   onSave: () => void;
   onUploadRequest: () => void;
   onClearRequest: () => void;
@@ -118,6 +123,10 @@ function blockerMessage(copy: Messages, blocker: ScenarioIssue, maximum: number 
       return copy.dynamicScenarioTextTooLongForStore(SCENARIO_TEXT_LIMIT_BYTES);
     case "storeUnavailable":
       return copy.dynamicStoreNotReady;
+    case "deviceAliasMissing":
+      return copy.dynamicBlockerDeviceAliasMissing;
+    case "deviceUnbound":
+      return copy.dynamicBlockerDeviceUnbound;
     default:
       return copy.dynamicScenarioKeepUnsupported;
   }
@@ -142,6 +151,7 @@ export function ScenarioEditor({
   copy,
   mode,
   deviceName,
+  deviceAlias,
   scenario,
   device,
   staticLocked,
@@ -159,6 +169,7 @@ export function ScenarioEditor({
   onTtlChange,
   onKeepChange,
   onTargetChange,
+  onBindDevice,
   onSave,
   onUploadRequest,
   onClearRequest,
@@ -186,6 +197,10 @@ export function ScenarioEditor({
   const informationalOnly = blockers.every((blocker) => blocker === "capabilityDiscovering");
   const observationTarget = observationTargetLabel(copy, capability, observation);
   const canResetObservation = mode === "preview" && (observation.status === "committed" || observation.status === "cleared" || observation.status === "error");
+  // Device binding only exists in the connected workspace: the preview has no
+  // device to bind and keeps its fixed sample name.
+  const deviceMode = mode === "device";
+  const binding = deviceBindingState(scenario, deviceAlias);
   const savedNote = scenario.isNew
     ? copy.neverSaved
     : dirty
@@ -256,10 +271,31 @@ export function ScenarioEditor({
             <div className="mt-4 grid gap-5 sm:grid-cols-2">
               <div className="min-w-0">
                 <span className="block text-sm font-medium text-ink">{copy.dynamicTargetDevice}</span>
-                <p className="mt-2.5 flex h-11 items-center gap-2 rounded-xl border border-line bg-surface px-3.5 text-sm text-ink">
-                  <span className="truncate font-mono">{deviceName}</span>
+                <p className={`mt-2.5 flex h-11 items-center gap-2 rounded-xl border bg-surface px-3.5 text-sm ${deviceMode && binding === "aliasMissing" ? "border-warning/40 text-warning" : "border-line text-ink"}`}>
+                  <span className="truncate font-mono">{deviceMode ? deviceAlias ?? copy.dynamicDeviceAliasUnset : deviceName}</span>
                 </p>
-                <p className="mt-1.5 text-xs leading-relaxed text-ink-subtle">{mode === "device" ? copy.dynamicTargetDeviceRealHelp : copy.dynamicTargetDeviceHelp}</p>
+                {deviceMode ? (
+                  binding === "bound" ? (
+                    <p className="mt-1.5 text-xs leading-relaxed text-success">{copy.dynamicDeviceBound}</p>
+                  ) : (
+                    <div className="mt-1.5">
+                      <p className="text-xs leading-relaxed text-warning" role="note">
+                        {binding === "aliasMissing" ? copy.dynamicDeviceAliasRequiredHelp : copy.dynamicDeviceUnbound}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={onBindDevice}
+                        disabled={binding === "aliasMissing" || device !== "ready"}
+                        className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-line-strong bg-surface px-3 text-xs font-medium text-ink-muted transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Link2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        {copy.dynamicDeviceBind}
+                      </button>
+                    </div>
+                  )
+                ) : (
+                  <p className="mt-1.5 text-xs leading-relaxed text-ink-subtle">{copy.dynamicTargetDeviceHelp}</p>
+                )}
               </div>
               <DynamicTargetSelector
                 copy={copy}

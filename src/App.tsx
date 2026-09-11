@@ -78,6 +78,15 @@ import {
   validateDynamicTtl,
 } from "./utils/dynamic";
 import { capabilityPresentationFromBackend, serviceDeviceState, targetMatchesCapability, DEFAULT_WORKSPACE_TRAY_CONTEXT, sameWorkspaceTrayContext } from "./utils/scenario";
+import {
+  MAX_DEVICE_ALIAS_BYTES,
+  deviceAliasFor,
+  readDeviceAliasStore,
+  setDeviceAlias,
+  writeDeviceAliasStore,
+  type DeviceAliasError,
+  type DeviceAliasStore,
+} from "./utils/device-alias";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -386,6 +395,19 @@ function App() {
   // Tray-visible summary of the connected workspace: the selected scenario's
   // display name and the three action flags. It never carries scenario text.
   const [workspaceTrayContext, setWorkspaceTrayContext] = useState<WorkspaceTrayContext>(DEFAULT_WORKSPACE_TRAY_CONTEXT);
+  // Local device aliases, keyed by the safe device summary. They are a local
+  // preference: never sent to the device, never persisted in the store file.
+  const [deviceAliases, setDeviceAliases] = useState<DeviceAliasStore>(() => readDeviceAliasStore());
+  const [aliasDraft, setAliasDraft] = useState("");
+  const [aliasError, setAliasError] = useState<DeviceAliasError | null>(null);
+
+  // The alias is looked up by exact summary key, so another device (or the same
+  // device on a different interface/usage) never inherits it.
+  const currentDeviceSummaryKey = deviceSummaryKey(connection.device);
+  const currentDeviceAlias = deviceAliasFor(deviceAliases, currentDeviceSummaryKey);
+  // The header, the workspace and the tray show the user's alias first and fall
+  // back to the HID product name.
+  const deviceName = currentDeviceAlias ?? connection.device?.productName ?? copy.unnamedDevice;
 
   const mounted = useRef(false);
   const operation = useRef(0);
@@ -431,8 +453,11 @@ function App() {
   const restorePageZoom = useCallback(() => {
     setPageZoomDraft(pageZoomPercent);
     applyPageZoom(pageZoomPercent);
+    // Cancelling also drops an uncommitted alias draft.
+    setAliasDraft(currentDeviceAlias ?? "");
+    setAliasError(null);
     setSettingsOpen(false);
-  }, [applyPageZoom, pageZoomPercent]);
+  }, [applyPageZoom, currentDeviceAlias, pageZoomPercent]);
 
   const handlePageZoomInput = useCallback((rawValue: string) => {
     if (rawValue.trim() === "") {
@@ -1393,7 +1418,8 @@ function App() {
 
   const dynamicWorkspaceBackend = useMemo<DynamicWorkspaceBackend>(() => ({
     schemaVersion: SCENARIO_STORE_SCHEMA_VERSION,
-    deviceName: connection.device?.productName || copy.unnamedDevice,
+    deviceName,
+    deviceAlias: currentDeviceAlias,
     device: serviceDeviceState(connection.connected, dynamicCapabilityStatus),
     staticLocked: connection.authState === "locked",
     capability: capabilityPresentationFromBackend(dynamicCapabilities),
@@ -1408,8 +1434,8 @@ function App() {
     clearScenarioDynamic,
     connection.authState,
     connection.connected,
-    connection.device,
-    copy.unnamedDevice,
+    currentDeviceAlias,
+    deviceName,
     dynamicCapabilityStatus,
     dynamicCapabilities,
     dynamicServiceState,
@@ -1513,6 +1539,13 @@ function App() {
       setSettingsError("retries");
       return;
     }
+    // The alias is validated before anything is written: a duplicate alias is
+    // refused instead of silently stealing the name from another device.
+    const aliasPlan = currentDeviceSummaryKey === null ? null : setDeviceAlias(deviceAliases, currentDeviceSummaryKey, aliasDraft);
+    if (aliasPlan !== null && !aliasPlan.ok) {
+      setAliasError(aliasPlan.error);
+      return;
+    }
     setSettingsBusy(true);
     setSettingsError(null);
     setSettingsSaved(false);
@@ -1534,6 +1567,12 @@ function App() {
       setPrivacySettings(nextPrivacy);
       setPrivacyDraft(nextPrivacy);
       writePrivacyPreviewSettings(nextPrivacy);
+      if (aliasPlan !== null && aliasPlan.ok) {
+        writeDeviceAliasStore(aliasPlan.store);
+        setDeviceAliases(aliasPlan.store);
+        setAliasDraft(aliasPlan.alias ?? "");
+        setAliasError(null);
+      }
       setSettingsSaved(false);
       setSettingsOpen(false);
     } catch (caught) {
@@ -1541,7 +1580,7 @@ function App() {
     } finally {
       setSettingsBusy(false);
     }
-  }, [applyPageZoom, commandError, pageZoomDraft, pageZoomPercent, privacyDraft, recordOperation, settingsDraft]);
+  }, [aliasDraft, applyPageZoom, commandError, currentDeviceSummaryKey, deviceAliases, pageZoomDraft, pageZoomPercent, privacyDraft, recordOperation, settingsDraft]);
 
   const updateTheme = useCallback((nextTheme: ThemeMode) => {
     setTheme(nextTheme);
@@ -1554,9 +1593,13 @@ function App() {
     setSettingsDraft(settings);
     setPageZoomDraft(pageZoomPercent);
     setPrivacyDraft(privacySettings);
+    // Both drafts are seeded from the connected device, so an alias edit always
+    // starts from what is actually stored for this summary key.
+    setAliasDraft(currentDeviceAlias ?? "");
+    setAliasError(null);
     setSettingsError(null);
     setSettingsOpen(true);
-  }, [pageZoomPercent, privacySettings, settings]);
+  }, [currentDeviceAlias, pageZoomPercent, privacySettings, settings]);
 
   const updateLanguage = useCallback((next: LanguagePreference) => {
     if (!isLanguagePreference(next)) return;
@@ -1632,11 +1675,12 @@ function App() {
       deviceConnected,
       dynamicStatus: deviceConnected ? dynamicServiceState?.status ?? "unknown" : "unknown",
       currentScenarioName: context.scenarioName,
+      deviceAlias: deviceConnected ? currentDeviceAlias : null,
       canChooseScenario: context.canChooseScenario,
       canUploadScenario: context.canUploadScenario,
       canClearDynamic: context.canClearDynamic,
     }).catch(() => undefined);
-  }, [connection.connected, dynamicServiceState?.status, workspaceTrayContext]);
+  }, [connection.connected, currentDeviceAlias, dynamicServiceState?.status, workspaceTrayContext]);
 
   // A disconnect drops the workspace summary as well, so a later reconnect never
   // republishes the previous device's scenario name.
@@ -1644,6 +1688,15 @@ function App() {
     if (connection.connected) return;
     setWorkspaceTrayContext((current) => sameWorkspaceTrayContext(current, DEFAULT_WORKSPACE_TRAY_CONTEXT) ? current : DEFAULT_WORKSPACE_TRAY_CONTEXT);
   }, [connection.connected]);
+
+  // An alias belongs to exactly one device summary. While the settings modal is
+  // open, a device switch or reconnect reseeds the draft instead of carrying the
+  // previous device's alias over.
+  useEffect(() => {
+    if (!settingsOpen) return;
+    setAliasDraft(currentDeviceAlias ?? "");
+    setAliasError(null);
+  }, [currentDeviceAlias, currentDeviceSummaryKey, settingsOpen]);
 
   useEffect(() => {
     mounted.current = true;
@@ -1718,7 +1771,6 @@ function App() {
   const route = !connection.connected ? "select" : connection.authState === "locked" || connection.authState === "credentialInvalid" ? "unlock" : canManage(connection) ? "workbench" : "select";
   const selectedDevice = devices.find((device) => device.id === selectedId);
   const currentCandidateId = devices.find((device) => deviceSummaryKey(device) === deviceSummaryKey(connection.device))?.id;
-  const deviceName = connection.device?.productName || copy.unnamedDevice;
   const configuredBytes = slots.reduce((total, slot) => total + slot.length, 0);
   const translatedError = errorCode ? translateCommandError(errorCode, locale) : null;
   const selectedInputError = inputError ? translateInputError(inputError, locale) : null;
@@ -1938,6 +1990,31 @@ function App() {
                   />
                 </div>
               </label>
+              <div className="border-t border-line pt-5">
+                <label className="block" htmlFor="device-alias-setting">
+                  <span className="text-sm font-medium text-ink">{copy.deviceAlias}</span>
+                  <input
+                    id="device-alias-setting"
+                    type="text"
+                    value={aliasDraft}
+                    maxLength={MAX_DEVICE_ALIAS_BYTES}
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={settingsBusy || currentDeviceSummaryKey === null}
+                    placeholder={connection.device?.productName || copy.unnamedDevice}
+                    onChange={(event) => { setAliasDraft(event.target.value); setAliasError(null); }}
+                    className="mt-2.5 h-11 w-full rounded-xl border border-line-strong bg-surface px-3.5 text-sm text-ink placeholder:text-ink-subtle disabled:cursor-not-allowed disabled:bg-surface-2"
+                  />
+                </label>
+                <small className="mt-1.5 block text-xs leading-relaxed text-ink-subtle">
+                  {currentDeviceSummaryKey === null ? copy.deviceAliasDisconnected : `${copy.deviceAliasHelp} ${copy.deviceAliasScope}`}
+                </small>
+                {aliasError ? (
+                  <p className="mt-2 text-sm text-danger" role="alert">
+                    {aliasError === "tooLong" ? copy.deviceAliasTooLong(MAX_DEVICE_ALIAS_BYTES) : aliasError === "controlCharacter" ? copy.deviceAliasInvalid : copy.deviceAliasDuplicate}
+                  </p>
+                ) : null}
+              </div>
               <div className="border-t border-line pt-5">
                 <PreviewSettingStepper
                   id="page-zoom"

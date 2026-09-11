@@ -9,9 +9,12 @@ import {
 } from "../src/bridge.ts";
 import type { Scenario, ScenarioFields } from "../src/types/scenario.ts";
 import {
+  bindScenarioToDevice,
   capabilityPresentationFromBackend,
   createScenario,
   createSerialRunner,
+  deviceBindingIssues,
+  deviceBindingState,
   editScenario,
   emptyScenarioFields,
   isScenarioDirty,
@@ -26,6 +29,7 @@ import {
   storeBlockers,
   storeFromScenarios,
   targetMatchesCapability,
+  trayContextFromWorkspace,
 } from "../src/utils/scenario.ts";
 
 /**
@@ -381,4 +385,81 @@ test("serialized store writes run in call order", async () => {
   const following = run(async () => "ok");
   await assert.rejects(() => failing);
   assert.equal(await following, "ok");
+});
+
+test("a scenario targets a device only through an explicit binding", () => {
+  const unbound = createScenario("scenario-a", { name: "Work", text: "git status\n", targetObjectId: "dynamic-object-0" });
+
+  // The device-free preview has no device to bind, so it is never blocked by the
+  // binding gate - not even when it carries an alias it cannot have.
+  assert.deepEqual(deviceBindingIssues({ mode: "preview", deviceAlias: null, scenario: unbound }), []);
+  assert.deepEqual(deviceBindingIssues({ mode: "preview", deviceAlias: "Work keyboard", scenario: unbound }), []);
+
+  // A connected device without an alias cannot bind anything, so both device
+  // actions stay blocked and the editor says what to do first.
+  assert.deepEqual(deviceBindingIssues({ mode: "device", deviceAlias: null, scenario: unbound }), ["deviceAliasMissing"]);
+  assert.equal(deviceBindingState(unbound, null), "aliasMissing");
+
+  // An unbound scenario, or one bound to another alias, is refused instead of
+  // being re-bound silently.
+  assert.deepEqual(deviceBindingIssues({ mode: "device", deviceAlias: "Work keyboard", scenario: unbound }), ["deviceUnbound"]);
+  assert.deepEqual(
+    deviceBindingIssues({
+      mode: "device",
+      deviceAlias: "Work keyboard",
+      scenario: createScenario("scenario-b", { targetDeviceId: "Other keyboard" }),
+    }),
+    ["deviceUnbound"],
+  );
+  assert.equal(deviceBindingState(unbound, "Work keyboard"), "unbound");
+
+  // The explicit bind only changes the draft, so it stays a normal unsaved edit
+  // that the user still has to save.
+  const bound = bindScenarioToDevice(unbound, "Work keyboard");
+  assert.equal(bound.draft.targetDeviceId, "Work keyboard");
+  assert.equal(bound.saved.targetDeviceId, null);
+  assert.equal(isScenarioDirty(bound), true);
+  assert.deepEqual(deviceBindingIssues({ mode: "device", deviceAlias: "Work keyboard", scenario: bound }), []);
+  assert.equal(deviceBindingState(bound, "Work keyboard"), "bound");
+
+  // Without an alias there is nothing to bind to, so the scenario is unchanged
+  // and stays blocked.
+  assert.equal(bindScenarioToDevice(unbound, null), unbound);
+
+  // No selected scenario: a missing alias is still reported, and with an alias
+  // present the target gate is the only reason left.
+  assert.deepEqual(deviceBindingIssues({ mode: "device", deviceAlias: null, scenario: null }), ["deviceAliasMissing"]);
+  assert.deepEqual(deviceBindingIssues({ mode: "device", deviceAlias: "Work keyboard", scenario: null }), []);
+});
+
+test("the tray device actions follow the same binding gate as the footer", () => {
+  const scenario = createScenario("scenario-a", { name: "Work", text: "git status\n", targetObjectId: "dynamic-object-0" });
+
+  // Unbound: the tray never offers upload or clear, exactly like the footer.
+  const binding = deviceBindingIssues({ mode: "device", deviceAlias: "Work keyboard", scenario });
+  const unboundContext = trayContextFromWorkspace({
+    scenario,
+    operation: null,
+    uploadBlockers: binding,
+    clearBlockers: binding,
+  });
+  assert.equal(unboundContext.canUploadScenario, false);
+  assert.equal(unboundContext.canClearDynamic, false);
+  // Choosing the scenario still only re-raises the existing workspace.
+  assert.equal(unboundContext.canChooseScenario, true);
+
+  // Bound: the binding gate stops blocking, so only the real device blockers
+  // can still disable an action.
+  const bound = bindScenarioToDevice(scenario, "Work keyboard");
+  const boundBinding = deviceBindingIssues({ mode: "device", deviceAlias: "Work keyboard", scenario: bound });
+  assert.deepEqual(boundBinding, []);
+  const boundContext = trayContextFromWorkspace({
+    scenario: bound,
+    operation: null,
+    uploadBlockers: boundBinding,
+    clearBlockers: boundBinding,
+  });
+  assert.equal(boundContext.canUploadScenario, true);
+  assert.equal(boundContext.canClearDynamic, true);
+  assert.equal(boundContext.scenarioName, "Work");
 });

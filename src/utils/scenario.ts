@@ -241,6 +241,54 @@ export function clearBlockers(gate: ScenarioGate): ScenarioBlocker[] {
 }
 
 /**
+ * How the selected Scenario relates to the connected device.
+ *
+ * The binding compares the stored alias with the current device alias, so a
+ * different device (or the same device under a different interface/usage, which
+ * has no alias) never inherits a binding it was not given.
+ */
+export type DeviceBindingState = "aliasMissing" | "unbound" | "bound";
+
+export function deviceBindingState(scenario: Scenario | null, deviceAlias: string | null): DeviceBindingState {
+  if (deviceAlias === null) return "aliasMissing";
+  return scenario !== null && scenario.draft.targetDeviceId === deviceAlias ? "bound" : "unbound";
+}
+
+/**
+ * Device-binding blockers of the device actions.
+ *
+ * The device-free preview has no device to bind, so it is never blocked. In the
+ * connected workspace, upload and clear both address the connected device and
+ * therefore require an explicit binding: a missing alias (there is nothing to
+ * bind to) or a Scenario bound to another alias is refused instead of being
+ * silently re-bound.
+ */
+export function deviceBindingIssues(input: {
+  mode: "preview" | "device";
+  deviceAlias: string | null;
+  scenario: Scenario | null;
+}): DeviceBindingBlocker[] {
+  if (input.mode === "preview") return [];
+  if (input.deviceAlias === null) return ["deviceAliasMissing"];
+  // Without a selected scenario there is no binding to judge: the target gate
+  // already reports the missing scenario, so this one stays quiet.
+  if (input.scenario === null) return [];
+  return deviceBindingState(input.scenario, input.deviceAlias) === "bound" ? [] : ["deviceUnbound"];
+}
+
+/**
+ * Bind a Scenario to the connected device.
+ *
+ * Only the draft changes, so the binding stays an unsaved edit until the user
+ * saves the Scenario. Without an alias there is nothing to bind to and the
+ * Scenario is returned unchanged.
+ */
+export function bindScenarioToDevice(scenario: Scenario, deviceAlias: string | null): Scenario {
+  if (deviceAlias === null) return scenario;
+  return editScenario(scenario, { targetDeviceId: deviceAlias });
+}
+
+/**
  * Reasons a local save cannot reach the scenario store.
  *
  * These are store schema limits, so they apply whenever a scenario is written
@@ -256,8 +304,17 @@ export type ScenarioStoreBlocker = "nameRequired" | "nameTooLong" | "storeTextUn
  */
 export type ScenarioStoreStateBlocker = "storeUnavailable";
 
+/**
+ * Reasons a device action has no bound device yet.
+ *
+ * A Scenario stores the alias the user explicitly bound it to. Until that alias
+ * exists on this machine and matches the connected device, the device actions
+ * stay unavailable: a device is never selected implicitly.
+ */
+export type DeviceBindingBlocker = "deviceAliasMissing" | "deviceUnbound";
+
 /** Any reason the editor has to report next to the action bar. */
-export type ScenarioIssue = ScenarioBlocker | ScenarioStoreBlocker | ScenarioStoreStateBlocker;
+export type ScenarioIssue = ScenarioBlocker | ScenarioStoreBlocker | ScenarioStoreStateBlocker | DeviceBindingBlocker;
 
 function storedTextIsSupported(text: string): boolean {
   const bytes = new TextEncoder().encode(text);

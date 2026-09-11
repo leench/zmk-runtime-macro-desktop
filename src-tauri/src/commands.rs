@@ -16,9 +16,7 @@ use crate::hid::{
     DeviceRecord, DeviceSummary, HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
 use crate::protocol::{AuthInfo, DynamicCapabilities, Status};
-use crate::tray::{
-    tray_context_from_parts, TrayContextError, TrayLocale, TrayMenuItems, TrayRuntimeContext,
-};
+use crate::tray::{TrayContextError, TrayLocale, TrayMenuItems, TrayRuntimeStateInput};
 
 /// Maps a rejected tray runtime input onto the stable command error envelope.
 ///
@@ -1552,55 +1550,20 @@ pub async fn set_tray_locale(
 /// context and rewrites menu text and enabled flags. It never opens HID, never
 /// calls the Dynamic service and never reads the scenario store, and the only
 /// scenario information it accepts is a bounded display name. An unknown status
-/// tag or an unsafe name is rejected with a stable sanitized error instead of
-/// being written into the menu.
+/// tag or an unsafe display name is rejected with a stable sanitized error
+/// instead of being written into the menu.
 #[tauri::command]
 pub async fn set_tray_runtime_state(
-    device_connected: bool,
-    dynamic_status: String,
-    current_scenario_name: Option<String>,
-    can_choose_scenario: bool,
-    can_upload_scenario: bool,
-    can_clear_dynamic: bool,
+    runtime: TrayRuntimeStateInput,
     menu: State<'_, TrayMenuItems>,
 ) -> Result<(), CommandError> {
-    let context = tray_runtime_context_from_input(
-        device_connected,
-        &dynamic_status,
-        current_scenario_name,
-        can_choose_scenario,
-        can_upload_scenario,
-        can_clear_dynamic,
-    )?;
+    let context = runtime.to_context().map_err(CommandError::from)?;
     menu.set_context(context).map_err(|_| {
         CommandError::new(
             "tray_update_failed",
             "The tray menu state could not be updated.",
         )
     })
-}
-
-/// Validates raw frontend values into a tray runtime context.
-///
-/// Kept as a free function so the validation and the two stable error codes stay
-/// testable without a live tray.
-fn tray_runtime_context_from_input(
-    device_connected: bool,
-    dynamic_status: &str,
-    current_scenario_name: Option<String>,
-    can_choose_scenario: bool,
-    can_upload_scenario: bool,
-    can_clear_dynamic: bool,
-) -> Result<TrayRuntimeContext, CommandError> {
-    tray_context_from_parts(
-        device_connected,
-        dynamic_status,
-        current_scenario_name,
-        can_choose_scenario,
-        can_upload_scenario,
-        can_clear_dynamic,
-    )
-    .map_err(CommandError::from)
 }
 
 /// Maps a frontend locale tag onto a tray locale.
@@ -1624,7 +1587,31 @@ mod tests {
     };
     use crate::hid::DeviceSummary;
     use crate::protocol::Status;
+    use crate::tray::TrayRuntimeContext;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    /// The command's validation path for one raw input, as a test needs it.
+    fn tray_runtime_context_from_input(
+        device_connected: bool,
+        dynamic_status: &str,
+        current_scenario_name: Option<String>,
+        device_alias: Option<String>,
+        can_choose_scenario: bool,
+        can_upload_scenario: bool,
+        can_clear_dynamic: bool,
+    ) -> Result<TrayRuntimeContext, CommandError> {
+        TrayRuntimeStateInput {
+            device_connected,
+            dynamic_status: dynamic_status.to_string(),
+            current_scenario_name,
+            device_alias,
+            can_choose_scenario,
+            can_upload_scenario,
+            can_clear_dynamic,
+        }
+        .to_context()
+        .map_err(CommandError::from)
+    }
 
     type SetCall = (u8, Vec<u8>);
     type SetCalls = Arc<StdMutex<Vec<SetCall>>>;
@@ -3331,18 +3318,21 @@ mod tests {
 
     #[test]
     fn tray_runtime_state_command_validates_status_and_scenario_name() {
-        // A valid payload carries only bounded display data: the status tag and
-        // the scenario display name, never dynamic text or an identifier.
+        // A valid payload carries only bounded display data: the status tag, the
+        // scenario display name and the device alias, never dynamic text or a
+        // device identifier.
         let context = tray_runtime_context_from_input(
             true,
             "committedLocally",
             Some("Work terminal".to_string()),
+            Some("Work keyboard".to_string()),
             true,
             false,
             true,
         )
         .unwrap();
         assert_eq!(context.current_scenario_name(), Some("Work terminal"));
+        assert_eq!(context.device_alias(), Some("Work keyboard"));
         assert_eq!(context.dynamic_status().tag(), "committedLocally");
         assert!(!context.upload_scenario_enabled());
         assert!(context.clear_dynamic_enabled());
@@ -3357,8 +3347,9 @@ mod tests {
             "idle",
             "system",
         ] {
-            let error = tray_runtime_context_from_input(true, rejected, None, true, true, true)
-                .unwrap_err();
+            let error =
+                tray_runtime_context_from_input(true, rejected, None, None, true, true, true)
+                    .unwrap_err();
             assert_eq!(error.code, "unsupported_tray_status", "{rejected:?}");
             assert!(!error.message.contains('\n'));
             assert!(!error.message.contains(rejected) || rejected.is_empty());
@@ -3378,6 +3369,7 @@ mod tests {
                 true,
                 "ready",
                 Some(rejected.to_string()),
+                None,
                 true,
                 true,
                 true,
@@ -3387,22 +3379,66 @@ mod tests {
         }
         let long_name = "n".repeat(crate::scenario_store::MAX_SCENARIO_NAME_BYTES + 1);
         assert_eq!(
-            tray_runtime_context_from_input(true, "ready", Some(long_name), true, true, true)
+            tray_runtime_context_from_input(true, "ready", Some(long_name), None, true, true, true)
                 .unwrap_err()
                 .code,
             "invalid_tray_scenario_name"
         );
 
-        // A disconnected window that offers nothing is always valid, and its
-        // device actions stay disabled even if a caller sets the flags.
+        // An unsafe device alias has its own stable code and never reaches the
+        // menu either.
+        for rejected in ["", "  ", "alias\nwith-newline", "control\u{7f}"] {
+            let error = tray_runtime_context_from_input(
+                true,
+                "ready",
+                None,
+                Some(rejected.to_string()),
+                true,
+                true,
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_tray_alias", "{rejected:?}");
+            assert!(!error.message.contains("with-newline"));
+        }
         assert_eq!(
-            tray_runtime_context_from_input(false, "unknown", None, false, false, false).unwrap(),
+            tray_runtime_context_from_input(
+                true,
+                "ready",
+                None,
+                Some("n".repeat(crate::scenario_store::MAX_SCENARIO_NAME_BYTES + 1)),
+                true,
+                true,
+                true
+            )
+            .unwrap_err()
+            .code,
+            "invalid_tray_alias"
+        );
+
+        // A disconnected window that offers nothing is always valid, and its
+        // device actions stay disabled even if a caller sets the flags. A stale
+        // alias is dropped rather than shown next to a missing device.
+        assert_eq!(
+            tray_runtime_context_from_input(false, "unknown", None, None, false, false, false)
+                .unwrap(),
             TrayRuntimeContext::default()
         );
         let forced =
-            tray_runtime_context_from_input(false, "ready", None, true, true, true).unwrap();
+            tray_runtime_context_from_input(false, "ready", None, None, true, true, true).unwrap();
         assert!(!forced.choose_scenario_enabled());
         assert!(!forced.upload_scenario_enabled());
         assert!(!forced.clear_dynamic_enabled());
+        let stale = tray_runtime_context_from_input(
+            false,
+            "ready",
+            None,
+            Some("Work keyboard".to_string()),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stale.device_alias(), None);
     }
 }

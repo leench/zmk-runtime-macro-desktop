@@ -27,7 +27,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{MenuBuilder, MenuItem, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -72,6 +72,12 @@ pub const TRAY_ACTION_EVENT: &str = "tray-action";
 
 /// Upper bound of the scenario display name, identical to the store schema.
 pub const MAX_TRAY_SCENARIO_NAME_BYTES: usize = crate::scenario_store::MAX_SCENARIO_NAME_BYTES;
+
+/// Upper bound of the device alias the tray may display.
+///
+/// It matches the store display-name bound, so an alias that fits a Scenario can
+/// always be shown in a native menu label.
+pub const MAX_TRAY_DEVICE_ALIAS_BYTES: usize = crate::scenario_store::MAX_SCENARIO_NAME_BYTES;
 
 const TOOLTIP: &str = "ZMK Runtime Macro";
 
@@ -217,6 +223,8 @@ pub enum TrayContextError {
     UnsupportedStatus,
     /// The scenario display name is empty, too long or contains control characters.
     InvalidScenarioName,
+    /// The device alias is empty, too long or contains control characters.
+    InvalidDeviceAlias,
 }
 
 impl TrayContextError {
@@ -224,6 +232,7 @@ impl TrayContextError {
         match self {
             Self::UnsupportedStatus => "unsupported_tray_status",
             Self::InvalidScenarioName => "invalid_tray_scenario_name",
+            Self::InvalidDeviceAlias => "invalid_tray_alias",
         }
     }
 
@@ -232,6 +241,9 @@ impl TrayContextError {
             Self::UnsupportedStatus => "Unsupported tray status.",
             Self::InvalidScenarioName => {
                 "The tray scenario name must be non-empty, at most 64 bytes and free of control characters."
+            }
+            Self::InvalidDeviceAlias => {
+                "The tray device alias must be non-empty, at most 64 bytes and free of control characters."
             }
         }
     }
@@ -255,6 +267,8 @@ pub struct TrayRuntimeContext {
     device_connected: bool,
     dynamic_status: TrayDynamicStatus,
     current_scenario_name: Option<String>,
+    /// Local alias of the connected device; always `None` while disconnected.
+    device_alias: Option<String>,
     can_choose_scenario: bool,
     can_upload_scenario: bool,
     can_clear_dynamic: bool,
@@ -266,6 +280,7 @@ impl Default for TrayRuntimeContext {
             device_connected: false,
             dynamic_status: TrayDynamicStatus::Unknown,
             current_scenario_name: None,
+            device_alias: None,
             can_choose_scenario: false,
             can_upload_scenario: false,
             can_clear_dynamic: false,
@@ -279,14 +294,20 @@ impl TrayRuntimeContext {
         device_connected: bool,
         dynamic_status: TrayDynamicStatus,
         current_scenario_name: Option<String>,
+        device_alias: Option<String>,
         can_choose_scenario: bool,
         can_upload_scenario: bool,
         can_clear_dynamic: bool,
     ) -> Result<Self, TrayContextError> {
+        // A supplied alias is always validated, so an unsafe value is refused
+        // instead of being dropped silently; it is only *displayed* while a
+        // device is connected.
+        let device_alias = normalize_device_alias(device_alias)?;
         Ok(Self {
             device_connected,
             dynamic_status,
             current_scenario_name: normalize_scenario_name(current_scenario_name)?,
+            device_alias: if device_connected { device_alias } else { None },
             can_choose_scenario,
             can_upload_scenario,
             can_clear_dynamic,
@@ -303,6 +324,11 @@ impl TrayRuntimeContext {
 
     pub fn current_scenario_name(&self) -> Option<&str> {
         self.current_scenario_name.as_deref()
+    }
+
+    /// Alias of the connected device, or `None` while it has none.
+    pub fn device_alias(&self) -> Option<&str> {
+        self.device_alias.as_deref()
     }
 
     /// The window can only show the workspace of a connected device, so the
@@ -322,29 +348,39 @@ impl TrayRuntimeContext {
     }
 }
 
-/// Validates a runtime context from raw frontend values.
+/// Raw runtime state a connected window publishes for the native menu.
 ///
-/// This is the only path from frontend input into the menu: an unknown status
-/// tag or an unsafe display name is rejected instead of being sanitized into the
-/// menu silently.
-pub fn tray_context_from_parts(
-    device_connected: bool,
-    dynamic_status: &str,
-    current_scenario_name: Option<String>,
-    can_choose_scenario: bool,
-    can_upload_scenario: bool,
-    can_clear_dynamic: bool,
-) -> Result<TrayRuntimeContext, TrayContextError> {
-    let status =
-        TrayDynamicStatus::from_tag(dynamic_status).ok_or(TrayContextError::UnsupportedStatus)?;
-    TrayRuntimeContext::new(
-        device_connected,
-        status,
-        current_scenario_name,
-        can_choose_scenario,
-        can_upload_scenario,
-        can_clear_dynamic,
-    )
+/// The command takes this as its single input object, so the Tauri IPC contract
+/// is one bounded payload instead of seven flat arguments. Every field is
+/// validated by [`Self::to_context`]: an unknown status tag or an unsafe display
+/// name is rejected instead of being sanitized into the menu silently.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayRuntimeStateInput {
+    pub device_connected: bool,
+    pub dynamic_status: String,
+    pub current_scenario_name: Option<String>,
+    pub device_alias: Option<String>,
+    pub can_choose_scenario: bool,
+    pub can_upload_scenario: bool,
+    pub can_clear_dynamic: bool,
+}
+
+impl TrayRuntimeStateInput {
+    /// The only path from frontend input into the menu.
+    pub fn to_context(&self) -> Result<TrayRuntimeContext, TrayContextError> {
+        let status = TrayDynamicStatus::from_tag(&self.dynamic_status)
+            .ok_or(TrayContextError::UnsupportedStatus)?;
+        TrayRuntimeContext::new(
+            self.device_connected,
+            status,
+            self.current_scenario_name.clone(),
+            self.device_alias.clone(),
+            self.can_choose_scenario,
+            self.can_upload_scenario,
+            self.can_clear_dynamic,
+        )
+    }
 }
 
 /// A display name is safe when it is non-empty once trimmed, within the store
@@ -359,6 +395,23 @@ fn normalize_scenario_name(raw: Option<String>) -> Result<Option<String>, TrayCo
         || trimmed.chars().any(char::is_control)
     {
         return Err(TrayContextError::InvalidScenarioName);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// A device alias is a display name of the same shape as a scenario name: it is
+/// trimmed, bounded in bytes and refused when it carries a control character, so
+/// arbitrary frontend text can never become a native menu label.
+fn normalize_device_alias(raw: Option<String>) -> Result<Option<String>, TrayContextError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_TRAY_DEVICE_ALIAS_BYTES
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(TrayContextError::InvalidDeviceAlias);
     }
     Ok(Some(trimmed.to_string()))
 }
@@ -387,6 +440,7 @@ pub struct TrayRenderedLabels {
 pub struct TrayLabels {
     locale: TrayLocale,
     pub open_main: &'static str,
+    pub device_prefix: &'static str,
     pub device_connected: &'static str,
     pub device_disconnected: &'static str,
     pub dynamic_prefix: &'static str,
@@ -402,6 +456,7 @@ pub struct TrayLabels {
 const ENGLISH_LABELS: TrayLabels = TrayLabels {
     locale: TrayLocale::En,
     open_main: "Open ZMK Runtime Macro",
+    device_prefix: "Device: ",
     device_connected: "Device: connected",
     device_disconnected: "Device: not connected",
     dynamic_prefix: "Dynamic status: ",
@@ -417,6 +472,7 @@ const ENGLISH_LABELS: TrayLabels = TrayLabels {
 const CHINESE_LABELS: TrayLabels = TrayLabels {
     locale: TrayLocale::ZhCn,
     open_main: "打开 ZMK Runtime Macro",
+    device_prefix: "设备：",
     device_connected: "设备：已连接",
     device_disconnected: "设备：未连接",
     dynamic_prefix: "Dynamic 状态：",
@@ -446,10 +502,10 @@ impl TrayLabels {
     /// The three status rows show real state; the three action rows only change
     /// their enabled flag, never their text.
     pub fn render(self, context: &TrayRuntimeContext) -> TrayRenderedLabels {
-        let device = if context.device_connected {
-            self.device_connected
-        } else {
-            self.device_disconnected
+        let device = match context.device_alias.as_deref() {
+            Some(alias) => format!("{}{}", self.device_prefix, alias),
+            None if context.device_connected => self.device_connected.to_string(),
+            None => self.device_disconnected.to_string(),
         };
         let scenario = context
             .current_scenario_name
@@ -457,7 +513,7 @@ impl TrayLabels {
             .unwrap_or(self.scenario_none);
         TrayRenderedLabels {
             open_main: self.open_main.to_string(),
-            status_device: device.to_string(),
+            status_device: device,
             status_dynamic: format!(
                 "{}{}",
                 self.dynamic_prefix,
@@ -895,6 +951,31 @@ mod tests {
         MENU_QUIT,
     ];
 
+    /// One runtime-state input and its validated context.
+    ///
+    /// Kept as a helper so every test states the raw fields exactly as the
+    /// frontend sends them.
+    fn context_from_parts(
+        device_connected: bool,
+        dynamic_status: &str,
+        current_scenario_name: Option<String>,
+        device_alias: Option<String>,
+        can_choose_scenario: bool,
+        can_upload_scenario: bool,
+        can_clear_dynamic: bool,
+    ) -> Result<TrayRuntimeContext, TrayContextError> {
+        TrayRuntimeStateInput {
+            device_connected,
+            dynamic_status: dynamic_status.to_string(),
+            current_scenario_name,
+            device_alias,
+            can_choose_scenario,
+            can_upload_scenario,
+            can_clear_dynamic,
+        }
+        .to_context()
+    }
+
     /// Contexts a menu can be rendered in: nothing connected, a connected but
     /// blocked workspace, and a fully usable connected workspace.
     fn contexts() -> Vec<TrayRuntimeContext> {
@@ -903,6 +984,7 @@ mod tests {
             TrayRuntimeContext::new(
                 true,
                 TrayDynamicStatus::Discovering,
+                None,
                 None,
                 false,
                 false,
@@ -913,6 +995,7 @@ mod tests {
                 true,
                 TrayDynamicStatus::Ready,
                 Some("Work terminal".to_string()),
+                Some("Work keyboard".to_string()),
                 true,
                 true,
                 true,
@@ -1051,8 +1134,65 @@ mod tests {
     }
 
     #[test]
+    fn runtime_state_input_deserializes_the_camel_case_payload() {
+        let input: TrayRuntimeStateInput = serde_json::from_value(json!({
+            "deviceConnected": true,
+            "dynamicStatus": "ready",
+            "currentScenarioName": "Work terminal",
+            "deviceAlias": "Work keyboard",
+            "canChooseScenario": true,
+            "canUploadScenario": false,
+            "canClearDynamic": false,
+        }))
+        .expect("input");
+        let context = input.to_context().expect("context");
+        assert_eq!(context.device_alias(), Some("Work keyboard"));
+        assert_eq!(context.current_scenario_name(), Some("Work terminal"));
+
+        // The IPC contract is exact, not best-effort: snake_case keys, a missing
+        // field and a non-object payload are all refused.
+        for rejected in [
+            json!({
+                "device_connected": true,
+                "dynamic_status": "ready",
+                "current_scenario_name": null,
+                "device_alias": null,
+                "can_choose_scenario": true,
+                "can_upload_scenario": true,
+                "can_clear_dynamic": true,
+            }),
+            json!({ "deviceConnected": true, "dynamicStatus": "ready" }),
+            json!([1, 2, 3]),
+            json!("ready"),
+            json!(null),
+        ] {
+            assert!(
+                serde_json::from_value::<TrayRuntimeStateInput>(rejected).is_err(),
+                "a malformed payload must be refused"
+            );
+        }
+
+        // An unknown status tag inside a well-formed payload is a validation
+        // error instead of a silent fallback.
+        let unknown: TrayRuntimeStateInput = serde_json::from_value(json!({
+            "deviceConnected": true,
+            "dynamicStatus": "Ready",
+            "currentScenarioName": null,
+            "deviceAlias": null,
+            "canChooseScenario": false,
+            "canUploadScenario": false,
+            "canClearDynamic": false,
+        }))
+        .expect("input");
+        assert_eq!(
+            unknown.to_context().unwrap_err(),
+            TrayContextError::UnsupportedStatus
+        );
+    }
+
+    #[test]
     fn context_rejects_unknown_status_and_unsafe_scenario_names() {
-        let error = tray_context_from_parts(true, "Ready", None, true, true, true).unwrap_err();
+        let error = context_from_parts(true, "Ready", None, None, true, true, true).unwrap_err();
         assert_eq!(error, TrayContextError::UnsupportedStatus);
         assert_eq!(error.code(), "unsupported_tray_status");
         assert!(!error.message().contains("Ready"));
@@ -1069,10 +1209,11 @@ mod tests {
             "c1\u{9f}",
             "nul\u{0}",
         ] {
-            let error = tray_context_from_parts(
+            let error = context_from_parts(
                 true,
                 "ready",
                 Some(rejected.to_string()),
+                None,
                 true,
                 true,
                 true,
@@ -1087,10 +1228,11 @@ mod tests {
         }
 
         assert_eq!(
-            tray_context_from_parts(
+            context_from_parts(
                 true,
                 "ready",
                 Some("n".repeat(MAX_TRAY_SCENARIO_NAME_BYTES + 1)),
+                None,
                 true,
                 true,
                 true,
@@ -1103,15 +1245,16 @@ mod tests {
         let cjk = "场".repeat(MAX_TRAY_SCENARIO_NAME_BYTES / 3 + 1);
         assert!(cjk.chars().count() <= MAX_TRAY_SCENARIO_NAME_BYTES);
         assert_eq!(
-            tray_context_from_parts(true, "ready", Some(cjk), true, true, true).unwrap_err(),
+            context_from_parts(true, "ready", Some(cjk), None, true, true, true).unwrap_err(),
             TrayContextError::InvalidScenarioName
         );
 
         // Accepted values are kept as-is, only trimmed and bounded.
-        let context = tray_context_from_parts(
+        let context = context_from_parts(
             true,
             "committedLocally",
             Some("  Work terminal  ".to_string()),
+            Some("  Work keyboard  ".to_string()),
             true,
             false,
             true,
@@ -1123,10 +1266,100 @@ mod tests {
             TrayDynamicStatus::CommittedLocally
         );
         assert!(context.device_connected());
+        assert_eq!(context.device_alias(), Some("Work keyboard"));
         // None and an empty list of flags are always accepted.
         let idle =
-            tray_context_from_parts(false, "unknown", None, false, false, false).expect("context");
+            context_from_parts(false, "unknown", None, None, false, false, false).expect("context");
         assert_eq!(idle, TrayRuntimeContext::default());
+    }
+
+    #[test]
+    fn context_validates_the_device_alias_and_drops_it_while_disconnected() {
+        // A well-formed alias is trimmed and kept for the device row.
+        let context = context_from_parts(
+            true,
+            "ready",
+            None,
+            Some("  Work keyboard  ".to_string()),
+            false,
+            false,
+            false,
+        )
+        .expect("context");
+        assert_eq!(context.device_alias(), Some("Work keyboard"));
+
+        // An empty, over-long or control-character alias is refused with a stable
+        // sanitized error, and the message never echoes the rejected value.
+        for rejected in [
+            "",
+            "   ",
+            "name\nwith-newline",
+            "name\twith-tab",
+            "control\u{7f}",
+            "nul\u{0}",
+        ] {
+            let error = context_from_parts(
+                true,
+                "ready",
+                None,
+                Some(rejected.to_string()),
+                false,
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error, TrayContextError::InvalidDeviceAlias, "{rejected:?}");
+            assert_eq!(error.code(), "invalid_tray_alias");
+            assert!(!error.message().contains("with-newline"));
+            assert!(!error.message().chars().any(char::is_control));
+        }
+        for rejected in [
+            "n".repeat(MAX_TRAY_DEVICE_ALIAS_BYTES + 1),
+            // Multi-byte aliases are bounded in bytes, so this one fits in
+            // characters but not in the alias bound.
+            "场".repeat(MAX_TRAY_DEVICE_ALIAS_BYTES / 3 + 1),
+        ] {
+            assert_eq!(
+                context_from_parts(true, "ready", None, Some(rejected), false, false, false)
+                    .unwrap_err(),
+                TrayContextError::InvalidDeviceAlias
+            );
+        }
+
+        // A disconnected window never shows the previous device's alias, and a
+        // bad alias is still refused instead of being dropped silently.
+        let disconnected = context_from_parts(
+            false,
+            "unknown",
+            None,
+            Some("Work keyboard".to_string()),
+            false,
+            false,
+            false,
+        )
+        .expect("context");
+        assert_eq!(disconnected.device_alias(), None);
+        assert_eq!(
+            context_from_parts(
+                false,
+                "unknown",
+                None,
+                Some("bad\nalias".to_string()),
+                false,
+                false,
+                false,
+            )
+            .unwrap_err(),
+            TrayContextError::InvalidDeviceAlias
+        );
+    }
+
+    #[test]
+    fn device_alias_bound_matches_the_store_schema() {
+        assert_eq!(
+            MAX_TRAY_DEVICE_ALIAS_BYTES,
+            crate::scenario_store::MAX_SCENARIO_NAME_BYTES
+        );
     }
 
     #[test]
@@ -1144,6 +1377,7 @@ mod tests {
             false,
             TrayDynamicStatus::Ready,
             Some("Work".to_string()),
+            Some("Work keyboard".to_string()),
             true,
             true,
             true,
@@ -1162,6 +1396,7 @@ mod tests {
             true,
             TrayDynamicStatus::Discovering,
             None,
+            None,
             true,
             false,
             false,
@@ -1176,6 +1411,7 @@ mod tests {
             true,
             TrayDynamicStatus::Ready,
             Some("Work".to_string()),
+            Some("Work keyboard".to_string()),
             true,
             true,
             true,
@@ -1287,13 +1523,14 @@ mod tests {
             true,
             TrayDynamicStatus::CommittedLocally,
             Some("Work terminal".to_string()),
+            Some("Work keyboard".to_string()),
             true,
             true,
             true,
         )
         .expect("context");
         let en = TrayLocale::En.labels().render(&ready);
-        assert_eq!(label_for(&en, MENU_STATUS_DEVICE), "Device: connected");
+        assert_eq!(label_for(&en, MENU_STATUS_DEVICE), "Device: Work keyboard");
         assert_eq!(
             label_for(&en, MENU_STATUS_DYNAMIC),
             "Dynamic status: Sent · local confirmation"
@@ -1305,7 +1542,7 @@ mod tests {
         // A local acknowledgement never reads like a device readback.
         assert!(label_for(&en, MENU_STATUS_DYNAMIC).contains("local"));
         let zh = TrayLocale::ZhCn.labels().render(&ready);
-        assert_eq!(label_for(&zh, MENU_STATUS_DEVICE), "设备：已连接");
+        assert_eq!(label_for(&zh, MENU_STATUS_DEVICE), "设备：Work keyboard");
         assert_eq!(
             label_for(&zh, MENU_STATUS_DYNAMIC),
             "Dynamic 状态：已发送 · 本地确认"
@@ -1316,11 +1553,31 @@ mod tests {
         );
         assert!(label_for(&zh, MENU_STATUS_DYNAMIC).contains("本地"));
 
+        // A connected device without an alias only says that it is connected: the
+        // menu never invents a name and never falls back to a device identity.
+        let unnamed =
+            TrayRuntimeContext::new(true, TrayDynamicStatus::Ready, None, None, true, true, true)
+                .expect("context");
+        assert_eq!(
+            label_for(
+                &TrayLocale::En.labels().render(&unnamed),
+                MENU_STATUS_DEVICE
+            ),
+            "Device: connected"
+        );
+        assert_eq!(
+            label_for(
+                &TrayLocale::ZhCn.labels().render(&unnamed),
+                MENU_STATUS_DEVICE
+            ),
+            "设备：已连接"
+        );
+
         // Every status has its own localized label, and it is always a real
         // status word rather than a placeholder.
         for status in TrayDynamicStatus::ALL {
-            let labels =
-                TrayRuntimeContext::new(true, status, None, false, false, false).expect("context");
+            let labels = TrayRuntimeContext::new(true, status, None, None, false, false, false)
+                .expect("context");
             for locale in LOCALES {
                 let rendered = locale.labels().render(&labels);
                 let text = label_for(&rendered, MENU_STATUS_DYNAMIC);

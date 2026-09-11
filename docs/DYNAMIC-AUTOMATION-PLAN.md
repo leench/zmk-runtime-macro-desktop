@@ -14,10 +14,10 @@
 
 当前已经确认的实施方向和实际进度是：
 
-1. **Dynamic Protocol v2 backend、bridge/multislot model 和 presentation-first Dynamic Workspace 均已完成。** Rust protocol/client/commands 已按 v2 多槽位实现（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；`src/bridge.ts` 与 `src/types/dynamic.ts` 已提供 slot-aware dynamic command 和 per-object 状态模型；`src/features/dynamic/` 的页面级 Dynamic Workspace 已按 in-memory fixture 实现（Scenario 列表/编辑器、capability-driven target 行、状态矩阵和确认对话框），但**仍待人工视觉验收**。
-2. Dynamic Workspace 采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。这些边界目前仍然成立，workspace 尚未调用任何真实 workspace command；真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供，旧入口作为 fallback 保留到视觉验收通过。
+1. **Dynamic Protocol v2 backend、bridge/multislot model 和 presentation-first Dynamic Workspace 均已完成。** Rust protocol/client/commands 已按 v2 多槽位实现（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；`src/bridge.ts` 与 `src/types/dynamic.ts` 已提供 slot-aware dynamic command 和 per-object 状态模型；`src/features/dynamic/` 的页面级 Dynamic Workspace 已完成（Scenario 列表/编辑器、capability-driven target 行、状态矩阵和确认对话框），其中 DeviceSelect 入口仍用 in-memory fixture，connected Workbench 入口已接入真实 command，但**仍待人工视觉验收**。
+2. Dynamic Workspace 保留 presentation-first 的 Preview 路径：DeviceSelect 入口用 in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API；connected Workbench 入口则已接入真实 capability/service/store（见 §12 阶段 5），旧 `DynamicMacroModal`/`DynamicMacroPanel` 作为 fallback 保留到视觉验收通过。
 3. **托盘基础已实现并已接入真实状态/操作**（`src-tauri/src/tray.rs`、`src-tauri/src/lib.rs`、`src/App.tsx`、`src/features/dynamic/DynamicWorkspace.tsx`）：Tauri 2 tray icon 和原生菜单、打开/隐藏/明确退出、close-to-tray、单实例窗口恢复；菜单的设备/Dynamic/Scenario 状态行显示连接与本地观察状态（状态行始终 disabled，仅信息展示），`Choose scenario` / `Upload current scenario` / `Clear Dynamic Object` 由受限 runtime context 控制 enabled，并通过稳定全局 event `tray-action` 交给已连接窗口执行；菜单文本有 `en` / `zh-CN` 两套 labels，由受限 `set_tray_locale` 与 `set_tray_runtime_state` command 更新（Rust 只接受这两个精确 locale tag 与精确 status tag，不自行推断语言、不接受任意文本）。平台专属托盘行为仍需在对应平台人工验收。
-4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、场景持久化、设备 alias、自启、本地 HTTP API 和自动场景；DynamicService、UI 接入真实 HID 和托盘状态/操作已完成（托盘操作仍通过 frontend bridge，不绕过 DynamicService）。
+4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、场景持久化、设备 alias、自启、本地 HTTP API 和自动场景；DynamicService、UI 接入真实 HID、Scenario store、设备 alias 和托盘状态/操作已完成（托盘操作仍通过 frontend bridge，不绕过 DynamicService；alias 只是本机展示名，不写入设备）。
 5. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
 6. 上面已完成的 v2 多槽位 backend 和 bridge 是后续接入基线，不从零重写，也不降级回单槽 v1。
 
@@ -157,7 +157,7 @@ src/App.tsx
 ```text
 打开 ZMK Runtime Macro
 ──────────────────────
-设备                 已连接 / 未连接
+设备                 本地 alias / 已连接 / 未连接
 Dynamic 状态         本地观察状态（unknown/ready/error/…）
 当前场景             当前场景显示名 / 无
 ──────────────────────
@@ -172,9 +172,9 @@ Dynamic 状态         本地观察状态（unknown/ready/error/…）
 托盘是**视图，不是 worker**：它不打开 HID、不发送 protocol frame、不调用 DynamicService、不读取 Scenario store，也不显示 HID path、serial 或正文。
 
 - **真实行为**：`Open ZMK Runtime Macro`（以及 tray icon 左键点击）显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 终止应用（绕过 close-to-tray，退出时仍由 `AppState` 的 drop 执行 best-effort LOCK）；普通窗口关闭隐藏到托盘；第二次启动由 single-instance plugin 恢复已有窗口。
-- **状态行（始终 disabled，仅信息展示）**：设备行只显示是否连接；Dynamic 行显示序列化的本地观察状态（`unknown` / `discovering` / `ready` / `unsupported` / `uploading` / `committedLocally` / `clearing` / `clearedLocally` / `error`）；场景行显示当前场景的**显示名称**或“无”。`committedLocally` / `clearedLocally` 在菜单里明确写作本地确认（`Sent/Cleared · local confirmation`、`已发送/已清除 · 本地确认`），不当作设备 readback。
-- **操作行**：`Choose scenario` / `Upload current scenario` / `Clear Dynamic Object` 的 enabled 由受限 runtime context 决定：必须已连接，且必须由窗口报告 upload/clear 无 blocker（目标缺失、超长、TTL、keep 不支持、store 不可用或操作进行中都保持 disabled）。菜单项被点击时，托盘先恢复并聚焦主窗口，再 emit 稳定全局 event `tray-action`；真正的保存—上传顺序、dirty 确认和 clear 确认全部由窗口的现有路径完成。
-- **输入边界**：`set_tray_runtime_state` 是唯一的运行状态输入，字段只有 `deviceConnected`、`dynamicStatus`、`currentScenarioName`（可空、≤ 64 bytes、不含控制字符的显示文本）、`canChooseScenario`、`canUploadScenario`、`canClearDynamic`；非法 status tag 返回 `unsupported_tray_status`，非法名称返回 `invalid_tray_scenario_name`，错误信息不回显被拒值。Rust 端再把三个 action flag 与 `deviceConnected` 取交集，因此断连时永远不会 offer 设备操作。
+- **状态行（始终 disabled，仅信息展示）**：设备行显示连接设备的本地 alias；设备没有 alias 时只显示“已连接”，断连时显示“未连接”，菜单不会自己编造名称；Dynamic 行显示序列化的本地观察状态（`unknown` / `discovering` / `ready` / `unsupported` / `uploading` / `committedLocally` / `clearing` / `clearedLocally` / `error`）；场景行显示当前场景的**显示名称**或“无”。`committedLocally` / `clearedLocally` 在菜单里明确写作本地确认（`Sent/Cleared · local confirmation`、`已发送/已清除 · 本地确认`），不当作设备 readback。
+- **操作行**：`Choose scenario` / `Upload current scenario` / `Clear Dynamic Object` 的 enabled 由受限 runtime context 决定：必须已连接，且必须由窗口报告 upload/clear 无 blocker（目标缺失、超长、TTL、keep 不支持、store 不可用、场景未绑定当前设备或操作进行中都保持 disabled）。菜单项被点击时，托盘先恢复并聚焦主窗口，再 emit 稳定全局 event `tray-action`；真正的保存—上传顺序、dirty 确认和 clear 确认全部由窗口的现有路径完成。
+- **输入边界**：`set_tray_runtime_state` 是唯一的运行状态输入，它的单个参数 `runtime` 只接受 `deviceConnected`、`dynamicStatus`、`currentScenarioName`（可空、≤ 64 bytes、不含控制字符的显示文本）、`deviceAlias`（可空、≤ 64 bytes、不含控制字符的本地 alias）、`canChooseScenario`、`canUploadScenario`、`canClearDynamic`；非法 status tag 返回 `unsupported_tray_status`，非法名称返回 `invalid_tray_scenario_name`，非法 alias 返回 `invalid_tray_alias`，错误信息不回显被拒值。Rust 端再把三个 action flag 与 `deviceConnected` 取交集，并在断连时丢弃 alias，因此断连时永远不会 offer 设备操作、也不会残留上一台设备的名称。
 - **event payload**：`tray-action` 只携带三个稳定 action 之一（`chooseScenario` / `uploadScenario` / `clearDynamic`），不含正文、path、serial 或设备标识；未连接或未监听的窗口不会自行执行任何操作。
 - **菜单文本跟随 UI locale**：菜单标签集中为 `en` 与 `zh-CN` 两套（不进入前端 UI locale 文件，菜单本身归 Rust 持有）；`set_tray_locale` 命令只接受精确的 `"en"` / `"zh-CN"`，其他值返回 `unsupported_locale`；语言始终来自前端 `resolveLocale` 的结果，Rust 不读环境变量、存储偏好或设备信息来猜语言；`App.tsx` 在启动和 locale 变化时同步，无需重启，失败静默处理；locale 切换不重置 runtime context。
 - 仍未实现：autostart、托盘直接读写设备（不在计划中）和 HTTP API；真实硬件与跨平台托盘人工验收仍待完成。
@@ -482,6 +482,8 @@ UI-only 阶段不保存 Scenario。正式功能阶段采用带 schema version �
 
 - `name` 是用户自定义显示名称，不是 firmware object 名称；
 - `target_object` 保存 opaque object id 或当前兼容 alias，不保存进程内 HID candidate ID；
+- `target_device` 保存用户在本机设置的设备 alias（显示名）：它可以包含空格和本地化字符，但不能为空、超过 64 bytes 或包含控制字符；alias 与安全设备摘要 key、serial、HID path 都不同，store 也不保存后三者；
+- 场景绑定要求用户显式选择：alias 变更或设备摘要变化后，旧绑定不再匹配，必须由用户重新确认；
 - 场景正文明确属于用户选择保存的非 secret 明文；
 - 写入使用临时文件加原子替换；
 - 配置损坏时保留原文件并报告可恢复错误；
@@ -614,7 +616,7 @@ UI 视觉验收通过后：
 
 **已完成（状态层）：** `DynamicService` 已接入 `AppState`，capability/upload/clear 在开始时进入 `Discovering`/`Uploading`/`Clearing`，成功只记录本次本地观察（`CommittedLocally`/`ClearedLocally`，以及 slot、byte length、TTL/keep），失败按 Remote status 进入 `Unsupported`/`Error` 并保留 session，transport/protocol 失败丢弃 session 并回到 `Unknown`；connect/disconnect/设备替换/`AppState` drop 后 reset 为 `Unknown`；generation 为本地 last-write-wins，过期完成被丢弃，新操作清除被取代操作遗留的 in-flight 状态；仍然只使用既有单一 HID worker 和 `MacroSession`，没有第二个 writer/线程/queue；static/auth command boundary 未改变（Dynamic 仍绕过 static auth gate）。backend 不保存 draft，也不保存任何 dynamic 正文。
 
-**仍未实现：** 连接后的自动 capability discovery（目前仍是显式 command）、pending 淘汰所需的待发送队列（目前只有 UI 的同步 command 调用方）、source metadata 和 device alias。
+**仍未实现：** 连接后的自动 capability discovery（目前仍是显式 command）、pending 淘汰所需的待发送队列（目前只有 UI 的同步 command 调用方）和 source metadata。
 
 ### 阶段 4：Scenario 原子持久化
 
@@ -638,7 +640,7 @@ UI 视觉验收通过后：
 - 真实 ACK 只更新本地观察状态，不添加 readback；
 - 完成硬件前的 fake-HID regression tests。
 
-**已完成（阶段 5）：** connected Workbench 的 Dynamic Workspace 已通过 `DynamicWorkspaceBackend` 接入真实 capability、无正文 `get_dynamic_state`、upload/clear 和 Scenario store；保存、删除、Save & Upload 使用串行持久化，保存失败保留 dirty draft，`objectId` 与 `wireSlot` 通过显式 capability 映射校验。DeviceSelect 入口仍是纯 in-memory Preview，旧 Dynamic modal 保留为 fallback；未接入 HTTP、自动 discovery 或 device alias；托盘状态/操作已按阶段 7 接入。
+**已完成（阶段 5）：** connected Workbench 的 Dynamic Workspace 已通过 `DynamicWorkspaceBackend` 接入真实 capability、无正文 `get_dynamic_state`、upload/clear 和 Scenario store；保存、删除、Save & Upload 使用串行持久化，保存失败保留 dirty draft，`objectId` 与 `wireSlot` 通过显式 capability 映射校验。DeviceSelect 入口仍是纯 in-memory Preview，旧 Dynamic modal 保留为 fallback；未接入 HTTP 或自动 discovery；托盘状态/操作已按阶段 7 接入，device alias 已按阶段 6 接入。
 
 ### 阶段 6：Device alias
 
@@ -648,6 +650,10 @@ UI 视觉验收通过后：
 - 设备摘要变化后要求用户重新确认绑定；
 - 首期仍只保持一个并行 HID session。
 
+**已完成（阶段 6）：** alias 保存在本机浏览器存储的独立 key（`zmk-runtime-macro-device-alias:v1`）下，按现有安全设备摘要 key（`vendorId:productId:interfaceNumber:usagePage:usage`）逐设备绑定；`src/utils/device-alias.ts` 只做纯校验/唯一性/读写（trim 后 1–64 bytes、不含控制字符、同一 alias 不能属于两个摘要 key、清空即解除），不存 serial、HID path、candidate id 或正文，也不送给 backend。Settings modal 在已连接时提供 alias 编辑（未连接则 disabled 并说明），错误用 `tooLong` / `controlCharacter` / `duplicate` 三种本地提示，保存走现有设置流程且与 `set_settings` 无关。Workbench header 与 Dynamic Workspace 的目标设备区优先显示 alias（无 alias 时回退 productName/unnamedDevice）；托盘设备行显示 alias（无 alias 时只说已连接），`deviceAlias` 作为受限字段进入 `TrayRuntimeStateInput`，Rust 以 `invalid_tray_alias` 拒绝非法值并在断连时丢弃 alias。Scenario 只在 `targetDeviceId` / 持久化 `target_device` 保存 alias，不保存摘要 key；connected Workspace 只有在 `targetDeviceId === 当前 alias` 时才允许 upload/clear，否则显示未绑定/不可用并提供显式 `Use this device`，点击后只改 draft（仍需 Save）；Preview 路径不参与绑定。仍只保持单一 HID session，未新增 manager/repository 层。
+
+**仍未实现：** alias 的跨平台人工验收（含托盘设备行渲染），以及后续 API/tray 对 alias 的更广泛使用。
+
 ### 阶段 7：托盘接入真实状态
 
 - 将托盘菜单从 mock 状态接入 DynamicService 和 Scenario store；
@@ -655,9 +661,9 @@ UI 视觉验收通过后：
 - 托盘上传、clear、选择 Scenario 与主窗口共用同一 service；
 - 关闭窗口仍只隐藏到托盘；明确退出才停止 worker/service。
 
-**已完成（阶段 7，device alias 除外）：** `src-tauri/src/tray.rs` 保存受限的 `TrayRuntimeContext`（`deviceConnected`、精确 `DynamicServiceStatus` tag、有界的当前场景显示名、三个 action flag），并按 locale + context 重写已有 `MenuItem` 的文本与 enabled 状态（状态行始终 disabled）；`set_tray_runtime_state` 校验输入（非法 status → `unsupported_tray_status`，非法名称 → `invalid_tray_scenario_name`），`set_tray_locale` 不重置 runtime context。三个操作菜单项点击时先恢复/聚焦主窗口，再 emit 全局 event `tray-action`（payload 只有 `chooseScenario` / `uploadScenario` / `clearDynamic`）；`src/App.tsx` 把连接状态、`DynamicService` 状态和 workspace 回传的显示名/可用性同步给 Rust，`src/features/dynamic/DynamicWorkspace.tsx`（连接模式下 hidden 但仍 mounted）监听 event：choose 打开工作区，upload 复用 Save & Upload（先保存成功再上传），clear 复用现有确认；blocker 存在时安全忽略。托盘仍不打开 HID、不调用 DynamicService/Scenario store，也不显示 HID path、serial 或正文。
+**已完成（阶段 7，device alias 见阶段 6）：** `src-tauri/src/tray.rs` 保存受限的 `TrayRuntimeContext`（`deviceConnected`、精确 `DynamicServiceStatus` tag、有界的当前场景显示名、有界设备 alias、三个 action flag），并按 locale + context 重写已有 `MenuItem` 的文本与 enabled 状态（状态行始终 disabled）；`set_tray_runtime_state` 的单个参数 `runtime` 校验输入（非法 status → `unsupported_tray_status`，非法名称 → `invalid_tray_scenario_name`，非法 alias → `invalid_tray_alias`；断连时丢弃 alias），`set_tray_locale` 不重置 runtime context。三个操作菜单项点击时先恢复/聚焦主窗口，再 emit 全局 event `tray-action`（payload 只有 `chooseScenario` / `uploadScenario` / `clearDynamic`）；`src/App.tsx` 把连接状态、alias、`DynamicService` 状态和 workspace 回传的显示名/可用性同步给 Rust，`src/features/dynamic/DynamicWorkspace.tsx`（连接模式下 hidden 但仍 mounted）监听 event：choose 打开工作区，upload 复用 Save & Upload（先保存成功再上传，且需已绑定当前设备），clear 复用现有确认；blocker 存在时安全忽略。托盘仍不打开 HID、不调用 DynamicService/Scenario store，也不显示 HID path、serial 或正文。
 
-**仍未实现：** 菜单里的设备 alias（阶段 6）仍未实现，因此设备行只显示是否连接；托盘上传/clear 的真实硬件与跨平台人工验收仍待完成。
+**仍未实现：** 托盘上传/clear 的真实硬件与跨平台人工验收（含设备行 alias 渲染）仍待完成。
 
 ### 阶段 8：Login autostart
 
@@ -739,8 +745,8 @@ v2 多 object capability/protocol contract 已经发布并实现：Rust backend 
 | PR-06 | DynamicService、serialized writer、queue、generation、observed state | PR-05 | 复用现有 client；fake-HID regression |
 | PR-07 | Scenario schema、原子持久化和损坏恢复 | PR-06 | 正文只作为用户选择的非 secret 数据保存 |
 | PR-08 | UI bridge 接入真实 DynamicService/HID | PR-07 | 真实 capability/upload/clear；无 readback |
-| PR-09 | 当前 active device alias | PR-08 | alias 不暴露 serial/path；多候选不自动选择 |
-| PR-10 | 托盘菜单接入真实 Scenario/service 状态 | PR-09 | 主窗口和 tray 共用 service；手动闭环准备（已实现：状态行 + 三个 action 经 `tray-action` event 交给窗口，见阶段 7；device alias 仍待阶段 6） |
+| PR-09 | 当前 active device alias | PR-08 | alias 不暴露 serial/path；多候选不自动选择（已实现：安全摘要 key 绑定 + 本地唯一 + Scenario 显式绑定，见阶段 6） |
+| PR-10 | 托盘菜单接入真实 Scenario/service 状态 | PR-09 | 主窗口和 tray 共用 service；手动闭环准备（已实现：状态行 + 三个 action 经 `tray-action` event 交给窗口，设备行显示 alias，见阶段 6/7） |
 | PR-11 | Login autostart 和后台启动参数 | PR-10 | 默认关闭；普通启动和自启入口区分 |
 | **Gate B** | **首期手动闭环验收** | PR-11 | **真实 tray、autostart、Scenario、HID 和 static/auth 无回归** |
 | **Gate C** | **HTTP API 前验收** | Gate B | **确认 UI/tray/service/store/alias 已稳定，再决定是否开始 HTTP API** |

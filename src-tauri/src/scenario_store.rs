@@ -197,6 +197,18 @@ fn valid_opaque(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
+/// True for the device alias a Scenario is bound to.
+///
+/// An alias is a local display name, not a device identifier: it accepts every
+/// character the native tray can display (no control characters) within the same
+/// byte bound as a Scenario name, so "Work keyboard" and a localized alias are
+/// both storable. Empty, over-long or control-character aliases are refused.
+fn valid_alias(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SCENARIO_NAME_BYTES
+        && !value.chars().any(char::is_control)
+}
+
 /// Validate the whole document before any write; never truncates or repairs.
 pub fn validate(document: &ScenarioDocument) -> Result<(), ScenarioStoreError> {
     if document.schema_version != SCENARIO_SCHEMA_VERSION {
@@ -222,11 +234,13 @@ pub fn validate(document: &ScenarioDocument) -> Result<(), ScenarioStoreError> {
                 return Err(ScenarioStoreError::Invalid);
             }
         }
-        for value in [&scenario.target_device, &scenario.target_object]
-            .into_iter()
-            .flatten()
-        {
-            if !valid_opaque(value) {
+        if let Some(device) = &scenario.target_device {
+            if !valid_alias(device) {
+                return Err(ScenarioStoreError::Invalid);
+            }
+        }
+        if let Some(object) = &scenario.target_object {
+            if !valid_opaque(object) {
                 return Err(ScenarioStoreError::Invalid);
             }
         }
@@ -712,5 +726,50 @@ mod tests {
         assert!(is_supported_text("ok\n\t\u{8}"));
         assert!(!is_supported_text("emoji ✨"));
         assert!(!is_supported_text("中文"));
+    }
+
+    #[test]
+    fn a_device_alias_is_a_display_name_not_an_identifier() {
+        // A space and a localized alias are both acceptable: the alias is shown in
+        // the native menu, and the same bound applies there.
+        for accepted in ["Work keyboard", "工作键盘", "Keyboard 1 (USB)"] {
+            let document = ScenarioDocument {
+                schema_version: SCENARIO_SCHEMA_VERSION,
+                scenarios: vec![PersistedScenario {
+                    target_device: Some(accepted.to_string()),
+                    ..sample("alias-accepted")
+                }],
+            };
+            assert_eq!(validate(&document), Ok(()), "{accepted:?}");
+        }
+
+        // Empty, over-long and control-character aliases are refused, and so is an
+        // object id that is not a plain opaque token.
+        for rejected in ["", "with\nnewline", "with\t tab", "nul\u{0}"] {
+            let document = ScenarioDocument {
+                schema_version: SCENARIO_SCHEMA_VERSION,
+                scenarios: vec![PersistedScenario {
+                    target_device: Some(rejected.to_string()),
+                    ..sample("alias-rejected")
+                }],
+            };
+            assert_eq!(validate(&document), Err(ScenarioStoreError::Invalid));
+        }
+        let too_long = ScenarioDocument {
+            schema_version: SCENARIO_SCHEMA_VERSION,
+            scenarios: vec![PersistedScenario {
+                target_device: Some("n".repeat(MAX_SCENARIO_NAME_BYTES + 1)),
+                ..sample("alias-too-long")
+            }],
+        };
+        assert_eq!(validate(&too_long), Err(ScenarioStoreError::Invalid));
+        let spaced_object = ScenarioDocument {
+            schema_version: SCENARIO_SCHEMA_VERSION,
+            scenarios: vec![PersistedScenario {
+                target_object: Some("object with space".to_string()),
+                ..sample("object-spaced")
+            }],
+        };
+        assert_eq!(validate(&spaced_object), Err(ScenarioStoreError::Invalid));
     }
 }
