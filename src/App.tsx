@@ -53,10 +53,20 @@ import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
 import { SelectField } from "./components/SelectField";
 import type { Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
+import type { DynamicCapabilityStatus, DynamicObjectState, DynamicObjectStatus } from "./types/dynamic";
 import type { SlotAction, SlotState } from "./types/workbench";
 import { MAX_TEXT_BYTES, macroBytes, textFromTokens, tokensFromText } from "./utils/macro";
-import { FIRST_DYNAMIC_SLOT, validateDynamicText, validateDynamicTtl } from "./utils/dynamic";
-import type { DynamicMacroStatus } from "./components/DynamicMacroPanel";
+import {
+  FIRST_DYNAMIC_SLOT,
+  clearDynamicObjectFeedback,
+  createDynamicObjectState,
+  dynamicLimits,
+  dynamicObjectSlots,
+  normalizeDynamicObjects,
+  resetDynamicObjectOperation,
+  validateDynamicText,
+  validateDynamicTtl,
+} from "./utils/dynamic";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -298,6 +308,11 @@ function makeSlotState(metadata: SlotMetadata, labels: Record<number, string>, p
   };
 }
 
+/** Editing an object draft invalidates a previous local observation. */
+function statusAfterDynamicEdit(status: DynamicObjectStatus): DynamicObjectStatus {
+  return status === "error" || status === "committed" || status === "cleared" ? "idle" : status;
+}
+
 function platformForHost(): Platform {
   if (typeof navigator === "undefined") return "linux";
   const value = `${navigator.platform} ${navigator.userAgent}`.toLowerCase();
@@ -345,13 +360,12 @@ function App() {
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   const [authRemainingSeconds, setAuthRemainingSeconds] = useState<number | null>(null);
   const [dynamicCapabilities, setDynamicCapabilities] = useState<DynamicCapabilities | null>(null);
-  const [dynamicText, setDynamicText] = useState("");
-  const [dynamicTtlSeconds, setDynamicTtlSeconds] = useState<number | null>(null);
-  const [dynamicKeepAfterExecute, setDynamicKeepAfterExecute] = useState(false);
-  const [dynamicStatus, setDynamicStatus] = useState<DynamicMacroStatus>("unknown");
-  const [dynamicProgress, setDynamicProgress] = useState<number | null>(null);
-  const [dynamicError, setDynamicError] = useState<CommandError | null>(null);
-  const [dynamicClearConfirm, setDynamicClearConfirm] = useState(false);
+  const [dynamicCapabilityStatus, setDynamicCapabilityStatus] = useState<DynamicCapabilityStatus>("unknown");
+  // One in-memory state per dynamic object. The initial state is the default
+  // target that every supported device reports as object 0; CAPABILITIES then
+  // aligns the collection with the real object count.
+  const [dynamicObjects, setDynamicObjects] = useState<DynamicObjectState[]>(() => [createDynamicObjectState(FIRST_DYNAMIC_SLOT)]);
+  const [selectedDynamicSlot, setSelectedDynamicSlot] = useState<number>(FIRST_DYNAMIC_SLOT);
   const [dynamicModalOpen, setDynamicModalOpen] = useState(false);
 
   const mounted = useRef(false);
@@ -464,11 +478,9 @@ function App() {
       connectionRef.current = disconnected;
       setConnection(disconnected);
       setDynamicCapabilities(null);
-      setDynamicStatus("unknown");
+      setDynamicCapabilityStatus("unknown");
       setDynamicModalOpen(false);
-      setDynamicError(null);
-      setDynamicProgress(null);
-      setDynamicClearConfirm(false);
+      setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
       clearAuthDeadline();
       cancelPreviewLoads();
       hideRevealed();
@@ -477,29 +489,33 @@ function App() {
     }
   }, [cancelPreviewLoads, clearAuthDeadline, hideRevealed]);
 
+  const applyDynamicCapabilities = useCallback((capabilities: DynamicCapabilities, preserveUnknown: boolean) => {
+    const slots = dynamicObjectSlots(capabilities);
+    setDynamicObjects((previous) => normalizeDynamicObjects(previous, slots, capabilities.supportsKeepAfterExecute));
+    setSelectedDynamicSlot((current) => slots.includes(current) ? current : slots[0] ?? FIRST_DYNAMIC_SLOT);
+    setDynamicCapabilities(capabilities);
+    setDynamicCapabilityStatus(preserveUnknown ? "unknown" : "ready");
+  }, []);
+
   const loadDynamicCapabilities = useCallback(async (sequence: number, preserveUnknown: boolean): Promise<boolean> => {
     if (!connectionRef.current.connected) return false;
-    setDynamicError(null);
-    setDynamicProgress(null);
-    setDynamicStatus(preserveUnknown ? "unknown" : "discovering");
+    setDynamicObjects((previous) => previous.map(clearDynamicObjectFeedback));
+    setDynamicCapabilityStatus(preserveUnknown ? "unknown" : "discovering");
     recordOperation("CAPABILITIES");
     try {
       const capabilities = await enqueueProtocolOperation(() => getDynamicCapabilities());
       if (!mounted.current || operation.current !== sequence || !connectionRef.current.connected) return false;
-      setDynamicCapabilities(capabilities);
-      setDynamicKeepAfterExecute((current) => capabilities.supportsKeepAfterExecute ? current : false);
-      setDynamicStatus(preserveUnknown ? "unknown" : "ready");
+      applyDynamicCapabilities(capabilities, preserveUnknown);
       return true;
     } catch (caught) {
       if (!mounted.current || operation.current !== sequence) return false;
       const error = asCommandError(caught);
-      setDynamicError(error);
       setDynamicCapabilities(null);
-      setDynamicStatus(error.code === "dynamic_unsupported" ? "unsupported" : "error");
+      setDynamicCapabilityStatus(error.code === "dynamic_unsupported" ? "unsupported" : "error");
       if (dropsConnection(error.code)) applyErrorState(error);
       return false;
     }
-  }, [applyErrorState, enqueueProtocolOperation, recordOperation]);
+  }, [applyDynamicCapabilities, applyErrorState, enqueueProtocolOperation, recordOperation]);
 
   const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean): SlotState[] => {
     const nextSlots = metadata.map((item) => makeSlotState(item, nextLabels, slotsRef.current.find((slot) => slot.slot === item.slot), preserveDirty));
@@ -645,11 +661,9 @@ function App() {
       }
       if (!nextConnection.connected) {
         setDynamicCapabilities(null);
-        setDynamicStatus("unknown");
+        setDynamicCapabilityStatus("unknown");
         setDynamicModalOpen(false);
-        setDynamicError(null);
-        setDynamicProgress(null);
-        setDynamicClearConfirm(false);
+        setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
       }
       if (!nextConnection.connected && nextDevices.length === 0) {
         setLastErrorCode("no_device");
@@ -684,11 +698,9 @@ function App() {
     setSetupOpen(false);
     setPasswordModalMode(null);
     setDynamicCapabilities(null);
-    setDynamicStatus("unknown");
+    setDynamicCapabilityStatus("unknown");
     setDynamicModalOpen(false);
-    setDynamicError(null);
-    setDynamicProgress(null);
-    setDynamicClearConfirm(false);
+    setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
     setConnection(disconnected);
     hideRevealed();
     recordOperation("Connect");
@@ -763,11 +775,9 @@ function App() {
       setConnection(disconnected);
       clearAuthDeadline();
       setDynamicCapabilities(null);
-      setDynamicStatus("unknown");
+      setDynamicCapabilityStatus("unknown");
       setDynamicModalOpen(false);
-      setDynamicError(null);
-      setDynamicProgress(null);
-      setDynamicClearConfirm(false);
+      setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
       setSelectedId("");
       setClearConfirm(null);
       setSwitchConfirm(null);
@@ -799,11 +809,9 @@ function App() {
           if (!mounted.current || operation.current !== sequence || deviceKey.current !== knownKey) return;
           setConnection(disconnected);
           setDynamicCapabilities(null);
-          setDynamicStatus("unknown");
+          setDynamicCapabilityStatus("unknown");
           setDynamicModalOpen(false);
-          setDynamicError(null);
-          setDynamicProgress(null);
-          setDynamicClearConfirm(false);
+          setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
           clearAuthDeadline();
           cancelPreviewLoads();
           hideRevealed();
@@ -1118,110 +1126,122 @@ function App() {
     }
   }, [applyErrorState, busy, commandError, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, selectedSlot, slots]);
 
-  const updateDynamicText = useCallback((value: string) => {
-    setDynamicText(value);
-    setDynamicError(null);
-    if (dynamicStatus === "error" || dynamicStatus === "committed" || dynamicStatus === "cleared") setDynamicStatus(dynamicCapabilities ? "ready" : "unknown");
-  }, [dynamicCapabilities, dynamicStatus]);
-
-  const requestDynamicClear = useCallback(() => {
-    if (!connectionRef.current.connected || dynamicCapabilities === null || dynamicStatus === "unsupported" || dynamicStatus === "discovering") return;
-    setDynamicClearConfirm(true);
-  }, [dynamicCapabilities, dynamicStatus]);
-
-  const cancelDynamicClear = useCallback(() => {
-    setDynamicClearConfirm(false);
+  const updateDynamicObject = useCallback((slot: number, update: (state: DynamicObjectState) => DynamicObjectState) => {
+    setDynamicObjects((previous) => previous.map((state) => state.slot === slot ? update(state) : state));
   }, []);
 
+  const selectDynamicSlot = useCallback((slot: number) => {
+    if (!dynamicObjects.some((state) => state.slot === slot)) return;
+    setSelectedDynamicSlot(slot);
+  }, [dynamicObjects]);
+
+  const updateDynamicText = useCallback((value: string) => {
+    updateDynamicObject(selectedDynamicSlot, (state) => ({
+      ...state,
+      draftText: value,
+      error: null,
+      status: statusAfterDynamicEdit(state.status),
+    }));
+  }, [selectedDynamicSlot, updateDynamicObject]);
+
+  const updateDynamicTtl = useCallback((value: number | null) => {
+    updateDynamicObject(selectedDynamicSlot, (state) => ({ ...state, ttlSeconds: value, error: null }));
+  }, [selectedDynamicSlot, updateDynamicObject]);
+
+  const updateDynamicKeep = useCallback((value: boolean) => {
+    updateDynamicObject(selectedDynamicSlot, (state) => ({ ...state, keepAfterExecute: value }));
+  }, [selectedDynamicSlot, updateDynamicObject]);
+
+  const requestDynamicClear = useCallback(() => {
+    if (!connectionRef.current.connected || dynamicCapabilities === null || dynamicCapabilityStatus === "unsupported" || dynamicCapabilityStatus === "discovering") return;
+    updateDynamicObject(selectedDynamicSlot, (state) => ({ ...state, clearConfirm: true }));
+  }, [dynamicCapabilities, dynamicCapabilityStatus, selectedDynamicSlot, updateDynamicObject]);
+
+  const cancelDynamicClear = useCallback(() => {
+    updateDynamicObject(selectedDynamicSlot, (state) => ({ ...state, clearConfirm: false }));
+  }, [selectedDynamicSlot, updateDynamicObject]);
+
   const uploadDynamic = useCallback(async (): Promise<CommandError | null> => {
-    if (!connectionRef.current.connected || dynamicCapabilities === null) {
-      const error = { code: "dynamic_unsupported", message: "" } satisfies CommandError;
-      setDynamicError(error);
-      setDynamicStatus("unsupported");
-      return error;
+    const slot = selectedDynamicSlot;
+    const object = dynamicObjects.find((state) => state.slot === slot) ?? null;
+    if (!connectionRef.current.connected || dynamicCapabilities === null || object === null) {
+      return { code: "dynamic_unsupported", message: "" } satisfies CommandError;
     }
-    const textError = validateDynamicText(dynamicText);
-    const ttlError = validateDynamicTtl(dynamicTtlSeconds);
+    const limits = dynamicLimits(dynamicCapabilities);
+    const textError = validateDynamicText(object.draftText, limits.maxBytes);
+    const ttlError = validateDynamicTtl(object.ttlSeconds, limits);
     if (textError || ttlError) {
       const error = { code: textError === "empty" ? "dynamic_empty" : textError === "tooLong" ? "length_exceeded" : textError === "ttlInvalid" ? "dynamic_ttl_invalid" : "invalid_text", message: "" } satisfies CommandError;
-      setDynamicError(error);
-      setDynamicStatus("error");
+      updateDynamicObject(slot, (state) => ({ ...state, error, status: "error" }));
       return error;
     }
-    if (dynamicKeepAfterExecute && !dynamicCapabilities.supportsKeepAfterExecute) {
+    if (object.keepAfterExecute && !dynamicCapabilities.supportsKeepAfterExecute) {
       const error = { code: "dynamic_keep_unsupported", message: "" } satisfies CommandError;
-      setDynamicError(error);
-      setDynamicStatus("error");
+      updateDynamicObject(slot, (state) => ({ ...state, error, status: "error" }));
       return error;
     }
     const sequence = ++operation.current;
     setBusy(true);
-    setDynamicError(null);
-    setDynamicStatus("uploading");
-    setDynamicProgress(0);
     setErrorCode(null);
     recordOperation("DYNAMIC_UPLOAD");
+    updateDynamicObject(slot, (state) => ({ ...state, error: null, status: "uploading", progress: 0 }));
     try {
-      setDynamicProgress(25);
-      await enqueueProtocolOperation(() => uploadDynamicCommand(FIRST_DYNAMIC_SLOT, dynamicText, dynamicTtlSeconds, dynamicKeepAfterExecute));
+      updateDynamicObject(slot, (state) => ({ ...state, progress: 25 }));
+      await enqueueProtocolOperation(() => uploadDynamicCommand(slot, object.draftText, object.ttlSeconds, object.keepAfterExecute));
       if (!mounted.current || operation.current !== sequence) return null;
-      setDynamicProgress(null);
-      setDynamicStatus("committed");
       markAuthenticatedActivity(false);
+      updateDynamicObject(slot, (state) => ({ ...state, status: "committed", progress: null }));
       return null;
     } catch (caught) {
       if (!mounted.current || operation.current !== sequence) return null;
       const error = asCommandError(caught);
-      setDynamicError(error);
-      setDynamicStatus(error.code === "dynamic_unsupported" ? "unsupported" : dropsConnection(error.code) ? "unknown" : "error");
-      setDynamicProgress(null);
       if (dropsConnection(error.code)) {
-        setDynamicCapabilities(null);
         applyErrorState(error);
+      } else {
+        if (error.code === "dynamic_unsupported") setDynamicCapabilityStatus("unsupported");
+        updateDynamicObject(slot, (state) => ({ ...state, error, status: "error", progress: null }));
       }
       return error;
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, dynamicCapabilities, dynamicKeepAfterExecute, dynamicText, dynamicTtlSeconds, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation]);
+  }, [applyErrorState, dynamicCapabilities, dynamicObjects, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, selectedDynamicSlot, updateDynamicObject]);
 
   const clearDynamic = useCallback(async (): Promise<CommandError | null> => {
-    setDynamicClearConfirm(false);
-    if (!connectionRef.current.connected || dynamicCapabilities === null) {
-      const error = { code: "dynamic_unsupported", message: "" } satisfies CommandError;
-      setDynamicError(error);
-      setDynamicStatus("unsupported");
-      return error;
+    const slot = selectedDynamicSlot;
+    const object = dynamicObjects.find((state) => state.slot === slot) ?? null;
+    if (object) updateDynamicObject(slot, (state) => ({ ...state, clearConfirm: false }));
+    if (!connectionRef.current.connected || dynamicCapabilities === null || object === null) {
+      return { code: "dynamic_unsupported", message: "" } satisfies CommandError;
     }
     const sequence = ++operation.current;
     setBusy(true);
-    setDynamicError(null);
-    setDynamicStatus("clearing");
-    setDynamicProgress(0);
     setErrorCode(null);
     recordOperation("DYNAMIC_CLEAR");
+    updateDynamicObject(slot, (state) => ({ ...state, error: null, status: "clearing", progress: 0 }));
     try {
-      setDynamicProgress(50);
-      await enqueueProtocolOperation(() => clearDynamicCommand(FIRST_DYNAMIC_SLOT));
+      updateDynamicObject(slot, (state) => ({ ...state, progress: 50 }));
+      await enqueueProtocolOperation(() => clearDynamicCommand(slot));
       if (!mounted.current || operation.current !== sequence) return null;
-      setDynamicProgress(null);
-      setDynamicStatus("cleared");
+      updateDynamicObject(slot, (state) => ({ ...state, status: "cleared", progress: null }));
       return null;
     } catch (caught) {
       if (!mounted.current || operation.current !== sequence) return null;
       const error = asCommandError(caught);
-      setDynamicError(error);
-      setDynamicStatus(error.code === "dynamic_unsupported" ? "unsupported" : dropsConnection(error.code) ? "unknown" : "error");
-      setDynamicProgress(null);
       if (dropsConnection(error.code)) {
-        setDynamicCapabilities(null);
         applyErrorState(error);
+      } else {
+        if (error.code === "dynamic_unsupported") setDynamicCapabilityStatus("unsupported");
+        updateDynamicObject(slot, (state) => ({ ...state, error, status: "error", progress: null }));
       }
       return error;
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, dynamicCapabilities, enqueueProtocolOperation, recordOperation]);
+  }, [applyErrorState, dynamicCapabilities, dynamicObjects, enqueueProtocolOperation, recordOperation, selectedDynamicSlot, updateDynamicObject]);
+
+  const dynamicObjectSlotsForPanel = dynamicObjects.map((state) => state.slot);
+  const selectedDynamicObject = dynamicObjects.find((state) => state.slot === selectedDynamicSlot) ?? dynamicObjects[0];
 
   const retrySelected = useCallback(() => {
     const selected = slots.find((slot) => slot.slot === selectedSlot);
@@ -1574,17 +1594,15 @@ function App() {
         <DynamicMacroModal
           copy={copy}
           capabilities={dynamicCapabilities}
-          text={dynamicText}
-          ttlSeconds={dynamicTtlSeconds}
-          keepAfterExecute={dynamicKeepAfterExecute}
-          status={dynamicStatus}
-          progress={dynamicProgress}
-          error={dynamicError}
+          capabilityStatus={dynamicCapabilityStatus}
+          objectSlots={dynamicObjectSlotsForPanel}
+          selectedSlot={selectedDynamicSlot}
+          object={selectedDynamicObject}
           disabled={busy}
-          clearPending={dynamicClearConfirm}
+          onSelectSlot={selectDynamicSlot}
           onTextChange={updateDynamicText}
-          onTtlChange={setDynamicTtlSeconds}
-          onKeepChange={setDynamicKeepAfterExecute}
+          onTtlChange={updateDynamicTtl}
+          onKeepChange={updateDynamicKeep}
           onUpload={uploadDynamic}
           onClearRequest={requestDynamicClear}
           onClearConfirm={clearDynamic}

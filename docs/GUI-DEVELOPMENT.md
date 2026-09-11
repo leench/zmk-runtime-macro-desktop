@@ -6,7 +6,7 @@
 
 首版目标平台：Linux x86_64、macOS Intel/Apple Silicon、Windows x64。前端不直接访问 HID，所有枚举、认证、协议和传输都在 Rust/Tauri command 层完成。
 
-当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端暂时只显式使用第一个 object，多 object 选择器待 UI 阶段。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
+当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
 
 ## 2. 固件和协议约束
 
@@ -114,9 +114,9 @@ Dynamic Macro 是独立于 static slot 的 RAM-only object collection，每个 o
 
 连接后先对第一个 object 发送 `CAPABILITIES`，并严格校验 capability version（必须为 2，不接受 v1 或未知版本）、object count（1–8，且 response slot 必须落在该 count 内）、固定长度（512）/TTL/timeout、required lifecycle flags 和 reserved bits 7..15。`BAD_OPCODE`/`BAD_VERSION` 映射为 Dynamic unsupported，不阻塞 static 功能；malformed success 是 protocol error，不降级为 static `SET`，也不自动 login。Dynamic request 不刷新或修改 static auth session。
 
-Dynamic 文本在任何 HID write 前完成本地校验：非空、1–512 bytes、仅 printable US ASCII/LF/Tab/Backspace；显式 TTL 为 1–86400 秒，缺省使用设备默认 300 秒。目标 object 先按协议上限（0–7）预检，再按 `CAPABILITIES` 返回的 object count 校验，非法 index 不会产生任何 HID 写入。BEGIN payload 只允许 0/1/4/5，keep-after-execute 只有 capability lifecycle bit 6 支持时才显示/发送，Tauri 参数使用 `slot`、`keepAfterExecute`。上传失败或 timeout 从新 request ID 的 BEGIN 重新开始；clear 逐个 object 幂等重试，没有 wire clear-all。Dynamic 文本只存在当前内存编辑区，不写 localStorage、日志、诊断、错误、报告或诊断摘要。
+Dynamic 文本在任何 HID write 前完成本地校验：非空、不超过 `CAPABILITIES` 上报的 `max_dynamic_length`（capability 未加载时 UI 使用 512 bytes fallback）、仅 printable US ASCII/LF/Tab/Backspace；显式 TTL 必须落在 `CAPABILITIES` 上报的 min/max 内（fallback 1–86400 秒），缺省使用设备默认值（fallback 300 秒）。目标 object 先按协议上限（0–7）预检，再按 `CAPABILITIES` 返回的 object count 校验，非法 index 不会产生任何 HID 写入。BEGIN payload 只允许 0/1/4/5，keep-after-execute 只有 capability lifecycle bit 6 支持时才显示/发送，Tauri 参数使用 `slot`、`keepAfterExecute`。上传失败或 timeout 从新 request ID 的 BEGIN 重新开始；clear 逐个 object 幂等重试，没有 wire clear-all。Dynamic 文本只存在当前内存编辑区，不写 localStorage、日志、诊断、错误、报告或诊断摘要。
 
-当前 UI 仍只显式使用第一个 object（`slot = 0`）；capability-driven 多 object 选择器属于后续 UI 阶段，后端已按 slot 开放 `upload_dynamic`/`clear_dynamic` 参数。
+UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object 选择器（count = 1 时只显示只读对象行），upload/clear 使用当前选中 object 的 wire slot；每个 object 独立保存内存 draft、TTL、keep、状态、progress、error 和 clear 确认。
 
 状态文案区分 `Unknown`、`Unsupported`、`Uploading`、`Committed locally`、`Cleared locally` 和 `Error`；提交/清除仅表示本地收到 ACK，不是 readback 证明。断开、重连、重启或生命周期不确定后回到 Unknown，不自动 re-upload。capability flags 摘要、byte count、TTL、keep 开关和进度均为本地 UI 信息，不能推断设备当前仍保存动态文本。
 
@@ -170,6 +170,7 @@ Runtime Macro protocol v2 / hidapi
 自动验证至少包括：
 
 - `npm run build`；
+- `npm test`（前端 dynamic object 状态模型，Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
 - `cargo fmt --check`、`cargo test`、`cargo clippy --all-targets -- -D warnings`；
 - `npm run tauri build -- --no-bundle`；
 - `git diff --check` 和隐私/secret scan。

@@ -196,9 +196,12 @@ export type MessageTable = {
   dynamicMacroHelp: string;
   dynamicUnencryptedTitle: string;
   dynamicUnencryptedHelp: string;
+  dynamicObject: string;
+  dynamicObjectLabel: (slot: number) => string;
+  dynamicObjectHelp: string;
   dynamicMacroText: string;
   dynamicMacroPlaceholder: string;
-  dynamicMacroTextHelp: string;
+  dynamicMacroTextHelp: (maximum: number) => string;
   dynamicBytes: (count: number, maximum: number) => string;
   dynamicCapabilityStatus: string;
   dynamicCapabilityVersion: string;
@@ -237,8 +240,9 @@ export type MessageTable = {
   dynamicOperationError: string;
   dynamicTextRequired: string;
   dynamicUnsupportedText: string;
-  dynamicTextTooLong: string;
+  dynamicTextTooLong: (maximum: number) => string;
   dynamicTtlInvalid: string;
+  dynamicCapabilityError: string;
 };
 
 export type Messages = MessageTable;
@@ -431,12 +435,15 @@ const english: MessageTable = {
   unprotectedHelp: "no management password is set; macro management is available to other local HID clients.",
   dynamicMacro: "Dynamic Macro",
   dynamicMacroTitle: "Temporary macro",
-  dynamicMacroHelp: "One RAM-only object with no readback. Upload only non-secret text; it is independent of static macro slots.",
+  dynamicMacroHelp: "RAM-only objects with no readback. Upload only non-secret text; they are independent of static macro slots.",
   dynamicUnencryptedTitle: "HID is unencrypted.",
   dynamicUnencryptedHelp: "Do not upload passwords, tokens, or other secrets. Dynamic Macro is available even while static management is locked.",
+  dynamicObject: "Dynamic object",
+  dynamicObjectLabel: (slot) => `Object ${slot}`,
+  dynamicObjectHelp: "Upload and clear apply to the selected object only.",
   dynamicMacroText: "Dynamic text",
   dynamicMacroPlaceholder: "Type a temporary macro…",
-  dynamicMacroTextHelp: "Printable US ASCII, LF, Tab, and Backspace · maximum 512 bytes.",
+  dynamicMacroTextHelp: (maximum) => `Printable US ASCII, LF, Tab, and Backspace · maximum ${maximum} bytes.`,
   dynamicBytes: (count, maximum) => `${count} / ${maximum} bytes`,
   dynamicCapabilityStatus: "Capability",
   dynamicCapabilityVersion: "Version",
@@ -475,8 +482,9 @@ const english: MessageTable = {
   dynamicOperationError: "Dynamic Macro operation failed. The local state is unknown; do not assume the object is present.",
   dynamicTextRequired: "Enter non-empty dynamic text.",
   dynamicUnsupportedText: "Dynamic text supports printable US ASCII, LF, Tab, and Backspace only.",
-  dynamicTextTooLong: "Dynamic text cannot exceed 512 bytes.",
+  dynamicTextTooLong: (maximum) => `Dynamic text cannot exceed ${maximum} bytes.`,
   dynamicTtlInvalid: "The Dynamic Macro TTL is outside the supported range.",
+  dynamicCapabilityError: "Could not read the Dynamic Macro capability from this device. Reconnect and try again.",
 };
 
 const chinese: MessageTable = {
@@ -667,12 +675,15 @@ const chinese: MessageTable = {
   unprotectedHelp: "未设置管理密码；其他本机 HID 客户端也可以管理宏。",
   dynamicMacro: "动态宏",
   dynamicMacroTitle: "临时宏",
-  dynamicMacroHelp: "单个仅存于 RAM 且不可读回的对象。仅上传非敏感文本；它独立于静态宏列表。",
+  dynamicMacroHelp: "仅存于 RAM 且不可读回的对象。仅上传非敏感文本；它们独立于静态宏列表。",
   dynamicUnencryptedTitle: "HID 未加密。",
   dynamicUnencryptedHelp: "不要上传密码、令牌或其他秘密。静态管理锁定时仍可使用动态宏。",
+  dynamicObject: "动态对象",
+  dynamicObjectLabel: (slot) => `对象 ${slot}`,
+  dynamicObjectHelp: "上传和清空只作用于所选对象。",
   dynamicMacroText: "动态文本",
   dynamicMacroPlaceholder: "输入临时宏…",
-  dynamicMacroTextHelp: "可打印 US ASCII、LF、Tab 和 Backspace · 最多 512 bytes。",
+  dynamicMacroTextHelp: (maximum) => `可打印 US ASCII、LF、Tab 和 Backspace · 最多 ${maximum} bytes。`,
   dynamicBytes: (count, maximum) => `${count} / ${maximum} bytes`,
   dynamicCapabilityStatus: "能力",
   dynamicCapabilityVersion: "版本",
@@ -711,8 +722,9 @@ const chinese: MessageTable = {
   dynamicOperationError: "动态宏操作失败。本地状态未知，不要假设对象仍存在。",
   dynamicTextRequired: "请输入非空动态文本。",
   dynamicUnsupportedText: "动态文本仅支持可打印 US ASCII、LF、Tab 和 Backspace。",
-  dynamicTextTooLong: "动态文本不能超过 512 bytes。",
+  dynamicTextTooLong: (maximum) => `动态文本不能超过 ${maximum} bytes。`,
   dynamicTtlInvalid: "Dynamic Macro TTL 超出支持范围。",
+  dynamicCapabilityError: "无法从该设备读取动态宏能力信息。请重新连接后重试。",
 };
 
 const MESSAGE_TABLE: Record<Locale, MessageTable> = { en: english, "zh-CN": chinese };
