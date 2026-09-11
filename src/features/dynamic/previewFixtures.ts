@@ -3,8 +3,8 @@
  *
  * They exist so every state of the review matrix can be inspected without a
  * device: no HID, no Tauri command, no storage, no persistence. Fixture object
- * ids, counts and limits stand in for `CAPABILITIES` values and are never
- * interpreted as a wire contract by the UI.
+ * ids, wire slots, counts and limits stand in for `CAPABILITIES` values and are
+ * never interpreted as a wire contract by the UI.
  */
 
 import type {
@@ -49,6 +49,7 @@ function defaultLifecycle(overrides: Partial<DynamicLifecyclePresentation> = {})
 function objectPresentation(index: number, overrides: Partial<DynamicObjectPresentation> = {}): DynamicObjectPresentation {
   return {
     objectId: `object-${index + 1}`,
+    wireSlot: index,
     displayLabel: "",
     maxLength: DEVICE_MAX_LENGTH,
     ttl: { ...DEVICE_TTL },

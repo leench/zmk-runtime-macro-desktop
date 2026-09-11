@@ -90,7 +90,7 @@ TTL 倒计时如果展示，必须标记为估计值，不能表示可靠的设�
 - dynamic 文本仅允许 printable ASCII、LF、Tab 和 Backspace；
 - Dynamic 默认执行后消费，可选 `keep-after-execute`；
 - Dynamic 没有 readback，只能报告本地观察状态；
-- Dynamic 状态层 `DynamicService`（capability、upload、clear 的本地观察状态、generation、唯一 DTO 和 `get_dynamic_state` command）已落地并在本阶段迁移完成；UI Workspace、Scenario store、托盘真实状态和 HTTP API 仍未接入。
+- Dynamic 状态层 `DynamicService`（capability、upload、clear 的本地观察状态、generation、唯一 DTO 和 `get_dynamic_state` command）已落地并在本阶段迁移完成；连接后的 Workbench Dynamic Workspace 和 Scenario store 已接入，DeviceSelect 入口仍保持纯 Preview；托盘真实状态和 HTTP API 仍未接入。
 
 相关现有实现主要位于：
 
@@ -448,9 +448,9 @@ src-tauri/src/
 - 不新增第二个 HID writer、线程或队列：所有 command 仍通过 `Arc<Mutex<AppState>>` + 单一 HID worker 串行访问同一个 `MacroSession`，因此没有也不假装实现并行 writer；
 - connect/disconnect/设备替换/应用退出（`AppState` drop）后状态回到 `Unknown`；transport/protocol 失败会丢弃 session，因此同样回到 `Unknown`，Remote status 保留 session 并进入 `unsupported` 或 `error`；
 - `get_dynamic_capabilities` / `upload_dynamic` / `clear_dynamic` 与新的只读 command `get_dynamic_state` 共用这一状态层；Dynamic 仍绕过 static auth gate，不调用、不刷新也不自动登录 static auth，static slot/auth 状态机不变；
-- 新增 `get_dynamic_state` command 和 `bridge.ts` 类型 wrapper，但 page-level Dynamic Workspace 尚未接入真实 command；
-- Scenario store（阶段 4）已完成：见 §9；
-- 尚未接入：UI Workspace 真实数据（阶段 5）、托盘真实状态（阶段 7）、HTTP API（阶段 9）。
+- 新增 `get_dynamic_state` command 和 `bridge.ts` 类型 wrapper；连接后的 Workbench Dynamic Workspace 通过 App bridge 使用真实 capability、无正文 service state、upload/clear 和 Scenario store，DeviceSelect 入口继续使用 in-memory Preview；
+- Scenario store（阶段 4）已完成并由 connected Workbench 调用：见 §9；
+- 尚未接入：托盘真实状态（阶段 7）、HTTP API（阶段 9）；连接后的自动 capability discovery 仍未实现。
 
 ### 8.2 Scenario store（阶段 4，已实现）
 
@@ -619,7 +619,7 @@ UI 视觉验收通过后：
 
 **已完成（状态层）：** `DynamicService` 已接入 `AppState`，capability/upload/clear 在开始时进入 `Discovering`/`Uploading`/`Clearing`，成功只记录本次本地观察（`CommittedLocally`/`ClearedLocally`，以及 slot、byte length、TTL/keep），失败按 Remote status 进入 `Unsupported`/`Error` 并保留 session，transport/protocol 失败丢弃 session 并回到 `Unknown`；connect/disconnect/设备替换/`AppState` drop 后 reset 为 `Unknown`；generation 为本地 last-write-wins，过期完成被丢弃，新操作清除被取代操作遗留的 in-flight 状态；仍然只使用既有单一 HID worker 和 `MacroSession`，没有第二个 writer/线程/queue；static/auth command boundary 未改变（Dynamic 仍绕过 static auth gate）。backend 不保存 draft，也不保存任何 dynamic 正文。
 
-**仍未实现：** 连接后的自动 capability discovery（目前仍是显式 command）、pending 淘汰所需的待发送队列（目前只有 UI 的同步 command 调用方）、UI Workspace 的真实接入（阶段 5）和 source metadata。
+**仍未实现：** 连接后的自动 capability discovery（目前仍是显式 command）、pending 淘汰所需的待发送队列（目前只有 UI 的同步 command 调用方）、source metadata 和 device alias。
 
 ### 阶段 4：Scenario 原子持久化
 
@@ -632,7 +632,7 @@ UI 视觉验收通过后：
 
 **已完成（阶段 4）：** `src-tauri/src/scenario_store.rs`（`SCENARIO_SCHEMA_VERSION = 1`、`scenarios.json`、`PersistedScenario`/`ScenarioDocument`）、`load_scenarios` / `save_scenarios` 两个 async command（`spawn_blocking`，不经过 HID worker）、`bridge.ts` 的 `PersistedScenario` / `ScenarioStore` / `SCENARIO_STORE_SCHEMA_VERSION` / `loadScenarios()` / `saveScenarios()`。持久化模型与 UI-only 的 `src/types/scenario.ts` 明确分离：`draft`/`saved`/`isNew` 和 React key 不落盘，`targetDevice`/`targetObject` 为 nullable opaque string，绝不写入 HID path、serial 或 in-process candidate id。校验/原子写/损坏错误行为见 §8.2。
 
-**仍未实现：** UI 接入真实 store（`src/features/dynamic/` 仍只用 in-memory preview fixture，刷新即丢失）、托盘选择/上传 Scenario（阶段 7）、HTTP API（阶段 9），仍不支持 secret。
+**仍未实现：** 托盘选择/上传 Scenario（阶段 7）、HTTP API（阶段 9），仍不支持 secret；DeviceSelect 的 Preview 路径仍不持久化。
 
 ### 阶段 5：UI 接入真实 DynamicService/HID
 
@@ -642,6 +642,8 @@ UI 视觉验收通过后：
 - 保留 static locked 但 Dynamic 可用的边界；
 - 真实 ACK 只更新本地观察状态，不添加 readback；
 - 完成硬件前的 fake-HID regression tests。
+
+**已完成（阶段 5）：** connected Workbench 的 Dynamic Workspace 已通过 `DynamicWorkspaceBackend` 接入真实 capability、无正文 `get_dynamic_state`、upload/clear 和 Scenario store；保存、删除、Save & Upload 使用串行持久化，保存失败保留 dirty draft，`objectId` 与 `wireSlot` 通过显式 capability 映射校验。DeviceSelect 入口仍是纯 in-memory Preview，旧 Dynamic modal 保留为 fallback；未接入托盘真实状态、HTTP、自动 discovery 或 device alias。
 
 ### 阶段 6：Device alias
 

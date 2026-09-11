@@ -11,12 +11,16 @@ import {
   disconnectDevice as disconnectDeviceCommand,
   getConnection,
   getDynamicCapabilities,
+  getDynamicState,
   getSettings,
   getSlot,
   listDevices,
+  loadScenarios as loadScenarioStoreCommand,
   refreshAuthState as refreshAuthStateCommand,
   listSlots,
   lockDevice,
+  saveScenarios as saveScenarioStoreCommand,
+  SCENARIO_STORE_SCHEMA_VERSION,
   setPassword as setPasswordCommand,
   setSettings as setSettingsCommand,
   setSlot as setSlotCommand,
@@ -29,6 +33,8 @@ import {
   type ConnectionState,
   type DeviceCandidate,
   type DynamicCapabilities,
+  type DynamicServiceState,
+  type ScenarioStore,
   type SlotBytes,
   type SlotMetadata,
 } from "./bridge";
@@ -51,6 +57,7 @@ import { Unlock } from "./pages/Unlock";
 import { PasswordSetupModal } from "./components/PasswordSetupModal";
 import { DynamicMacroModal } from "./components/DynamicMacroModal";
 import { DynamicWorkspace } from "./features/dynamic/DynamicWorkspace";
+import type { DynamicClearTarget, DynamicUploadTarget, DynamicWorkspaceBackend } from "./types/scenario";
 import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
 import { SelectField } from "./components/SelectField";
 import { TitleBar, type Platform } from "./components/TitleBar";
@@ -69,6 +76,7 @@ import {
   validateDynamicText,
   validateDynamicTtl,
 } from "./utils/dynamic";
+import { capabilityPresentationFromBackend, serviceDeviceState, targetMatchesCapability } from "./utils/scenario";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -363,6 +371,9 @@ function App() {
   const [authRemainingSeconds, setAuthRemainingSeconds] = useState<number | null>(null);
   const [dynamicCapabilities, setDynamicCapabilities] = useState<DynamicCapabilities | null>(null);
   const [dynamicCapabilityStatus, setDynamicCapabilityStatus] = useState<DynamicCapabilityStatus>("unknown");
+  // Body-free observation of the current session, read back from the service
+  // state layer. It never contains dynamic text and is never a device readback.
+  const [dynamicServiceState, setDynamicServiceState] = useState<DynamicServiceState | null>(null);
   // One in-memory state per dynamic object. The initial state is the default
   // target that every supported device reports as object 0; CAPABILITIES then
   // aligns the collection with the real object count.
@@ -483,6 +494,7 @@ function App() {
       setConnection(disconnected);
       setDynamicCapabilities(null);
       setDynamicCapabilityStatus("unknown");
+      setDynamicServiceState(null);
       setDynamicModalOpen(false);
       setDynamicWorkspaceOpen(false);
       setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
@@ -502,6 +514,22 @@ function App() {
     setDynamicCapabilityStatus(preserveUnknown ? "unknown" : "ready");
   }, []);
 
+  /**
+   * Read the body-free DynamicService state of the current session.
+   *
+   * The command performs no HID I/O and never returns dynamic text, so a failed
+   * read stays silent instead of surfacing as a device error.
+   */
+  const refreshDynamicServiceState = useCallback(async (): Promise<void> => {
+    if (!connectionRef.current.connected) return;
+    try {
+      const state = await enqueueProtocolOperation(() => getDynamicState());
+      if (mounted.current) setDynamicServiceState(state);
+    } catch {
+      // Reading the local service state must not surface as a device error.
+    }
+  }, [enqueueProtocolOperation]);
+
   const loadDynamicCapabilities = useCallback(async (sequence: number, preserveUnknown: boolean): Promise<boolean> => {
     if (!connectionRef.current.connected) return false;
     setDynamicObjects((previous) => previous.map(clearDynamicObjectFeedback));
@@ -511,6 +539,7 @@ function App() {
       const capabilities = await enqueueProtocolOperation(() => getDynamicCapabilities());
       if (!mounted.current || operation.current !== sequence || !connectionRef.current.connected) return false;
       applyDynamicCapabilities(capabilities, preserveUnknown);
+      void refreshDynamicServiceState();
       return true;
     } catch (caught) {
       if (!mounted.current || operation.current !== sequence) return false;
@@ -518,9 +547,10 @@ function App() {
       setDynamicCapabilities(null);
       setDynamicCapabilityStatus(error.code === "dynamic_unsupported" ? "unsupported" : "error");
       if (dropsConnection(error.code)) applyErrorState(error);
+      void refreshDynamicServiceState();
       return false;
     }
-  }, [applyDynamicCapabilities, applyErrorState, enqueueProtocolOperation, recordOperation]);
+  }, [applyDynamicCapabilities, applyErrorState, enqueueProtocolOperation, recordOperation, refreshDynamicServiceState]);
 
   const mergeSlotMetadata = useCallback((metadata: SlotMetadata[], nextLabels: Record<number, string>, preserveDirty: boolean): SlotState[] => {
     const nextSlots = metadata.map((item) => makeSlotState(item, nextLabels, slotsRef.current.find((slot) => slot.slot === item.slot), preserveDirty));
@@ -705,6 +735,7 @@ function App() {
     setPasswordModalMode(null);
     setDynamicCapabilities(null);
     setDynamicCapabilityStatus("unknown");
+    setDynamicServiceState(null);
     setDynamicModalOpen(false);
     setDynamicWorkspaceOpen(false);
     setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
@@ -744,6 +775,7 @@ function App() {
       if (mounted.current && operation.current === sequence) {
         const error = commandError(caught);
         setConnection(disconnected);
+        setDynamicServiceState(null);
         hideRevealed();
         autoReconnectEnabledRef.current = automaticReconnect && error.code !== "bad_version";
         if (error.code === "bad_version") setErrorCode("bad_version");
@@ -783,6 +815,7 @@ function App() {
       clearAuthDeadline();
       setDynamicCapabilities(null);
       setDynamicCapabilityStatus("unknown");
+      setDynamicServiceState(null);
       setDynamicModalOpen(false);
       setDynamicWorkspaceOpen(false);
       setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
@@ -818,6 +851,7 @@ function App() {
           setConnection(disconnected);
           setDynamicCapabilities(null);
           setDynamicCapabilityStatus("unknown");
+          setDynamicServiceState(null);
           setDynamicModalOpen(false);
           setDynamicWorkspaceOpen(false);
           setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
@@ -1200,6 +1234,10 @@ function App() {
       if (!mounted.current || operation.current !== sequence) return null;
       markAuthenticatedActivity(false);
       updateDynamicObject(slot, (state) => ({ ...state, status: "committed", progress: null }));
+      // The legacy dialog and the page-level workspace read the same body-free
+      // service state, so a confirmed upload is visible to both. Dynamic text
+      // never enters that state.
+      await refreshDynamicServiceState();
       return null;
     } catch (caught) {
       if (!mounted.current || operation.current !== sequence) return null;
@@ -1210,11 +1248,12 @@ function App() {
         if (error.code === "dynamic_unsupported") setDynamicCapabilityStatus("unsupported");
         updateDynamicObject(slot, (state) => ({ ...state, error, status: "error", progress: null }));
       }
+      await refreshDynamicServiceState();
       return error;
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, dynamicCapabilities, dynamicObjects, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, selectedDynamicSlot, updateDynamicObject]);
+  }, [applyErrorState, dynamicCapabilities, dynamicObjects, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, refreshDynamicServiceState, selectedDynamicSlot, updateDynamicObject]);
 
   const clearDynamic = useCallback(async (): Promise<CommandError | null> => {
     const slot = selectedDynamicSlot;
@@ -1233,6 +1272,8 @@ function App() {
       await enqueueProtocolOperation(() => clearDynamicCommand(slot));
       if (!mounted.current || operation.current !== sequence) return null;
       updateDynamicObject(slot, (state) => ({ ...state, status: "cleared", progress: null }));
+      // Same shared observation state as the upload path above.
+      await refreshDynamicServiceState();
       return null;
     } catch (caught) {
       if (!mounted.current || operation.current !== sequence) return null;
@@ -1243,11 +1284,125 @@ function App() {
         if (error.code === "dynamic_unsupported") setDynamicCapabilityStatus("unsupported");
         updateDynamicObject(slot, (state) => ({ ...state, error, status: "error", progress: null }));
       }
+      await refreshDynamicServiceState();
       return error;
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [applyErrorState, dynamicCapabilities, dynamicObjects, enqueueProtocolOperation, recordOperation, selectedDynamicSlot, updateDynamicObject]);
+  }, [applyErrorState, dynamicCapabilities, dynamicObjects, enqueueProtocolOperation, recordOperation, refreshDynamicServiceState, selectedDynamicSlot, updateDynamicObject]);
+
+  // Stable identities: the workspace loads the persisted store once per mount.
+  const loadScenarioStore = useCallback(() => loadScenarioStoreCommand(), []);
+  const saveScenarioStore = useCallback((store: ScenarioStore) => saveScenarioStoreCommand(store), []);
+
+  /**
+   * Upload one scenario through the same DynamicService the legacy dialog uses.
+   *
+   * The object is addressed by the wire slot that came with the capability
+   * mapping; the dynamic text only travels inside this call and is never kept in
+   * state, logs or diagnostics. The observed result is read back afterwards.
+   */
+  const uploadScenarioDynamic = useCallback(async (target: DynamicUploadTarget): Promise<CommandError | null> => {
+    const capabilities = dynamicCapabilities;
+    if (!connectionRef.current.connected) return { code: "not_connected", message: "" } satisfies CommandError;
+    if (capabilities === null) return { code: "dynamic_unsupported", message: "" } satisfies CommandError;
+    // The target must resolve to exactly the object the current capability
+    // reports: the slot has to exist, and the object id has to map onto that
+    // same slot. Nothing is parsed out of the id, so a mismatched pair is
+    // rejected here instead of being sent to a guessed slot.
+    if (!dynamicObjectSlots(capabilities).includes(target.wireSlot)
+      || !targetMatchesCapability(capabilities, target.objectId, target.wireSlot)) {
+      return { code: "invalid_slot", message: "" } satisfies CommandError;
+    }
+    const limits = dynamicLimits(capabilities);
+    const textError = validateDynamicText(target.text, limits.maxBytes);
+    const ttlError = validateDynamicTtl(target.ttlSeconds, limits);
+    if (textError || ttlError) {
+      return { code: textError === "empty" ? "dynamic_empty" : textError === "tooLong" ? "length_exceeded" : textError === "ttlInvalid" ? "dynamic_ttl_invalid" : "invalid_text", message: "" } satisfies CommandError;
+    }
+    if (target.keepAfterExecute && !capabilities.supportsKeepAfterExecute) {
+      return { code: "dynamic_keep_unsupported", message: "" } satisfies CommandError;
+    }
+    const sequence = ++operation.current;
+    setBusy(true);
+    setErrorCode(null);
+    recordOperation("DYNAMIC_UPLOAD");
+    try {
+      await enqueueProtocolOperation(() => uploadDynamicCommand(target.wireSlot, target.text, target.ttlSeconds, target.keepAfterExecute));
+      if (!mounted.current || operation.current !== sequence) return null;
+      markAuthenticatedActivity(false);
+      await refreshDynamicServiceState();
+      return null;
+    } catch (caught) {
+      if (!mounted.current || operation.current !== sequence) return null;
+      const error = asCommandError(caught);
+      if (dropsConnection(error.code)) applyErrorState(error);
+      else if (error.code === "dynamic_unsupported") setDynamicCapabilityStatus("unsupported");
+      await refreshDynamicServiceState();
+      return error;
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, dynamicCapabilities, enqueueProtocolOperation, markAuthenticatedActivity, recordOperation, refreshDynamicServiceState]);
+
+  /** Clear one scenario's target object through the same service. */
+  const clearScenarioDynamic = useCallback(async (target: DynamicClearTarget): Promise<CommandError | null> => {
+    const capabilities = dynamicCapabilities;
+    if (!connectionRef.current.connected) return { code: "not_connected", message: "" } satisfies CommandError;
+    if (capabilities === null) return { code: "dynamic_unsupported", message: "" } satisfies CommandError;
+    // Same rule as the scenario upload: the id and the slot must describe the
+    // same reported object before any device call is made.
+    if (!dynamicObjectSlots(capabilities).includes(target.wireSlot)
+      || !targetMatchesCapability(capabilities, target.objectId, target.wireSlot)) {
+      return { code: "invalid_slot", message: "" } satisfies CommandError;
+    }
+    const sequence = ++operation.current;
+    setBusy(true);
+    setErrorCode(null);
+    recordOperation("DYNAMIC_CLEAR");
+    try {
+      await enqueueProtocolOperation(() => clearDynamicCommand(target.wireSlot));
+      if (!mounted.current || operation.current !== sequence) return null;
+      await refreshDynamicServiceState();
+      return null;
+    } catch (caught) {
+      if (!mounted.current || operation.current !== sequence) return null;
+      const error = asCommandError(caught);
+      if (dropsConnection(error.code)) applyErrorState(error);
+      else if (error.code === "dynamic_unsupported") setDynamicCapabilityStatus("unsupported");
+      await refreshDynamicServiceState();
+      return error;
+    } finally {
+      if (mounted.current && operation.current === sequence) setBusy(false);
+    }
+  }, [applyErrorState, dynamicCapabilities, enqueueProtocolOperation, recordOperation, refreshDynamicServiceState]);
+
+  const formatCommandError = useCallback((error: CommandError) => translateCommandError(error.code, locale), [locale]);
+
+  const dynamicWorkspaceBackend = useMemo<DynamicWorkspaceBackend>(() => ({
+    schemaVersion: SCENARIO_STORE_SCHEMA_VERSION,
+    deviceName: connection.device?.productName || copy.unnamedDevice,
+    device: serviceDeviceState(connection.connected, dynamicCapabilityStatus),
+    staticLocked: connection.authState === "locked",
+    capability: capabilityPresentationFromBackend(dynamicCapabilities),
+    serviceState: dynamicServiceState,
+    loadScenarios: loadScenarioStore,
+    saveScenarios: saveScenarioStore,
+    upload: uploadScenarioDynamic,
+    clear: clearScenarioDynamic,
+  }), [
+    clearScenarioDynamic,
+    connection.authState,
+    connection.connected,
+    connection.device,
+    copy.unnamedDevice,
+    dynamicCapabilityStatus,
+    dynamicCapabilities,
+    dynamicServiceState,
+    loadScenarioStore,
+    saveScenarioStore,
+    uploadScenarioDynamic,
+  ]);
 
   const dynamicObjectSlotsForPanel = dynamicObjects.map((state) => state.slot);
   const selectedDynamicObject = dynamicObjects.find((state) => state.slot === selectedDynamicSlot) ?? dynamicObjects[0];
@@ -1622,6 +1777,8 @@ function App() {
               copy={copy}
               onClose={() => setDynamicWorkspaceOpen(false)}
               onOpenLegacyDialog={() => setDynamicModalOpen(true)}
+              backend={dynamicWorkspaceBackend}
+              formatError={formatCommandError}
             />
           }
           onSelectSlot={selectSlot}

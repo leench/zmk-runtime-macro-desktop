@@ -14,6 +14,7 @@ import {
   isScenarioDirty,
   objectDisplayLabel,
   objectLimits,
+  objectWireSlot,
   saveScenario,
   scenarioByteLength,
   scenariosMatch,
@@ -49,7 +50,7 @@ function blockersFor(state: PreviewStateId, observation?: DynamicObservation) {
 
 test("scenario drafts stay dirty until they are saved locally", () => {
   const empty = createScenario("scenario-1");
-  assert.deepEqual(empty.draft, { name: "", text: "", ttlSeconds: null, keepAfterExecute: false, targetObjectId: null });
+  assert.deepEqual(empty.draft, { name: "", text: "", ttlSeconds: null, keepAfterExecute: false, targetObjectId: null, targetDeviceId: null });
   assert.equal(empty.isNew, false);
   assert.equal(isScenarioDirty(empty), false);
   assert.equal(hasScenarioContent(empty), false);
@@ -157,6 +158,18 @@ test("a single-object device stays blocked until the user rebinds the missing ta
 
 test("capability limits and labels come from the reported object", () => {
   const capability = capabilitiesFor("ready");
+  // Every fixture object carries the wire slot it must be addressed with, and
+  // the slot is never derived back out of the opaque id.
+  for (const [index, object] of capability.objects.entries()) {
+    assert.equal(object.wireSlot, index, "fixture wire slots follow the reported order");
+    assert.equal(objectWireSlot(capability, object.objectId), index);
+  }
+  // An id from another namespace is not reinterpreted as a slot.
+  assert.equal(objectWireSlot(capability, "dynamic-object-0"), null);
+  assert.equal(objectWireSlot(capability, "object-99"), null);
+  assert.equal(objectWireSlot(null, capability.objects[0].objectId), null);
+  assert.equal(objectWireSlot(capability, null), null);
+
   const object = findTargetObject(capability, "object-1");
   assert.ok(object);
   assert.deepEqual(objectLimits(object), { maxBytes: 512, minTtlSeconds: 1, maxTtlSeconds: 86_400, defaultTtlSeconds: 300 });

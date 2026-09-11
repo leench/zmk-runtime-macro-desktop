@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ShieldAlert, X } from "lucide-react";
+import { AlertCircle, ShieldAlert, X } from "lucide-react";
+import { asCommandError, type CommandError, type ScenarioStore } from "../../bridge";
 import type { Messages } from "../../i18n";
 import type {
   DynamicObservation,
+  DynamicWorkspaceBackend,
   PreviewFixture,
   PreviewScenarioLabels,
   PreviewStateId,
@@ -10,14 +12,22 @@ import type {
   ScenarioFields,
 } from "../../types/scenario";
 import {
+  type ScenarioIssue,
   clearBlockers,
   createScenario,
+  createSerialRunner,
   editScenario,
   hasScenarioContent,
   isScenarioDirty,
+  newScenarioId,
   objectDisplayLabel,
+  observationFromServiceState,
+  planScenarioSave,
   saveScenario,
+  scenariosFromStore,
   scenariosMatch,
+  storeBlockers,
+  storeFromScenarios,
   uploadBlockers,
 } from "../../utils/scenario";
 import { DynamicPreviewControls } from "./DynamicPreviewControls";
@@ -36,13 +46,25 @@ type DynamicWorkspaceProps = {
    * opened without a connected device.
    */
   onOpenLegacyDialog?: () => void;
+  /**
+   * Real DynamicService and scenario store of a connected device. Without it the
+   * workspace stays the device-free preview surface: every value comes from an
+   * in-memory fixture and nothing is persisted.
+   */
+  backend?: DynamicWorkspaceBackend;
+  /** Localizes a sanitized backend error for the failure banners. */
+  formatError?: (error: CommandError) => string;
 };
 
 type DialogState =
   | { kind: "discard"; next: { type: "select"; id: string } | { type: "new" } }
   | { kind: "delete"; id: string }
   | { kind: "upload" }
-  | { kind: "clear" };
+  | { kind: "clear" }
+  | { kind: "close" };
+
+type StoreStatus = "loading" | "ready" | "error";
+type StoreFailure = { kind: "load" | "save"; error: CommandError };
 
 function selectedIdFor(fixture: PreviewFixture): string | null {
   return fixture.selectedIndex === null ? null : fixture.scenarios[fixture.selectedIndex]?.id ?? null;
@@ -52,11 +74,19 @@ function selectedIdFor(fixture: PreviewFixture): string | null {
  * Page-level Dynamic workspace: scenarios are the primary object on the left,
  * the selected scenario's target is a device dynamic object on the right.
  *
- * UI-only stage: every value comes from an in-memory preview fixture. There is
- * no HID access, no Tauri dynamic command, no storage write and no scenario
- * persistence; the text lives in React memory for this session only.
+ * Two modes share one surface. Without a `backend` this is the UI-only preview:
+ * every value comes from an in-memory fixture and there is no HID access, no
+ * Tauri command, no storage write and no scenario persistence. With a `backend`
+ * the App supplies the mapped capability, the body-free service state and bridge
+ * callbacks, so scenarios are loaded from and written to the local store and
+ * upload/clear go through the one DynamicService the rest of the app uses. The
+ * component itself never opens HID and never stores dynamic text anywhere except
+ * the persisted scenario document the user asked to save.
  */
-export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicWorkspaceProps) {
+export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, formatError }: DynamicWorkspaceProps) {
+  const previewMode = backend === undefined;
+  const format = formatError ?? ((error: CommandError) => error.message);
+
   const scenarioLabels = useMemo<PreviewScenarioLabels>(() => ({
     workTerminal: copy.dynamicSampleScenarioWork,
     buildWatch: copy.dynamicSampleScenarioBuild,
@@ -66,33 +96,79 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
   const [previewState, setPreviewState] = useState<PreviewStateId>("ready");
   const fixture = useMemo(() => buildPreviewFixture(previewState, scenarioLabels), [previewState, scenarioLabels]);
 
-  const [scenarios, setScenarios] = useState<Scenario[]>(() => fixture.scenarios);
-  const [selectedId, setSelectedId] = useState<string | null>(() => selectedIdFor(fixture));
-  const [observation, setObservation] = useState<DynamicObservation>(fixture.observation);
+  const [scenarios, setScenarios] = useState<Scenario[]>(() => (previewMode ? fixture.scenarios : []));
+  const [selectedId, setSelectedId] = useState<string | null>(() => (previewMode ? selectedIdFor(fixture) : null));
+  const [previewObservation, setPreviewObservation] = useState<DynamicObservation>(fixture.observation);
   const [dialog, setDialog] = useState<DialogState | null>(null);
+  const [storeStatus, setStoreStatus] = useState<StoreStatus>(previewMode ? "ready" : "loading");
+  const [storeFailure, setStoreFailure] = useState<StoreFailure | null>(null);
+  const [operation, setOperation] = useState<"upload" | "clear" | null>(null);
+  const [storePending, setStorePending] = useState(false);
+  /** Newest sanitized device failure, kept with the target it belongs to. */
+  const [deviceError, setDeviceError] = useState<{ objectId: string; error: CommandError } | null>(null);
 
   const scenariosRef = useRef(scenarios);
   const appliedFixtureRef = useRef(fixture);
   const appliedStateRef = useRef(previewState);
-  const sequenceRef = useRef(0);
+  const mountedRef = useRef(true);
+  const serialRef = useRef<ReturnType<typeof createSerialRunner> | null>(null);
+  if (serialRef.current === null) serialRef.current = createSerialRunner();
   scenariosRef.current = scenarios;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const applyFixture = useCallback((next: PreviewFixture) => {
     appliedFixtureRef.current = next;
     setScenarios(next.scenarios);
     setSelectedId(selectedIdFor(next));
-    setObservation(next.observation);
+    setPreviewObservation(next.observation);
   }, []);
 
   useEffect(() => {
+    if (!previewMode) return;
     const stateChanged = appliedStateRef.current !== previewState;
     const untouched = scenariosMatch(scenariosRef.current, appliedFixtureRef.current.scenarios);
     appliedStateRef.current = previewState;
     if (stateChanged || (untouched && appliedFixtureRef.current !== fixture)) applyFixture(fixture);
-  }, [applyFixture, fixture, previewState]);
+  }, [applyFixture, fixture, previewMode, previewState]);
+
+  // The loader identity is stable in the App, so this runs once per mount and
+  // never reloads over in-memory edits. A missing file resolves to an empty
+  // store; a failure is reported and never fabricated into an empty one.
+  const loadStore = backend?.loadScenarios ?? null;
+  useEffect(() => {
+    if (!loadStore) return undefined;
+    let active = true;
+    setStoreStatus("loading");
+    void loadStore()
+      .then((store) => {
+        if (!active || !mountedRef.current) return;
+        const loaded = scenariosFromStore(store);
+        setScenarios(loaded);
+        setSelectedId(loaded[0]?.id ?? null);
+        setStoreStatus("ready");
+        setStoreFailure(null);
+      })
+      .catch((caught: unknown) => {
+        if (!active || !mountedRef.current) return;
+        setScenarios([]);
+        setSelectedId(null);
+        setStoreStatus("error");
+        setStoreFailure({ kind: "load", error: asCommandError(caught) });
+      });
+    return () => { active = false; };
+  }, [loadStore]);
+
+  const device = backend ? backend.device : fixture.device;
+  const staticLocked = backend ? backend.staticLocked : fixture.staticLocked;
+  const notice = backend ? null : fixture.notice;
+  const capability = backend ? backend.capability : fixture.capability;
+  const deviceName = backend ? backend.deviceName : copy.dynamicPreviewDeviceName;
 
   const selectedScenario = scenarios.find((scenario) => scenario.id === selectedId) ?? null;
-  const capability = fixture.capability;
   const targetObjectId = selectedScenario?.draft.targetObjectId ?? null;
   const targetIndex = capability && targetObjectId
     ? capability.objects.findIndex((object) => object.objectId === targetObjectId)
@@ -101,8 +177,40 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
   const targetLabel = targetObject
     ? objectDisplayLabel(targetObject, targetIndex, (index) => copy.dynamicObjectLabel(index))
     : copy.dynamicScenarioNoTarget;
-  const uploadReasons = uploadBlockers({ device: fixture.device, capability, scenario: selectedScenario, observation });
-  const clearReasons = clearBlockers({ device: fixture.device, capability, scenario: selectedScenario, observation });
+
+  // A running operation reports its own pending observation immediately; the
+  // settled result always comes from the backend service state afterwards.
+  const observation: DynamicObservation = backend
+    ? operation !== null
+      ? { status: operation === "upload" ? "uploading" : "clearing", targetObjectId: targetObject?.objectId ?? null, errorKind: null }
+      : observationFromServiceState(
+        backend.serviceState,
+        targetObject ? { objectId: targetObject.objectId, wireSlot: targetObject.wireSlot } : null,
+      )
+    : previewObservation;
+
+  // A failure of the current target is reported even before the service state
+  // was re-read; an error of another target is never borrowed.
+  const activeDeviceError = deviceError && targetObject?.objectId === deviceError.objectId ? deviceError.error : null;
+
+  const errorDetail = activeDeviceError
+    ? format(activeDeviceError)
+    : backend && observation.status === "error" && backend.serviceState?.error
+      ? format(backend.serviceState.error)
+      : null;
+
+  const busyIssues: ScenarioIssue[] = operation !== null || storePending ? ["operationInProgress"] : [];
+  const storeIssues: ScenarioIssue[] = backend && selectedScenario ? storeBlockers(selectedScenario.draft) : [];
+  const uploadReasons: ScenarioIssue[] = [
+    ...busyIssues,
+    ...storeIssues,
+    ...uploadBlockers({ device, capability, scenario: selectedScenario, observation }),
+  ];
+  const clearReasons: ScenarioIssue[] = [
+    ...busyIssues,
+    ...clearBlockers({ device, capability, scenario: selectedScenario, observation }),
+  ];
+  const saveReasons: ScenarioIssue[] = [...busyIssues, ...storeIssues];
 
   const updateSelected = (patch: Partial<ScenarioFields>) => {
     if (!selectedId) return;
@@ -110,8 +218,7 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
   };
 
   const addScenario = () => {
-    sequenceRef.current += 1;
-    const next = createScenario(`preview-scenario-${sequenceRef.current}`, {}, { isNew: true });
+    const next = createScenario(newScenarioId(scenariosRef.current.map((scenario) => scenario.id)), {}, { isNew: true });
     setScenarios((previous) => [...previous, next]);
     setSelectedId(next.id);
   };
@@ -145,35 +252,140 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
     if (selectedScenario) setDialog({ kind: "delete", id: selectedScenario.id });
   };
 
+  const requestClose = () => {
+    // A dirty draft is never dropped silently: the same confirmation style as a
+    // scenario switch protects closing the workspace.
+    if (scenarios.some((scenario) => isScenarioDirty(scenario) && hasScenarioContent(scenario))) {
+      setDialog({ kind: "close" });
+      return;
+    }
+    onClose();
+  };
+
+  /** Write one store document, serialized after every earlier write. */
+  const persistStore = useCallback(async (store: ScenarioStore): Promise<boolean> => {
+    if (!backend) return true;
+    const serial = serialRef.current ?? createSerialRunner();
+    serialRef.current = serial;
+    setStorePending(true);
+    try {
+      await serial(() => backend.saveScenarios(store));
+      if (mountedRef.current) setStoreFailure(null);
+      return true;
+    } catch (caught) {
+      // A failed write must never look persisted: the caller keeps its dirty
+      // draft and reports the sanitized store error.
+      if (mountedRef.current) setStoreFailure({ kind: "save", error: asCommandError(caught) });
+      return false;
+    } finally {
+      if (mountedRef.current) setStorePending(false);
+    }
+  }, [backend]);
+
+  /**
+   * Save the selected scenario locally. Returns the committed scenario only when
+   * the store write succeeded, so Save & upload can refuse to upload a scenario
+   * that is not on disk.
+   */
+  const commitSelectedSave = async (): Promise<Scenario | null> => {
+    const scenario = selectedScenario;
+    if (!scenario) return null;
+    if (!backend) {
+      const committed = saveScenario(scenario);
+      setScenarios((previous) => previous.map((item) => item.id === committed.id ? committed : item));
+      return committed;
+    }
+    const plan = planScenarioSave(scenariosRef.current, scenario.id, backend.schemaVersion);
+    if (!plan) return null;
+    if (!await persistStore(plan.store)) return null;
+    if (mountedRef.current) setScenarios(plan.scenarios);
+    return plan.committed;
+  };
+
+  const deleteScenario = async (id: string) => {
+    const index = scenariosRef.current.findIndex((scenario) => scenario.id === id);
+    if (index < 0) return;
+    const remaining = scenariosRef.current.filter((scenario) => scenario.id !== id);
+    if (backend && !await persistStore(storeFromScenarios(remaining, backend.schemaVersion, null))) return;
+    if (!mountedRef.current) return;
+    setScenarios(remaining);
+    if (selectedId === id) setSelectedId(remaining[Math.min(index, remaining.length - 1)]?.id ?? null);
+  };
+
+  const uploadSelected = async () => {
+    const target = targetObject;
+    if (!backend || !target) return;
+    setDeviceError(null);
+    // The scenario is persisted first; only then does the device see the upload.
+    const committed = await commitSelectedSave();
+    if (!committed) return;
+    setOperation("upload");
+    try {
+      const error = await backend.upload({
+        objectId: target.objectId,
+        wireSlot: target.wireSlot,
+        text: committed.draft.text,
+        ttlSeconds: committed.draft.ttlSeconds,
+        keepAfterExecute: committed.draft.keepAfterExecute,
+      });
+      if (mountedRef.current) setDeviceError(error ? { objectId: target.objectId, error } : null);
+    } finally {
+      if (mountedRef.current) setOperation(null);
+    }
+  };
+
+  const clearSelected = async () => {
+    const target = targetObject;
+    if (!backend || !target) return;
+    setOperation("clear");
+    setDeviceError(null);
+    try {
+      const error = await backend.clear({ objectId: target.objectId, wireSlot: target.wireSlot });
+      if (mountedRef.current) setDeviceError(error ? { objectId: target.objectId, error } : null);
+    } finally {
+      if (mountedRef.current) setOperation(null);
+    }
+  };
+
   const resetObservation = () => {
-    setObservation({ status: "none", targetObjectId: null, errorKind: null });
+    setPreviewObservation({ status: "none", targetObjectId: null, errorKind: null });
+    setDeviceError(null);
   };
 
   const confirmDialog = () => {
     const current = dialog;
     setDialog(null);
     if (!current) return;
+    if (current.kind === "close") {
+      onClose();
+      return;
+    }
     if (current.kind === "discard") {
       if (current.next.type === "new") addScenario();
       else setSelectedId(current.next.id);
       return;
     }
     if (current.kind === "delete") {
-      const index = scenarios.findIndex((scenario) => scenario.id === current.id);
-      const remaining = scenarios.filter((scenario) => scenario.id !== current.id);
-      setScenarios(remaining);
-      if (selectedId === current.id) setSelectedId(remaining[Math.min(index, remaining.length - 1)]?.id ?? null);
+      void deleteScenario(current.id);
       return;
     }
     if (current.kind === "upload") {
+      if (backend) {
+        void uploadSelected();
+        return;
+      }
       if (selectedScenario) {
         const uploaded = selectedScenario;
         setScenarios((previous) => previous.map((scenario) => scenario.id === uploaded.id ? saveScenario(scenario) : scenario));
-        setObservation({ status: "committed", targetObjectId: uploaded.draft.targetObjectId, errorKind: null });
+        setPreviewObservation({ status: "committed", targetObjectId: uploaded.draft.targetObjectId, errorKind: null });
       }
       return;
     }
-    setObservation({ status: "cleared", targetObjectId, errorKind: null });
+    if (backend) {
+      void clearSelected();
+      return;
+    }
+    setPreviewObservation({ status: "cleared", targetObjectId, errorKind: null });
   };
 
   const scenarioName = (scenario: Scenario | null) => scenario?.draft.name.trim() || copy.dynamicUntitledScenario;
@@ -181,6 +393,20 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
   const renderDialog = () => {
     if (!dialog) return null;
     const cancel = () => setDialog(null);
+    if (dialog.kind === "close") {
+      return (
+        <ScenarioDialog
+          copy={copy}
+          eyebrow={copy.unsavedChanges}
+          title={copy.switchUnsavedTitle}
+          message={copy.dynamicScenarioCloseMessage}
+          confirmLabel={copy.dynamicScenarioCloseAnyway}
+          danger
+          onConfirm={confirmDialog}
+          onCancel={cancel}
+        />
+      );
+    }
     if (dialog.kind === "discard") {
       return (
         <ScenarioDialog
@@ -202,7 +428,9 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
           copy={copy}
           eyebrow={copy.dynamicScenarioEyebrow}
           title={copy.dynamicScenarioDeleteTitle}
-          message={copy.dynamicScenarioDeleteMessage(scenarioName(scenario))}
+          message={backend
+            ? copy.dynamicScenarioDeleteMessageDevice(scenarioName(scenario))
+            : copy.dynamicScenarioDeleteMessage(scenarioName(scenario))}
           confirmLabel={copy.dynamicScenarioDeleteConfirm}
           danger
           onConfirm={confirmDialog}
@@ -214,10 +442,12 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
       return (
         <ScenarioDialog
           copy={copy}
-          eyebrow={copy.dynamicPreviewBadge}
-          title={copy.dynamicConfirmUploadTitle}
-          message={copy.dynamicConfirmUploadMessage(scenarioName(selectedScenario), targetLabel)}
-          confirmLabel={copy.dynamicConfirmUploadConfirm}
+          eyebrow={backend ? copy.dynamicMacro : copy.dynamicPreviewBadge}
+          title={backend ? copy.dynamicConfirmUploadTitleDevice : copy.dynamicConfirmUploadTitle}
+          message={backend
+            ? copy.dynamicConfirmUploadMessageDevice(scenarioName(selectedScenario), targetLabel)
+            : copy.dynamicConfirmUploadMessage(scenarioName(selectedScenario), targetLabel)}
+          confirmLabel={backend ? copy.dynamicConfirmUploadConfirmDevice : copy.dynamicConfirmUploadConfirm}
           onConfirm={confirmDialog}
           onCancel={cancel}
         />
@@ -226,10 +456,10 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
     return (
       <ScenarioDialog
         copy={copy}
-        eyebrow={copy.dynamicPreviewBadge}
-        title={copy.dynamicConfirmClearTitle}
-        message={copy.dynamicConfirmClearMessage(targetLabel)}
-        confirmLabel={copy.dynamicConfirmClearConfirm}
+        eyebrow={backend ? copy.dynamicMacro : copy.dynamicPreviewBadge}
+        title={backend ? copy.dynamicConfirmClearTitleDevice : copy.dynamicConfirmClearTitle}
+        message={backend ? copy.dynamicConfirmClearMessageDevice(targetLabel) : copy.dynamicConfirmClearMessage(targetLabel)}
+        confirmLabel={backend ? copy.dynamicConfirmClearConfirmDevice : copy.dynamicConfirmClearConfirm}
         onConfirm={confirmDialog}
         onCancel={cancel}
       />
@@ -259,7 +489,7 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
           ) : null}
           <button
             type="button"
-            onClick={onClose}
+            onClick={requestClose}
             aria-label={copy.close}
             className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink"
           >
@@ -268,12 +498,24 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
         </div>
       </div>
 
-      <DynamicPreviewControls copy={copy} state={previewState} onChange={(state) => { setDialog(null); setPreviewState(state); }} />
+      {previewMode ? (
+        <DynamicPreviewControls copy={copy} state={previewState} onChange={(state) => { setDialog(null); setPreviewState(state); }} />
+      ) : null}
 
       <p className="flex shrink-0 items-start gap-2 border-b border-warning/40 bg-warning-soft px-10 py-2.5 text-xs leading-relaxed text-warning" role="note">
         <ShieldAlert className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         <span><strong className="font-semibold">{copy.dynamicWorkspaceWarningTitle}</strong> {copy.dynamicWorkspaceWarning}</span>
       </p>
+
+      {storeFailure ? (
+        <p className="flex shrink-0 items-start gap-2 border-b border-danger/40 bg-danger-soft px-10 py-2.5 text-xs leading-relaxed text-danger" role="alert">
+          <AlertCircle className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            <strong className="font-semibold">{storeFailure.kind === "load" ? copy.dynamicStoreLoadFailedTitle : copy.dynamicStoreSaveFailedTitle}</strong>{" "}
+            {format(storeFailure.error)}
+          </span>
+        </p>
+      ) : null}
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <ScenarioList
@@ -284,25 +526,33 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog }: DynamicW
           onSelect={requestScenario}
           onNewScenario={requestNewScenario}
         />
-        {selectedScenario ? (
+        {storeStatus === "loading" ? (
+          <section className="flex min-w-0 flex-1 items-center justify-center bg-canvas px-8 text-center">
+            <p className="text-sm text-ink-muted" role="status">{copy.dynamicStoreLoading}</p>
+          </section>
+        ) : selectedScenario ? (
           <ScenarioEditor
             copy={copy}
+            mode={previewMode ? "preview" : "device"}
+            deviceName={deviceName}
             scenario={selectedScenario}
-            device={fixture.device}
-            staticLocked={fixture.staticLocked}
-            notice={fixture.notice}
+            device={device}
+            staticLocked={staticLocked}
+            notice={notice}
             capability={capability}
             observation={observation}
+            errorDetail={errorDetail}
             targetObject={targetObject}
             targetIndex={targetIndex}
             uploadBlockers={uploadReasons}
             clearBlockers={clearReasons}
+            saveBlockers={saveReasons}
             onNameChange={(value) => updateSelected({ name: value })}
             onTextChange={(value) => updateSelected({ text: value })}
             onTtlChange={(value) => updateSelected({ ttlSeconds: value })}
             onKeepChange={(value) => updateSelected({ keepAfterExecute: value })}
             onTargetChange={(objectId) => updateSelected({ targetObjectId: objectId })}
-            onSave={() => { if (selectedId) setScenarios((previous) => previous.map((scenario) => scenario.id === selectedId ? saveScenario(scenario) : scenario)); }}
+            onSave={() => { void commitSelectedSave(); }}
             onUploadRequest={requestUpload}
             onClearRequest={requestClear}
             onDeleteRequest={requestDelete}

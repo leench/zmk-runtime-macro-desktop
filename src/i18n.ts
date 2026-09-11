@@ -263,6 +263,7 @@ export type MessageTable = {
   dynamicTarget: string;
   dynamicTargetDevice: string;
   dynamicTargetDeviceHelp: string;
+  dynamicTargetDeviceRealHelp: string;
   dynamicTargetObject: string;
   dynamicTargetChoose: string;
   dynamicTargetUnavailable: string;
@@ -294,6 +295,7 @@ export type MessageTable = {
   dynamicObservationErrorUnsupported: string;
   dynamicObservationTarget: string;
   dynamicObservationReset: string;
+  dynamicObservationRealNote: string;
   dynamicScenarioListAria: string;
   dynamicScenarios: string;
   dynamicScenarioCount: (count: number) => string;
@@ -306,6 +308,15 @@ export type MessageTable = {
   dynamicScenarioName: string;
   dynamicScenarioNameHelp: string;
   dynamicScenarioSavedLocally: string;
+  dynamicScenarioSavedToStore: string;
+  dynamicScenarioNameRequired: string;
+  dynamicScenarioNameTooLong: (maximum: number) => string;
+  dynamicScenarioTextTooLongForStore: (maximum: number) => string;
+  dynamicScenarioCloseMessage: string;
+  dynamicScenarioCloseAnyway: string;
+  dynamicStoreLoading: string;
+  dynamicStoreLoadFailedTitle: string;
+  dynamicStoreSaveFailedTitle: string;
   dynamicScenarioNoTarget: string;
   dynamicScenarioTarget: (label: string) => string;
   dynamicScenarioTargetPending: string;
@@ -314,6 +325,7 @@ export type MessageTable = {
   dynamicScenarioSwitchAnyway: string;
   dynamicScenarioDeleteTitle: string;
   dynamicScenarioDeleteMessage: (name: string) => string;
+  dynamicScenarioDeleteMessageDevice: (name: string) => string;
   dynamicScenarioDeleteConfirm: string;
   dynamicScenarioSaveAndUpload: string;
   dynamicScenarioClearDevice: string;
@@ -326,6 +338,12 @@ export type MessageTable = {
   dynamicConfirmClearTitle: string;
   dynamicConfirmClearMessage: (target: string) => string;
   dynamicConfirmClearConfirm: string;
+  dynamicConfirmUploadTitleDevice: string;
+  dynamicConfirmUploadMessageDevice: (name: string, target: string) => string;
+  dynamicConfirmUploadConfirmDevice: string;
+  dynamicConfirmClearTitleDevice: string;
+  dynamicConfirmClearMessageDevice: (target: string) => string;
+  dynamicConfirmClearConfirmDevice: string;
   dynamicBlockerDisconnected: string;
   dynamicBlockerUnknown: string;
   dynamicBlockerOperating: string;
@@ -612,6 +630,7 @@ const english: MessageTable = {
   dynamicTarget: "Upload target",
   dynamicTargetDevice: "Target device",
   dynamicTargetDeviceHelp: "Device aliases arrive in a later stage; preview data uses a fixed name.",
+  dynamicTargetDeviceRealHelp: "Device aliases arrive in a later stage, so the connected device summary is shown instead.",
   dynamicTargetObject: "Dynamic object",
   dynamicTargetChoose: "Choose a target object…",
   dynamicTargetUnavailable: "Saved target is unavailable",
@@ -643,11 +662,12 @@ const english: MessageTable = {
   dynamicObservationErrorUnsupported: "Preview error: the device rejected the request as unsupported. Reset the observation to continue.",
   dynamicObservationTarget: "Observed target",
   dynamicObservationReset: "Reset observation",
+  dynamicObservationRealNote: "Local observation of this session only. Dynamic objects live in RAM, are cleared on execution, TTL or disconnect, and cannot be read back.",
   dynamicScenarioListAria: "Dynamic scenarios",
   dynamicScenarios: "Scenarios",
   dynamicScenarioCount: (count) => `${count} scenario${count === 1 ? "" : "s"}`,
   dynamicNewScenario: "New scenario",
-  dynamicNoScenarios: "No scenarios yet. This preview fixture starts empty.",
+  dynamicNoScenarios: "No scenarios yet.",
   dynamicUntitledScenario: "Untitled scenario",
   dynamicEmptyTitle: "No scenarios yet",
   dynamicEmptyHelp: "Scenarios are desktop-side templates that you name yourself. A Dynamic object on the device is only the upload target.",
@@ -655,6 +675,15 @@ const english: MessageTable = {
   dynamicScenarioName: "Scenario name",
   dynamicScenarioNameHelp: "Desktop-side name only; it is never sent to the device.",
   dynamicScenarioSavedLocally: "Saved in memory (preview)",
+  dynamicScenarioSavedToStore: "Saved",
+  dynamicScenarioNameRequired: "Give the scenario a name before saving it.",
+  dynamicScenarioNameTooLong: (maximum) => `Scenario names are limited to ${maximum} bytes.`,
+  dynamicScenarioTextTooLongForStore: (maximum) => `Text saved to the scenario file is limited to ${maximum} bytes.`,
+  dynamicScenarioCloseMessage: "This scenario has unsaved changes. Close the workspace anyway? Unsaved edits stay in memory and are not written to the scenario file.",
+  dynamicScenarioCloseAnyway: "Close anyway",
+  dynamicStoreLoading: "Loading saved scenarios…",
+  dynamicStoreLoadFailedTitle: "Saved scenarios could not be loaded.",
+  dynamicStoreSaveFailedTitle: "Scenarios could not be saved.",
   dynamicScenarioNoTarget: "No target object",
   dynamicScenarioTarget: (label) => `Target: ${label}`,
   dynamicScenarioTargetPending: "Target: not checked yet",
@@ -663,6 +692,7 @@ const english: MessageTable = {
   dynamicScenarioSwitchAnyway: "Switch anyway",
   dynamicScenarioDeleteTitle: "Delete scenario",
   dynamicScenarioDeleteMessage: (name) => `Remove ${name} from this preview? Device objects and their content are not affected.`,
+  dynamicScenarioDeleteMessageDevice: (name) => `Remove ${name} from the saved scenarios? Device objects and their content are not affected.`,
   dynamicScenarioDeleteConfirm: "Delete scenario",
   dynamicScenarioSaveAndUpload: "Save & upload",
   dynamicScenarioClearDevice: "Clear device",
@@ -675,9 +705,15 @@ const english: MessageTable = {
   dynamicConfirmClearTitle: "Preview clear",
   dynamicConfirmClearMessage: (target) => `Mark ${target} as cleared? The scenario and its text stay untouched.`,
   dynamicConfirmClearConfirm: "Mark as cleared",
+  dynamicConfirmUploadTitleDevice: "Save and upload",
+  dynamicConfirmUploadMessageDevice: (name, target) => `Save ${name}, then upload it to ${target}? The device acknowledges the upload; there is no readback.`,
+  dynamicConfirmUploadConfirmDevice: "Save and upload",
+  dynamicConfirmClearTitleDevice: "Clear device object",
+  dynamicConfirmClearMessageDevice: (target) => `Clear ${target} on the device? The scenario and its text are kept.`,
+  dynamicConfirmClearConfirmDevice: "Clear object",
   dynamicBlockerDisconnected: "Connect a device to upload or clear.",
   dynamicBlockerUnknown: "The device state is unknown after a reconnect. Reopen the device to continue.",
-  dynamicBlockerOperating: "A preview operation is already running.",
+  dynamicBlockerOperating: "An operation is already running.",
   dynamicTextHelpPending: "Printable US ASCII, LF, Tab, and Backspace. The length limit follows the device capability.",
   dynamicSampleScenarioWork: "Work terminal",
   dynamicSampleScenarioBuild: "Build watch",
@@ -959,6 +995,7 @@ const chinese: MessageTable = {
   dynamicTarget: "上传目标",
   dynamicTargetDevice: "目标设备",
   dynamicTargetDeviceHelp: "设备别名将在后续阶段实现；预览使用固定名称。",
+  dynamicTargetDeviceRealHelp: "设备别名将在后续阶段实现，当前显示已连接设备的安全摘要。",
   dynamicTargetObject: "动态对象",
   dynamicTargetChoose: "选择目标对象…",
   dynamicTargetUnavailable: "已保存的目标当前不可用",
@@ -990,11 +1027,12 @@ const chinese: MessageTable = {
   dynamicObservationErrorUnsupported: "预览错误：设备以不支持为由拒绝请求。可重置观察后继续。",
   dynamicObservationTarget: "观察目标",
   dynamicObservationReset: "重置观察",
+  dynamicObservationRealNote: "这里只是本次连接的本地观察。动态对象仅存于 RAM，会因执行、TTL 或断开而消失，且无法读回。",
   dynamicScenarioListAria: "Dynamic 场景列表",
   dynamicScenarios: "场景",
   dynamicScenarioCount: (count) => `${count} 个场景`,
   dynamicNewScenario: "新建场景",
-  dynamicNoScenarios: "还没有场景。该预览 fixture 从空状态开始。",
+  dynamicNoScenarios: "还没有场景。",
   dynamicUntitledScenario: "未命名场景",
   dynamicEmptyTitle: "还没有场景",
   dynamicEmptyHelp: "场景是你自己命名的桌面端模板；设备上的动态对象只是上传目标。",
@@ -1002,6 +1040,15 @@ const chinese: MessageTable = {
   dynamicScenarioName: "场景名称",
   dynamicScenarioNameHelp: "仅用于桌面端显示，不会发送到设备。",
   dynamicScenarioSavedLocally: "已保存到内存（预览）",
+  dynamicScenarioSavedToStore: "已保存",
+  dynamicScenarioNameRequired: "请先为场景命名再保存。",
+  dynamicScenarioNameTooLong: (maximum) => `场景名称最多 ${maximum} bytes。`,
+  dynamicScenarioTextTooLongForStore: (maximum) => `场景文件中的正文最多 ${maximum} bytes。`,
+  dynamicScenarioCloseMessage: "该场景有未保存修改。仍要关闭工作区吗？未保存的修改只留在内存中，不会写入场景文件。",
+  dynamicScenarioCloseAnyway: "仍然关闭",
+  dynamicStoreLoading: "正在加载已保存场景…",
+  dynamicStoreLoadFailedTitle: "无法加载已保存的场景。",
+  dynamicStoreSaveFailedTitle: "场景未能保存。",
   dynamicScenarioNoTarget: "未选择目标对象",
   dynamicScenarioTarget: (label) => `目标：${label}`,
   dynamicScenarioTargetPending: "目标：尚未检查",
@@ -1010,6 +1057,7 @@ const chinese: MessageTable = {
   dynamicScenarioSwitchAnyway: "仍然切换",
   dynamicScenarioDeleteTitle: "删除场景",
   dynamicScenarioDeleteMessage: (name) => `从预览中移除 ${name}？设备对象及其内容不受影响。`,
+  dynamicScenarioDeleteMessageDevice: (name) => `从已保存场景中删除 ${name}？设备对象及其内容不受影响。`,
   dynamicScenarioDeleteConfirm: "删除场景",
   dynamicScenarioSaveAndUpload: "保存并上传",
   dynamicScenarioClearDevice: "清除设备对象",
@@ -1022,9 +1070,15 @@ const chinese: MessageTable = {
   dynamicConfirmClearTitle: "预览清除",
   dynamicConfirmClearMessage: (target) => `将 ${target} 标记为已清除？场景及其正文不受影响。`,
   dynamicConfirmClearConfirm: "标记为已清除",
+  dynamicConfirmUploadTitleDevice: "保存并上传",
+  dynamicConfirmUploadMessageDevice: (name, target) => `保存 ${name} 并上传到 ${target}？设备只会确认本次上传，没有读回。`,
+  dynamicConfirmUploadConfirmDevice: "保存并上传",
+  dynamicConfirmClearTitleDevice: "清除设备对象",
+  dynamicConfirmClearMessageDevice: (target) => `在设备上清除 ${target}？场景及其正文会保留。`,
+  dynamicConfirmClearConfirmDevice: "清除对象",
   dynamicBlockerDisconnected: "请先连接设备，再上传或清除。",
   dynamicBlockerUnknown: "重新连接后设备状态未知。请重新打开设备后再继续。",
-  dynamicBlockerOperating: "已有预览操作正在进行。",
+  dynamicBlockerOperating: "已有操作正在进行。",
   dynamicTextHelpPending: "支持可打印 US ASCII、LF、Tab 和 Backspace；长度上限以设备能力为准。",
   dynamicSampleScenarioWork: "工作终端",
   dynamicSampleScenarioBuild: "构建监视",

@@ -11,7 +11,9 @@ import type {
 import { SelectField } from "../../components/SelectField";
 import { dynamicTtlPresets } from "../../utils/dynamic";
 import {
-  type ScenarioBlocker,
+  type ScenarioIssue,
+  SCENARIO_NAME_LIMIT_BYTES,
+  SCENARIO_TEXT_LIMIT_BYTES,
   hasScenarioContent,
   isScenarioDirty,
   objectLimits,
@@ -20,18 +22,28 @@ import {
 import { DynamicCapabilityDetails } from "./DynamicCapabilityDetails";
 import { DynamicTargetSelector } from "./DynamicTargetSelector";
 
+export type ScenarioEditorMode = "preview" | "device";
+
 type ScenarioEditorProps = {
   copy: Messages;
+  /** `device` disables the preview-only notes and mock wording. */
+  mode: ScenarioEditorMode;
+  /** Safe connected-device display name; the preview passes its fixed name. */
+  deviceName: string;
   scenario: Scenario;
   device: PreviewDeviceState;
   staticLocked: boolean;
   notice: PreviewNotice;
   capability: DynamicCapabilitiesPresentation | null;
   observation: DynamicObservation;
+  /** Sanitized, localized detail of the newest failed operation, if any. */
+  errorDetail: string | null;
   targetObject: DynamicObjectPresentation | null;
   targetIndex: number;
-  uploadBlockers: ScenarioBlocker[];
-  clearBlockers: ScenarioBlocker[];
+  uploadBlockers: ScenarioIssue[];
+  clearBlockers: ScenarioIssue[];
+  /** Reasons the local save cannot reach the scenario store. */
+  saveBlockers: ScenarioIssue[];
   onNameChange: (value: string) => void;
   onTextChange: (value: string) => void;
   onTtlChange: (value: number | null) => void;
@@ -74,7 +86,7 @@ function observationMessage(copy: Messages, observation: DynamicObservation): st
   return copy.dynamicObservationNone;
 }
 
-function blockerMessage(copy: Messages, blocker: ScenarioBlocker, maximum: number | null): string {
+function blockerMessage(copy: Messages, blocker: ScenarioIssue, maximum: number | null): string {
   switch (blocker) {
     case "deviceDisconnected":
       return copy.dynamicBlockerDisconnected;
@@ -96,6 +108,14 @@ function blockerMessage(copy: Messages, blocker: ScenarioBlocker, maximum: numbe
       return maximum === null ? copy.dynamicTextRequired : copy.dynamicTextTooLong(maximum);
     case "ttlInvalid":
       return copy.dynamicTtlInvalid;
+    case "nameRequired":
+      return copy.dynamicScenarioNameRequired;
+    case "nameTooLong":
+      return copy.dynamicScenarioNameTooLong(SCENARIO_NAME_LIMIT_BYTES);
+    case "storeTextUnsupported":
+      return copy.dynamicUnsupportedText;
+    case "storeTextTooLong":
+      return copy.dynamicScenarioTextTooLongForStore(SCENARIO_TEXT_LIMIT_BYTES);
     default:
       return copy.dynamicScenarioKeepUnsupported;
   }
@@ -113,20 +133,25 @@ function observationTargetLabel(
 
 /**
  * Right column of the workspace: the selected scenario, its upload target and
- * the local observation. Text and TTL stay in React memory only.
+ * the local observation. Text and TTL stay in React memory until the user saves
+ * the scenario; the editor never talks to the device or the store itself.
  */
 export function ScenarioEditor({
   copy,
+  mode,
+  deviceName,
   scenario,
   device,
   staticLocked,
   notice,
   capability,
   observation,
+  errorDetail,
   targetObject,
   targetIndex,
   uploadBlockers,
   clearBlockers,
+  saveBlockers,
   onNameChange,
   onTextChange,
   onTtlChange,
@@ -139,7 +164,7 @@ export function ScenarioEditor({
   onResetObservation,
 }: ScenarioEditorProps) {
   const dirty = isScenarioDirty(scenario);
-  const saveable = dirty && hasScenarioContent(scenario);
+  const saveable = dirty && hasScenarioContent(scenario) && saveBlockers.length === 0;
   const byteCount = scenarioByteLength(scenario.draft.text);
   const limits = targetObject ? objectLimits(targetObject) : null;
   const presets = limits ? dynamicTtlPresets(limits) : [];
@@ -158,7 +183,14 @@ export function ScenarioEditor({
   const blockers = uploadBlockers.length > 0 ? uploadBlockers.slice(0, 3) : clearBlockers.slice(0, 1);
   const informationalOnly = blockers.every((blocker) => blocker === "capabilityDiscovering");
   const observationTarget = observationTargetLabel(copy, capability, observation);
-  const canResetObservation = observation.status === "committed" || observation.status === "cleared" || observation.status === "error";
+  const canResetObservation = mode === "preview" && (observation.status === "committed" || observation.status === "cleared" || observation.status === "error");
+  const savedNote = scenario.isNew
+    ? copy.neverSaved
+    : dirty
+      ? copy.unsavedChanges
+      : mode === "device"
+        ? copy.dynamicScenarioSavedToStore
+        : copy.dynamicScenarioSavedLocally;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col" aria-labelledby="scenario-heading">
@@ -170,7 +202,7 @@ export function ScenarioEditor({
               <h1 id="scenario-heading" className="mt-1.5 truncate text-2xl font-semibold text-ink">{scenario.draft.name.trim() || copy.dynamicUntitledScenario}</h1>
             </div>
             <p className={`mt-1 shrink-0 text-xs ${dirty ? "text-warning" : "text-ink-subtle"}`} aria-live="polite">
-              {scenario.isNew ? copy.neverSaved : dirty ? copy.unsavedChanges : copy.dynamicScenarioSavedLocally}
+              {savedNote}
             </p>
           </header>
 
@@ -223,9 +255,9 @@ export function ScenarioEditor({
               <div className="min-w-0">
                 <span className="block text-sm font-medium text-ink">{copy.dynamicTargetDevice}</span>
                 <p className="mt-2.5 flex h-11 items-center gap-2 rounded-xl border border-line bg-surface px-3.5 text-sm text-ink">
-                  <span className="truncate font-mono">{copy.dynamicPreviewDeviceName}</span>
+                  <span className="truncate font-mono">{deviceName}</span>
                 </p>
-                <p className="mt-1.5 text-xs leading-relaxed text-ink-subtle">{copy.dynamicTargetDeviceHelp}</p>
+                <p className="mt-1.5 text-xs leading-relaxed text-ink-subtle">{mode === "device" ? copy.dynamicTargetDeviceRealHelp : copy.dynamicTargetDeviceHelp}</p>
               </div>
               <DynamicTargetSelector
                 copy={copy}
@@ -313,12 +345,15 @@ export function ScenarioEditor({
               </span>
             </div>
             <p className="mt-2.5 text-sm leading-relaxed text-ink-muted">{observationMessage(copy, observation)}</p>
+            {errorDetail ? (
+              <p className="mt-1.5 text-sm leading-relaxed text-danger" role="alert">{errorDetail}</p>
+            ) : null}
             {observationTarget ? (
               <p className="mt-2 text-xs text-ink-subtle">{copy.dynamicObservationTarget}: <span className="font-mono">{observationTarget}</span></p>
             ) : null}
             <p className="mt-2 flex items-start gap-1.5 text-xs leading-relaxed text-ink-subtle">
               <Info className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              {copy.dynamicPreviewMockNote}
+              {mode === "device" ? copy.dynamicObservationRealNote : copy.dynamicPreviewMockNote}
             </p>
             {canResetObservation ? (
               <button

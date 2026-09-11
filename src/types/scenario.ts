@@ -1,13 +1,14 @@
 /**
  * Presentation model for the page-level Dynamic workspace.
  *
- * Everything here is UI-side data: scenarios are user-named desktop templates
- * and dynamic objects are upload targets. The current capability/observation
- * values come from an in-memory preview fixture; the same shapes are intended to
- * carry real values once the backend service stage starts. Nothing in this file
- * reads a device, a Tauri command or storage, and dynamic text never leaves the
- * React session.
+ * Scenarios are user-named desktop templates and dynamic objects are upload
+ * targets. The workspace has two sources with the same shapes: a device-free
+ * in-memory preview fixture, and the real path where the App passes in the
+ * mapped capability, the body-free service state and bridge callbacks. This
+ * file itself reads no device, no Tauri command and no storage.
  */
+
+import type { CommandError, DynamicServiceState, ScenarioStore } from "../bridge";
 
 export type DynamicObjectTtl = {
   defaultSeconds: number;
@@ -19,6 +20,12 @@ export type DynamicObjectTtl = {
 export type DynamicObjectPresentation = {
   /** Opaque id from the capability/fixture; the UI never parses a number out of it. */
   objectId: string;
+  /**
+   * Wire slot this object must be addressed with. It is the only source for a
+   * device call: neither `objectId` nor `displayLabel` is ever parsed back into
+   * a slot.
+   */
+  wireSlot: number;
   /** Device-provided alias; empty means the UI falls back to a positional label. */
   displayLabel: string;
   maxLength: number;
@@ -50,6 +57,12 @@ export type ScenarioFields = {
   keepAfterExecute: boolean;
   /** Target object id or `null` while no target has been chosen. */
   targetObjectId: string | null;
+  /**
+   * Opaque device alias the user bound earlier, or `null`. Reserved for a later
+   * stage: it is preserved through the persisted store but there is no editor
+   * for it yet. Never a serial number or a HID path.
+   */
+  targetDeviceId: string | null;
 };
 
 export type Scenario = {
@@ -125,4 +138,46 @@ export type PreviewFixture = {
   observation: DynamicObservation;
   scenarios: Scenario[];
   selectedIndex: number | null;
+};
+
+/**
+ * One object as the workspace addresses it on the wire.
+ *
+ * `wireSlot` comes from the capability mapping, never from the opaque id.
+ */
+export type DynamicUploadTarget = {
+  objectId: string;
+  wireSlot: number;
+  text: string;
+  ttlSeconds: number | null;
+  keepAfterExecute: boolean;
+};
+
+export type DynamicClearTarget = {
+  objectId: string;
+  wireSlot: number;
+};
+
+/**
+ * Real DynamicService and scenario store behind a connected workspace.
+ *
+ * The App owns every Tauri command and passes the results in; the workspace
+ * never opens HID, never calls a command directly and never stores dynamic text
+ * anywhere but the persisted scenario document the user asked to save.
+ */
+export type DynamicWorkspaceBackend = {
+  /** On-disk store version the App persists with. */
+  schemaVersion: number;
+  /** Safe connected-device display name; never a HID path or serial. */
+  deviceName: string;
+  device: PreviewDeviceState;
+  /** Static management may be locked while dynamic objects stay available. */
+  staticLocked: boolean;
+  capability: DynamicCapabilitiesPresentation | null;
+  /** Body-free local observation of the current session, or `null` before one. */
+  serviceState: DynamicServiceState | null;
+  loadScenarios: () => Promise<ScenarioStore>;
+  saveScenarios: (store: ScenarioStore) => Promise<ScenarioStore>;
+  upload: (target: DynamicUploadTarget) => Promise<CommandError | null>;
+  clear: (target: DynamicClearTarget) => Promise<CommandError | null>;
 };

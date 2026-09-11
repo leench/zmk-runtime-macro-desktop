@@ -2,18 +2,31 @@
  * Pure scenario/dynamic-target helpers for the page-level Dynamic workspace.
  *
  * These functions only transform in-memory data: no HID, no Tauri command, no
- * storage and no logging. Dynamic text stays inside the React session.
+ * storage and no logging. Dynamic text stays inside the React session until the
+ * user explicitly saves a scenario, and the persisted document is produced here
+ * as plain data for the App to hand to the store command.
  */
 
+import type { DynamicCapabilities, DynamicServiceState, PersistedScenario, ScenarioStore } from "../bridge";
+import type { DynamicCapabilityStatus } from "../types/dynamic";
 import type {
   DynamicCapabilitiesPresentation,
   DynamicObjectPresentation,
   DynamicObservation,
+  ObservationErrorKind,
   PreviewDeviceState,
   Scenario,
   ScenarioFields,
 } from "../types/scenario";
-import { dynamicByteLength, validateDynamicText } from "./dynamic.ts";
+import { dynamicByteLength, dynamicLimits, dynamicObjectSlots, validateDynamicText } from "./dynamic.ts";
+
+/**
+ * Limits enforced by the persisted scenario store. They are the on-disk schema
+ * limits, not a device capability: a scenario may legitimately hold text a
+ * smaller device object cannot accept.
+ */
+export const SCENARIO_NAME_LIMIT_BYTES = 64;
+export const SCENARIO_TEXT_LIMIT_BYTES = 512;
 
 /** Pseudo value for "no target object chosen yet". */
 export const TARGET_NONE = "";
@@ -21,7 +34,7 @@ export const TARGET_NONE = "";
 export const TARGET_MISSING = "__missing";
 
 export function emptyScenarioFields(): ScenarioFields {
-  return { name: "", text: "", ttlSeconds: null, keepAfterExecute: false, targetObjectId: null };
+  return { name: "", text: "", ttlSeconds: null, keepAfterExecute: false, targetObjectId: null, targetDeviceId: null };
 }
 
 export function createScenario(
@@ -47,7 +60,8 @@ export function sameScenarioFields(left: ScenarioFields, right: ScenarioFields):
     && left.text === right.text
     && left.ttlSeconds === right.ttlSeconds
     && left.keepAfterExecute === right.keepAfterExecute
-    && left.targetObjectId === right.targetObjectId;
+    && left.targetObjectId === right.targetObjectId
+    && left.targetDeviceId === right.targetDeviceId;
 }
 
 /** A never-saved scenario is dirty until its first local save. */
@@ -212,4 +226,289 @@ export function uploadBlockers(gate: ScenarioGate): ScenarioBlocker[] {
 /** Reasons Clear device stays disabled; text, TTL and keep do not matter here. */
 export function clearBlockers(gate: ScenarioGate): ScenarioBlocker[] {
   return [...deviceBlockers(gate), ...targetBlockers(gate)];
+}
+
+/**
+ * Reasons a local save cannot reach the scenario store.
+ *
+ * These are store schema limits, so they apply whenever a scenario is written
+ * to disk: a name is required, and the stored text must fit the on-disk format.
+ */
+export type ScenarioStoreBlocker = "nameRequired" | "nameTooLong" | "storeTextUnsupported" | "storeTextTooLong";
+
+/** Any reason the editor has to report next to the action bar. */
+export type ScenarioIssue = ScenarioBlocker | ScenarioStoreBlocker;
+
+function storedTextIsSupported(text: string): boolean {
+  const bytes = new TextEncoder().encode(text);
+  for (const byte of bytes) {
+    if (!((byte >= 0x20 && byte <= 0x7e) || byte === 0x08 || byte === 0x09 || byte === 0x0a)) return false;
+  }
+  return true;
+}
+
+/** Store-schema blockers of one scenario draft; empty means it can be persisted. */
+export function storeBlockers(fields: ScenarioFields): ScenarioStoreBlocker[] {
+  const blockers: ScenarioStoreBlocker[] = [];
+  const nameBytes = dynamicByteLength(fields.name);
+  if (fields.name.trim().length === 0) blockers.push("nameRequired");
+  else if (nameBytes > SCENARIO_NAME_LIMIT_BYTES) blockers.push("nameTooLong");
+  const textBytes = dynamicByteLength(fields.text);
+  if (textBytes > SCENARIO_TEXT_LIMIT_BYTES) blockers.push("storeTextTooLong");
+  else if (!storedTextIsSupported(fields.text)) blockers.push("storeTextUnsupported");
+  return blockers;
+}
+
+/**
+ * Stable opaque presentation id of one wire slot.
+ *
+ * The id is only an identifier: the wire slot always travels next to it in
+ * [`DynamicObjectPresentation.wireSlot`] and is never parsed back out of the id.
+ */
+export function objectIdForSlot(slot: number): string {
+  return `dynamic-object-${slot}`;
+}
+
+/**
+ * Map the real device capability onto the workspace presentation model.
+ *
+ * Object count, per-object byte limit, TTL bounds and keep support all come
+ * from the reported capability: nothing is hardcoded and no object is guessed.
+ */
+export function capabilityPresentationFromBackend(
+  capabilities: DynamicCapabilities | null,
+): DynamicCapabilitiesPresentation | null {
+  if (!capabilities) return null;
+  const limits = dynamicLimits(capabilities);
+  return {
+    capabilityVersion: capabilities.capabilityVersion,
+    objects: dynamicObjectSlots(capabilities).map((slot) => ({
+      objectId: objectIdForSlot(slot),
+      wireSlot: slot,
+      displayLabel: "",
+      maxLength: limits.maxBytes,
+      ttl: {
+        defaultSeconds: limits.defaultTtlSeconds,
+        minSeconds: limits.minTtlSeconds,
+        maxSeconds: limits.maxTtlSeconds,
+      },
+      supportsKeepAfterExecute: capabilities.supportsKeepAfterExecute,
+    })),
+    lifecycle: {
+      clearOnBoot: capabilities.clearOnBoot,
+      clearOnTtlExpiry: capabilities.clearOnTtlExpiry,
+      clearOnExecutionAccept: capabilities.clearOnExecutionAccept,
+      clearOnUsbDisconnect: capabilities.clearOnUsbDisconnect,
+      clearOnBleProfileChange: capabilities.clearOnBleProfileChange,
+      clearOnSelectedEndpointChange: capabilities.clearOnSelectedEndpointChange,
+    },
+  };
+}
+
+/**
+ * Wire slot of a target object, resolved through the capability collection.
+ *
+ * A saved or unknown id resolves to `null` instead of being reinterpreted, so
+ * a device call can never be addressed to a guessed slot.
+ */
+export function objectWireSlot(
+  capability: DynamicCapabilitiesPresentation | null,
+  objectId: string | null,
+): number | null {
+  const object = findTargetObject(capability, objectId);
+  return object ? object.wireSlot : null;
+}
+
+/**
+ * Whether a workspace target addresses exactly the object the device reports.
+ *
+ * The id is resolved through the mapped capability collection and the resolved
+ * wire slot must be the one the caller asked for. Neither the id nor a label is
+ * ever parsed into a slot, so a stale, foreign or mismatched target is rejected
+ * instead of being re-addressed to another object.
+ */
+export function targetMatchesCapability(
+  capabilities: DynamicCapabilities | null,
+  objectId: string,
+  wireSlot: number,
+): boolean {
+  const presentation = capabilityPresentationFromBackend(capabilities);
+  if (!presentation) return false;
+  return objectWireSlot(presentation, objectId) === wireSlot;
+}
+
+function observationErrorKind(errorCode: string): ObservationErrorKind {
+  if (errorCode === "timeout") return "timeout";
+  if (errorCode === "dynamic_unsupported") return "unsupported";
+  return "interrupted";
+}
+
+function observationStatusFromService(
+  status: DynamicServiceState["status"] | NonNullable<DynamicServiceState["objects"][number]>["status"],
+): DynamicObservation["status"] {
+  switch (status) {
+    case "uploading":
+      return "uploading";
+    case "committedLocally":
+      return "committed";
+    case "clearing":
+      return "clearing";
+    case "clearedLocally":
+      return "cleared";
+    case "error":
+      return "error";
+    default:
+      return "none";
+  }
+}
+
+/**
+ * Map the body-free DynamicService state onto the workspace observation.
+ *
+ * With a resolved target, only that object's own observation is reported: an
+ * operation on another object never shows up as this target's result. Without a
+ * target, the service-level status is the only available fact. Nothing here is a
+ * readback: a committed/cleared status only repeats the local acknowledgement of
+ * this session, and `none` means nothing was observed.
+ */
+export function observationFromServiceState(
+  state: DynamicServiceState | null,
+  target: { objectId: string; wireSlot: number } | null,
+): DynamicObservation {
+  if (!state) return { status: "none", targetObjectId: null, errorKind: null };
+  const errorKind = state.error ? observationErrorKind(state.error.code) : null;
+  if (target) {
+    const object = state.objects.find((entry) => entry.slot === target.wireSlot) ?? null;
+    if (!object) return { status: "none", targetObjectId: null, errorKind: null };
+    const mapped = observationStatusFromService(object.status);
+    if (mapped === "none") return { status: "none", targetObjectId: null, errorKind: null };
+    return { status: mapped, targetObjectId: target.objectId, errorKind: mapped === "error" ? errorKind : null };
+  }
+  const mapped = observationStatusFromService(state.status);
+  if (mapped === "none") return { status: "none", targetObjectId: null, errorKind: null };
+  return { status: mapped, targetObjectId: null, errorKind: mapped === "error" ? errorKind : null };
+}
+
+/** Local device state as the workspace shows it, derived from the connection. */
+export function serviceDeviceState(
+  connected: boolean,
+  status: DynamicCapabilityStatus,
+): PreviewDeviceState {
+  if (!connected) return "disconnected";
+  if (status === "ready") return "ready";
+  if (status === "discovering") return "discovering";
+  if (status === "unsupported") return "unsupported";
+  return "unknown";
+}
+
+/** Stable opaque id for a new scenario; ascii, bounded and unused. */
+export function newScenarioId(existing: readonly string[] = []): string {
+  const taken = new Set(existing);
+  let candidate = "";
+  do {
+    const random = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : null;
+    candidate = random ? `scenario-${random}` : `scenario-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  } while (taken.has(candidate));
+  return candidate.slice(0, SCENARIO_NAME_LIMIT_BYTES);
+}
+
+/**
+ * One scenario as it comes back from the store: draft and saved snapshot are the
+ * stored values, so a freshly loaded scenario is never dirty.
+ */
+export function scenarioFromPersisted(persisted: PersistedScenario): Scenario {
+  const fields: ScenarioFields = {
+    name: persisted.name,
+    text: persisted.text,
+    ttlSeconds: persisted.ttlSeconds,
+    keepAfterExecute: persisted.keepAfterExecute,
+    targetObjectId: persisted.targetObject,
+    targetDeviceId: persisted.targetDevice,
+  };
+  return { id: persisted.id, draft: { ...fields }, saved: { ...fields }, isNew: false };
+}
+
+export function scenariosFromStore(store: ScenarioStore): Scenario[] {
+  return store.scenarios.map(scenarioFromPersisted);
+}
+
+/** The scenario a store write commits, or `null` for a write without one. */
+export type ScenarioStoreCommit = { id: string; fields: ScenarioFields } | null;
+
+/**
+ * Build the on-disk document for one store write.
+ *
+ * Only the committed scenario is written from its draft: every other scenario is
+ * written from its saved snapshot, so saving one scenario never persists another
+ * scenario's unsaved edits. Scenarios that were never saved are not written at
+ * all - except the one being committed, which is why the first save of a new
+ * scenario needs a name.
+ */
+export function storeFromScenarios(
+  scenarios: readonly Scenario[],
+  schemaVersion: number,
+  commit: ScenarioStoreCommit = null,
+): ScenarioStore {
+  const persisted: PersistedScenario[] = [];
+  for (const scenario of scenarios) {
+    if (scenario.isNew && scenario.id !== commit?.id) continue;
+    const fields = scenario.id === commit?.id ? commit.fields : scenario.saved;
+    persisted.push({
+      id: scenario.id,
+      name: fields.name,
+      text: fields.text,
+      ttlSeconds: fields.ttlSeconds,
+      keepAfterExecute: fields.keepAfterExecute,
+      targetDevice: fields.targetDeviceId,
+      targetObject: fields.targetObjectId,
+    });
+  }
+  return { schemaVersion, scenarios: persisted };
+}
+
+/**
+ * What one local save would write and how the list looks afterwards.
+ *
+ * The plan is pure: nothing is applied until the store write succeeded, so a
+ * failed save leaves the caller's scenarios untouched and dirty.
+ */
+export type ScenarioSavePlan = {
+  /** The list with the committed scenario marked saved; apply only on success. */
+  scenarios: Scenario[];
+  /** The scenario that was committed. */
+  committed: Scenario;
+  /** The on-disk document for this save. */
+  store: ScenarioStore;
+  /** Explicit commit marker so the store uses the committed draft. */
+  commit: { id: string; fields: ScenarioFields };
+};
+
+export function planScenarioSave(
+  scenarios: readonly Scenario[],
+  id: string,
+  schemaVersion: number,
+): ScenarioSavePlan | null {
+  const scenario = scenarios.find((item) => item.id === id);
+  if (!scenario) return null;
+  const committed = saveScenario(scenario);
+  const next = scenarios.map((item) => (item.id === id ? committed : item));
+  const commit = { id: committed.id, fields: committed.draft };
+  return { scenarios: next, committed, store: storeFromScenarios(next, schemaVersion, commit), commit };
+}
+
+/**
+ * Run tasks strictly in call order, one after another.
+ *
+ * Used for store writes so a rapid Save / Delete / Save & Upload sequence cannot
+ * interleave two file writes and leave the older document behind on disk.
+ */
+export type SerialRunner = <T>(task: () => Promise<T>) => Promise<T>;
+
+export function createSerialRunner(): SerialRunner {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T,>(task: () => Promise<T>): Promise<T> => {
+    const queued = tail.then(task, task);
+    tail = queued.then(() => undefined, () => undefined);
+    return queued;
+  };
 }
