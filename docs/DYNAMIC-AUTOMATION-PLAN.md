@@ -449,7 +449,18 @@ src-tauri/src/
 - connect/disconnect/设备替换/应用退出（`AppState` drop）后状态回到 `Unknown`；transport/protocol 失败会丢弃 session，因此同样回到 `Unknown`，Remote status 保留 session 并进入 `unsupported` 或 `error`；
 - `get_dynamic_capabilities` / `upload_dynamic` / `clear_dynamic` 与新的只读 command `get_dynamic_state` 共用这一状态层；Dynamic 仍绕过 static auth gate，不调用、不刷新也不自动登录 static auth，static slot/auth 状态机不变；
 - 新增 `get_dynamic_state` command 和 `bridge.ts` 类型 wrapper，但 page-level Dynamic Workspace 尚未接入真实 command；
-- 尚未接入：UI Workspace 真实数据（阶段 5）、Scenario store（阶段 4）、托盘真实状态（阶段 7）、HTTP API（阶段 9）。
+- Scenario store（阶段 4）已完成：见 §9；
+- 尚未接入：UI Workspace 真实数据（阶段 5）、托盘真实状态（阶段 7）、HTTP API（阶段 9）。
+
+### 8.2 Scenario store（阶段 4，已实现）
+
+`src-tauri/src/scenario_store.rs` 实现窄职责的 Scenario 原子持久化，`commands.rs` 不变，`lib.rs` 只注册两个 command：
+
+- 文件为 app data dir 下的固定文件名 `scenarios.json`，磁盘 schema `{"schema_version":1,"scenarios":[...]}`，字段 `id`/`name`/`text`/`ttl_seconds`/`keep_after_execute`/`target_device`/`target_object`（严格 snake_case，类型 `ScenarioDocument`/`PersistedScenario`）；Tauri wire DTO 是独立类型 `ScenarioDocumentDto`/`PersistedScenarioDto`（`#[serde(rename_all = "camelCase")]`：`schemaVersion`/`ttlSeconds`/`keepAfterExecute`/`targetDevice`/`targetObject`），同一 serde struct 不同时承担两种格式，转换只经显式 `From`；
+- 缺文件返回空 schema v1；JSON 损坏、schema 版本不支持、缺少必需 `scenarios` 字段、重复/空 id、空或过长 name、非法字符集或超长正文、TTL 越界、场景数过多一律返回 sanitized 错误（`scenario_store_corrupt` / `scenario_store_invalid` / `scenario_store_write_failed` / `scenario_store_unavailable`；读取时的权限等 I/O 失败映射 `scenario_store_unavailable`），错误、日志和 DTO 不含 path、OS 原文或正文，损坏原文件不被覆盖；
+- 写入前验证完整 payload，不静默修正或截断；同目录临时文件 + flush/sync + 原子替换，失败时清理临时文件（Windows rename-over-existing 走显式 fallback）；`save_to_path` 覆盖验证/写临时文件/替换全流程持有进程内写锁，并发 save 串行完成、不会互相覆盖固定名临时文件；
+- 文件 I/O 通过 `tauri::async_runtime::spawn_blocking` 执行，不占用 Tauri 主线程、不使用 HID worker、不使用 `localStorage` 或 store plugin；
+- 正文是用户明确选择保存的非 secret 明文，只出现在该文件；store 不接真实 HID、托盘或 HTTP。
 
 ## 9. Scenario 模型与持久化方向
 
@@ -618,6 +629,10 @@ UI 视觉验收通过后：
 - 配置损坏可恢复；
 - 保持正文不进入日志、诊断、错误和无关持久化；
 - 仍然提示仅适合非 secret 文本。
+
+**已完成（阶段 4）：** `src-tauri/src/scenario_store.rs`（`SCENARIO_SCHEMA_VERSION = 1`、`scenarios.json`、`PersistedScenario`/`ScenarioDocument`）、`load_scenarios` / `save_scenarios` 两个 async command（`spawn_blocking`，不经过 HID worker）、`bridge.ts` 的 `PersistedScenario` / `ScenarioStore` / `SCENARIO_STORE_SCHEMA_VERSION` / `loadScenarios()` / `saveScenarios()`。持久化模型与 UI-only 的 `src/types/scenario.ts` 明确分离：`draft`/`saved`/`isNew` 和 React key 不落盘，`targetDevice`/`targetObject` 为 nullable opaque string，绝不写入 HID path、serial 或 in-process candidate id。校验/原子写/损坏错误行为见 §8.2。
+
+**仍未实现：** UI 接入真实 store（`src/features/dynamic/` 仍只用 in-memory preview fixture，刷新即丢失）、托盘选择/上传 Scenario（阶段 7）、HTTP API（阶段 9），仍不支持 secret。
 
 ### 阶段 5：UI 接入真实 DynamicService/HID
 

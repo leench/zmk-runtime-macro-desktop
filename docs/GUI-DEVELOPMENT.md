@@ -6,7 +6,7 @@
 
 首版目标平台：Linux x86_64、macOS Intel/Apple Silicon、Windows x64。前端不直接访问 HID，所有枚举、认证、协议和传输都在 Rust/Tauri command 层完成。
 
-当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）已完成 presentation-first UI-only 阶段：Scenario 列表/编辑器、capability-driven target 行、18 个 in-memory preview 状态和确认对话框全部来自内存 fixture，不接真实 workspace command，真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供。该工作区仍待人工视觉验收。阶段 1 托盘基础（§4.8）已实现：Tauri 2 tray icon/原生菜单、打开/隐藏/明确退出、close-to-tray 和单实例窗口恢复；托盘菜单的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接 DynamicService、不调用 HID；菜单文本提供 `en` / `zh-CN` 两套 labels，由受限 command `set_tray_locale` 跟随前端 `resolveLocale` 实时更新（只接受精确 `"en"` / `"zh-CN"`，非法值返回 `unsupported_locale`），无需重启。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
+当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）已完成 presentation-first UI-only 阶段：Scenario 列表/编辑器、capability-driven target 行、18 个 in-memory preview 状态和确认对话框全部来自内存 fixture，不接真实 workspace command，真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供。该工作区仍待人工视觉验收。Scenario store（§4.10）已在 backend 和 `bridge.ts` 落地（schema v1、`scenarios.json`、原子写、损坏可恢复的 sanitized 错误），但 Workspace 尚未调用它，仍不写盘。阶段 1 托盘基础（§4.8）已实现：Tauri 2 tray icon/原生菜单、打开/隐藏/明确退出、close-to-tray 和单实例窗口恢复；托盘菜单的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接 DynamicService、不调用 HID；菜单文本提供 `en` / `zh-CN` 两套 labels，由受限 command `set_tray_locale` 跟随前端 `resolveLocale` 实时更新（只接受精确 `"en"` / `"zh-CN"`，非法值返回 `unsupported_locale`），无需重启。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
 
 ## 2. 固件和协议约束
 
@@ -164,7 +164,21 @@ UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object �
 - `generation` 是本地 last-write-wins 计数器，不是 firmware 值、protocol request id 或设备版本：每次 capability/upload/clear 分配新 generation，过期完成不覆盖当前状态；新操作开始时清除被取代操作遗留的 in-flight object 状态，已确认的观察（含 byte length）保留；
 - 状态迁移：connect/disconnect/设备替换/应用退出（`AppState` drop）后为 `unknown`；capability 成功为 `ready`（并按 `dynamic_object_count` 生成 object 行），`BAD_OPCODE`/`BAD_VERSION` 为 `unsupported`，其他失败为 `error`；upload/clear 开始时为 `uploading`/`clearing`，成功只记录本地 ACK（`committedLocally`/`clearedLocally`）；Remote status 失败保留 session 并进入 `error`/`unsupported`，transport/protocol 失败丢弃 session 并回到 `unknown`；backend 不保存 draft，也不保存任何 dynamic 正文；
 - command：只读 `get_dynamic_state`（无 HID I/O）返回该无正文 DTO；`get_dynamic_capabilities`/`upload_dynamic`/`clear_dynamic` 与它共用同一状态层，返回值和错误映射不变；
-- 未接入：page-level Dynamic Workspace 仍使用 preview fixture（§4.7），Scenario 持久化、托盘真实状态（§4.8 仍是 disabled preview 占位）和 HTTP API 仍未实现；连接后的自动 capability discovery 也仍未实现（仍由显式 command 触发）。
+- 未接入：page-level Dynamic Workspace 仍使用 preview fixture（§4.7），托盘真实状态（§4.8 仍是 disabled preview 占位）、托盘 Scenario 选择和 HTTP API 仍未实现；连接后的自动 capability discovery 也仍未实现（仍由显式 command 触发）。Scenario store（§4.10）已在 backend/bridge 落地，但 Workspace 尚未调用它。
+
+### 4.10 Scenario 原子持久化 store（backend + bridge）
+
+`src-tauri/src/scenario_store.rs` 只负责把用户命名的 Scenario 存成 app data dir 下的一个 JSON 文件，与 HID/DynamicService/托盘/HTTP 完全无关：
+
+- 文件：固定文件名 `scenarios.json`，磁盘 schema `{"schema_version":1,"scenarios":[...]}`；每个 scenario 为 `id`、`name`、`text`、`ttl_seconds`、`keep_after_execute`、`target_device`、`target_object`（磁盘严格 snake_case）；Tauri JSON DTO 是独立 camelCase 类型（`schemaVersion`/`ttlSeconds`/`keepAfterExecute`/`targetDevice`/`targetObject`，后三者可为 `null`），由显式 `From` 转换，两种格式不共用一个 serde struct；
+- 持久化模型与 UI-only 的 `src/types/scenario.ts` 分离：`draft`/`saved`/`isNew` 和 React key 不落盘；`targetDevice`/`targetObject` 是 nullable opaque string（设备 alias 或 object id），绝不写 HID path、serial 或 in-process candidate id；
+- 缺文件（含目录尚不存在）返回空 schema v1；缺少必需 `scenarios` 字段视为 `scenario_store_corrupt`；写入时按需创建 app data dir；
+- 错误均为 sanitized：`scenario_store_corrupt`（JSON 损坏、缺少 `scenarios` 字段或 schema 版本不支持）、`scenario_store_invalid`（重复/空 id、空或超长 name、非法字符集或超长正文、TTL 越界、场景数过多）、`scenario_store_write_failed`、`scenario_store_unavailable`（读取时的权限/其他 I/O 失败）；错误 message、日志和 DTO 不含 path、OS 原文或正文，读取损坏文件不修改原文件；
+- 写入前验证整个 payload，不静默修正、截断或跳过用户场景；先写同目录临时文件并 flush/sync，再原子替换，失败时清理临时文件（Windows rename-over-existing 走显式 fallback，不会无条件先删原文件）；`save_to_path` 全流程持有进程内写锁，并发 save 串行执行，固定名临时文件不会被并发覆盖；
+- command：`load_scenarios`（无参数）、`save_scenarios`（参数名 `document`），二者都通过 `tauri::async_runtime::spawn_blocking` 执行文件 I/O，不阻塞 Tauri 主线程，也不占用 HID worker；只用 Rust 标准库文件 API，不需要 fs plugin 权限或 capabilities 变更；
+- `bridge.ts` 提供 `SCENARIO_STORE_SCHEMA_VERSION`、`PersistedScenario`、`ScenarioStore`、`loadScenarios()`、`saveScenarios()`（参数按 camelCase 传 `document`）；
+- 安全边界：正文是用户明确选择保存的非 secret 明文，只出现在该文件；写入时会提示不要保存 secret；不使用 `localStorage`、Tauri store plugin 或普通配置文件；
+- 仍未接入：`src/features/dynamic/` Workspace 仍然只用 in-memory preview fixture（§4.7），不调用这两个 command，因此刷新仍丢失草稿。
 
 ## 5. 后端与前端边界
 
@@ -204,7 +218,8 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 6. Dynamic Macro v2 多槽位 capability（slot-aware capability/upload/clear、512-byte object、逐槽 clear）、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix；
 7. Dynamic Workspace page-level UI-only 阶段（Scenario 列表/编辑器、capability-driven target 行、18 个 preview 状态、in-memory only）；真实 dynamic 操作仍走旧 modal；
 8. 托盘基础（Tauri 2 tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复）和菜单文本多语言（`en` / `zh-CN` 两套 labels，`set_tray_locale` 跟随 UI locale，Rust 只接受这两个精确 tag）；设备/Dynamic/Scenario 状态行和 Dynamic 操作项为 disabled preview 占位，不接 DynamicService；
-9. DynamicService 状态层和 DTO（`src-tauri/src/dynamic_service.rs`、`get_dynamic_state` command、`bridge.ts` 类型 wrapper、generation 与单一 HID writer 边界，见 §4.9）；UI Workspace 真实数据、Scenario store、托盘真实状态和 HTTP API 仍未接入，后续阶段见 `docs/DYNAMIC-AUTOMATION-PLAN.md` §12。
+9. DynamicService 状态层和 DTO（`src-tauri/src/dynamic_service.rs`、`get_dynamic_state` command、`bridge.ts` 类型 wrapper、generation 与单一 HID writer 边界，见 §4.9）；UI Workspace 真实数据、托盘真实状态和 HTTP API 仍未接入，后续阶段见 `docs/DYNAMIC-AUTOMATION-PLAN.md` §12；
+10. Scenario store（`src-tauri/src/scenario_store.rs`、`load_scenarios` / `save_scenarios` command、`bridge.ts` 的 `PersistedScenario`/`ScenarioStore` wrapper，见 §4.10）；文件 schema、原子写和损坏可恢复行为已实现，但 UI Workspace 仍只用 in-memory fixture，尚未调用 store；本阶段未改变任何 dynamic upload/clear 路径或 UI 数据源。
 
 所有阶段均只支持 v2，不提供 Legacy v1 管理。MagicPatterns 是唯一视觉基准；仅在真实功能、v2 协议、安全约束或 Tauri 平台行为冲突时适配，并记录冲突原因。
 
@@ -213,7 +228,7 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 自动验证至少包括：
 
 - `npm run build`；
-- `npm test`（前端 dynamic object 状态模型、Dynamic service DTO contract（`tests/dynamic-service-state.test.ts`）和 page-level scenario model，含 `tests/scenario-model.test.ts` 的 target/scenario 解析、阻塞条件和 preview fixture 检查；Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
+- `npm test`（前端 dynamic object 状态模型、Dynamic service DTO contract（`tests/dynamic-service-state.test.ts`）、Scenario store bridge contract（`tests/scenario-store-bridge.test.ts`：schema version、持久化字段集合、无 Tauri host 时不伪造成功）和 page-level scenario model，含 `tests/scenario-model.test.ts` 的 target/scenario 解析、阻塞条件和 preview fixture 检查；Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
 - `cargo fmt --check`、`cargo test`、`cargo clippy --all-targets -- -D warnings`；
 - `npm run tauri build -- --no-bundle`；
 - `git diff --check` 和隐私/secret scan。
@@ -224,6 +239,6 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 
 ## 9. 当前剩余工作与发布边界
 
-阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复、菜单文本跟随 UI locale），本机自动验证已通过（含两套 labels、`preview` 标记和非法 locale 的单元测试），但托盘图标/菜单交互、菜单文本在实际系统上的渲染与切换、close-to-tray、Wayland/X11 和单实例行为仍需在对应平台人工验收；托盘菜单中的设备/Dynamic/Scenario 状态和 Dynamic 操作仍是 preview 占位，需要先完成 DynamicService 的 UI/托盘接入和托盘真实状态阶段。DynamicService 状态层和 `get_dynamic_state` DTO（§4.9）已实现并接入现有 dynamic commands：它只发布本地观察状态（service/object 状态、byte length、本地 generation、可选 TTL/keep），不保存也不返回正文、HID path、serial 或 raw frame；本机 Rust/前端测试覆盖了初始/`unknown`、capability 成功与 `unsupported`/`error`、多 object、upload/clear 成功与失败、过期 generation 和 DTO 字段集合检查。page-level Dynamic Workspace、Scenario store、托盘真实状态和 HTTP API 仍未接入，动态功能仍只用 fake-HID/单元测试验证。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
+阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复、菜单文本跟随 UI locale），本机自动验证已通过（含两套 labels、`preview` 标记和非法 locale 的单元测试），但托盘图标/菜单交互、菜单文本在实际系统上的渲染与切换、close-to-tray、Wayland/X11 和单实例行为仍需在对应平台人工验收；托盘菜单中的设备/Dynamic/Scenario 状态和 Dynamic 操作仍是 preview 占位，需要先完成 DynamicService 的 UI/托盘接入和托盘真实状态阶段。DynamicService 状态层和 `get_dynamic_state` DTO（§4.9）已实现并接入现有 dynamic commands：它只发布本地观察状态（service/object 状态、byte length、本地 generation、可选 TTL/keep），不保存也不返回正文、HID path、serial 或 raw frame；本机 Rust/前端测试覆盖了初始/`unknown`、capability 成功与 `unsupported`/`error`、多 object、upload/clear 成功与失败、过期 generation 和 DTO 字段集合检查。Scenario store（`scenario_store.rs`、`load_scenarios`/`save_scenarios`、`bridge.ts` wrapper）已实现并通过本机 Rust/前端测试：缺文件返回空 schema v1、round trip、schema 版本拒绝、损坏 JSON 保留原文件、重复/空 id、name/字符集/TTL/count 校验、原子替换与临时文件清理、Windows 备份替换路径，以及无 Tauri host 时前端不伪造成功；这些测试只断言结构、长度和错误码，不输出正文，也未连接真实硬件。page-level Dynamic Workspace 尚未调用该 store，托盘真实状态和 HTTP API 仍未接入，动态功能仍只用 fake-HID/单元测试验证。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
 
 后续维护必须继续遵守 v2-only 边界，不得恢复 Legacy v1 管理或把密码、K、正文、HID path、serial、raw report 写入持久化、日志和诊断。

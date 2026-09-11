@@ -5,6 +5,7 @@ pub mod dynamic_service;
 pub mod error;
 pub mod hid;
 pub mod protocol;
+pub mod scenario_store;
 pub mod tray;
 
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,8 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::set_tray_locale,
+            scenario_store::load_scenarios,
+            scenario_store::save_scenarios,
         ])
         .setup(|app| {
             tray::init(app)?;

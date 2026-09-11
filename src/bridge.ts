@@ -241,3 +241,52 @@ export function setSettings(timeoutMs: number, retries: number): Promise<ClientS
 export function setTrayLocale(locale: Locale): Promise<void> {
   return invoke("set_tray_locale", { locale });
 }
+
+/** Only supported on-disk Scenario store version. */
+export const SCENARIO_STORE_SCHEMA_VERSION = 1;
+
+/**
+ * One scenario as stored on disk.
+ *
+ * This is not the UI presentation model (`src/types/scenario.ts`): drafts,
+ * `isNew` and React keys never reach the file, and `target_device` /
+ * `target_object` are opaque ids or aliases the user already bound — never a
+ * HID path, serial number or in-process candidate id. `text` is non-secret
+ * plain text the user explicitly chose to save.
+ */
+export type PersistedScenario = {
+  id: string;
+  name: string;
+  text: string;
+  /** `null` keeps the device default TTL. */
+  ttlSeconds: number | null;
+  keepAfterExecute: boolean;
+  targetDevice: string | null;
+  targetObject: string | null;
+};
+
+/** Complete stored document; `schemaVersion` must be 1. */
+export type ScenarioStore = {
+  schemaVersion: number;
+  scenarios: PersistedScenario[];
+};
+
+/**
+ * Read the persisted scenarios. A missing file resolves to an empty v1 store.
+ *
+ * Corruption or an unsupported schema version rejects with a sanitized
+ * `scenario_store_corrupt` error; the stored file is never modified by a read.
+ */
+export function loadScenarios(): Promise<ScenarioStore> {
+  return invoke<ScenarioStore>("load_scenarios");
+}
+
+/**
+ * Atomically replace the persisted scenarios and return the saved document.
+ *
+ * The backend validates the complete payload before writing and rejects
+ * unknown schema versions, so callers must not attempt repairs or truncation.
+ */
+export function saveScenarios(store: ScenarioStore): Promise<ScenarioStore> {
+  return invoke<ScenarioStore>("save_scenarios", { document: store });
+}
