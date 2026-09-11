@@ -35,6 +35,7 @@ pbkdf2 = "0.12.2"
 sha2 = "0.10.9"
 unicode-normalization = "0.1.25"
 zeroize = "1.9"
+tauri-plugin-autostart = "2.5.1"
 
 # Keep the Linux backend explicit so HID Usage metadata remains available for
 # safe Runtime Macro HID discovery without assuming a particular HID instance.

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod autostart;
 pub mod client;
 pub mod commands;
 pub mod dynamic_service;
@@ -15,9 +16,17 @@ pub fn run() {
     tauri::Builder::default()
         // A second launch restores the existing window instead of starting a
         // second instance, including when the window is hidden in the tray.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A login-autostart launch must not raise the window either: logging
+            // in starts the app in the tray even when one instance already runs.
+            if autostart::is_autostart_launch(argv) {
+                return;
+            }
             tray::show_main_window(app);
         }))
+        // Official autostart plugin: it owns the platform login entry, and this
+        // app only reads or changes it on an explicit user action in Settings.
+        .plugin(autostart::plugin())
         .manage(Arc::new(Mutex::new(commands::AppState::default())))
         .invoke_handler(tauri::generate_handler![
             commands::list_devices,
@@ -45,6 +54,14 @@ pub fn run() {
         ])
         .setup(|app| {
             tray::init(app)?;
+            // The main window is created hidden so a login-autostart launch
+            // cannot flash it. An autostart launch stays in the tray; every other
+            // launch shows and focuses the window immediately. Neither path
+            // connects to a device, runs a capability discovery or touches a
+            // Dynamic object, so `DynamicService` still starts in `unknown`.
+            if !autostart::is_autostart_launch(std::env::args()) {
+                tray::show_main_window(app.handle());
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

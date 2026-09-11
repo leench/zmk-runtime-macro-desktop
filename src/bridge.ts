@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  disable as disableAutostartEntry,
+  enable as enableAutostartEntry,
+  isEnabled as readAutostartEntry,
+} from "@tauri-apps/plugin-autostart";
 
 import type { Locale } from "./i18n";
 
@@ -235,6 +240,85 @@ export function getSettings(): Promise<ClientSettings> {
 
 export function setSettings(timeoutMs: number, retries: number): Promise<ClientSettings> {
   return invoke<ClientSettings>("set_settings", { timeoutMs, retries });
+}
+
+function inTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/**
+ * Login autostart, provided by the official Tauri autostart plugin.
+ *
+ * The plugin owns the platform entry (a Linux autostart entry, a macOS launch
+ * agent, a Windows registry value) and passes exactly one startup flag, which
+ * carries no password, macro text or device identifier. The app never registers
+ * the entry on its own: the wrappers below are only reached from the explicit
+ * toggle in the settings modal.
+ */
+
+/** Stable code: this host has no autostart surface at all. */
+export const AUTOSTART_UNAVAILABLE = "autostart_unavailable";
+/** Stable code: the operating system rejected the read or the change. */
+export const AUTOSTART_FAILED = "autostart_failed";
+
+/**
+ * Whether this host can read and change the login-autostart entry.
+ *
+ * A browser preview has no operating system entry to read, so the settings row
+ * reports it as unavailable instead of inventing a state.
+ */
+export function autostartAvailable(): boolean {
+  return inTauri();
+}
+
+/**
+ * Sanitized failure envelopes.
+ *
+ * The plugin reports operating-system text. It never reaches the UI: callers
+ * only receive a stable code they can translate.
+ */
+function autostartUnavailableError(): CommandError {
+  return {
+    code: AUTOSTART_UNAVAILABLE,
+    message: "Login autostart is only available in the desktop application.",
+  };
+}
+
+function autostartFailedError(): CommandError {
+  return {
+    code: AUTOSTART_FAILED,
+    message: "The login autostart setting could not be changed.",
+  };
+}
+
+/** Read the real operating-system autostart state. */
+export async function getAutostartEnabled(): Promise<boolean> {
+  if (!autostartAvailable()) throw autostartUnavailableError();
+  try {
+    return await readAutostartEntry();
+  } catch {
+    throw autostartFailedError();
+  }
+}
+
+/** No login-autostart entry exists until the user asks for one. */
+export async function enableAutostart(): Promise<void> {
+  if (!autostartAvailable()) throw autostartUnavailableError();
+  try {
+    await enableAutostartEntry();
+  } catch {
+    throw autostartFailedError();
+  }
+}
+
+/** Remove the login-autostart entry the user asked for earlier. */
+export async function disableAutostart(): Promise<void> {
+  if (!autostartAvailable()) throw autostartUnavailableError();
+  try {
+    await disableAutostartEntry();
+  } catch {
+    throw autostartFailedError();
+  }
 }
 
 /**

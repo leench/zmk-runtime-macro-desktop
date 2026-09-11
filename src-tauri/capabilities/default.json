@@ -4,6 +4,7 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
+    "autostart:default",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:webview:allow-set-webview-zoom",

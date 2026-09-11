@@ -5,10 +5,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   asCommandError,
   authenticate,
+  autostartAvailable,
   clearSlot as clearSlotCommand,
   clearDynamic as clearDynamicCommand,
   connectDevice as connectDeviceCommand,
+  disableAutostart,
   disconnectDevice as disconnectDeviceCommand,
+  enableAutostart,
+  getAutostartEnabled,
   getConnection,
   getDynamicCapabilities,
   getDynamicState,
@@ -87,6 +91,15 @@ import {
   type DeviceAliasError,
   type DeviceAliasStore,
 } from "./utils/device-alias";
+import {
+  AUTOSTART_LOADING_VIEW,
+  AUTOSTART_UNSUPPORTED_VIEW,
+  autostartPendingView,
+  autostartResultView,
+  autostartStatusKind,
+  autostartToggleEnabled,
+  type AutostartView,
+} from "./utils/autostart";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -400,6 +413,10 @@ function App() {
   const [deviceAliases, setDeviceAliases] = useState<DeviceAliasStore>(() => readDeviceAliasStore());
   const [aliasDraft, setAliasDraft] = useState("");
   const [aliasError, setAliasError] = useState<DeviceAliasError | null>(null);
+  // Login autostart is an operating-system entry the official plugin owns. The
+  // row is read when the settings modal opens and only ever shows a confirmed
+  // state, so it can never drift from the real entry.
+  const [autostart, setAutostart] = useState<AutostartView>(() => autostartAvailable() ? AUTOSTART_LOADING_VIEW : AUTOSTART_UNSUPPORTED_VIEW);
 
   // The alias is looked up by exact summary key, so another device (or the same
   // device on a different interface/usage) never inherits it.
@@ -421,6 +438,10 @@ function App() {
   const authRefreshInFlightRef = useRef(false);
   const busyRef = useRef(false);
   const autoReconnectEnabledRef = useRef(false);
+  // Login autostart reads its newest state through refs, so a rapid double click
+  // can never start two operating-system writes.
+  const autostartRef = useRef(autostart);
+  const autostartWriteRef = useRef(false);
   const autoReconnectInFlightRef = useRef(false);
   const missingDevicePollsRef = useRef(0);
   const slotsRef = useRef<SlotState[]>(slots);
@@ -432,6 +453,7 @@ function App() {
   dirtyRef.current = slots.some(isDirty);
   busyRef.current = busy;
   slotsRef.current = slots;
+  autostartRef.current = autostart;
 
   const recordOperation = useCallback((name: string) => setLastOperation(name), []);
 
@@ -1530,6 +1552,53 @@ function App() {
     }
   }, [applyErrorState, busy, cancelPreviewLoads, clearAuthDeadline, commandError, enqueueProtocolOperation, hideRevealed, recordOperation]);
 
+  /**
+   * Read the real operating-system autostart state.
+   *
+   * Called when the settings modal opens. A failed read keeps the row unknown and
+   * reports the sanitized error, so the toggle never shows a state the operating
+   * system did not report.
+   */
+  const refreshAutostart = useCallback(async () => {
+    if (!autostartAvailable()) {
+      setAutostart(AUTOSTART_UNSUPPORTED_VIEW);
+      return;
+    }
+    setAutostart((current) => autostartPendingView(current));
+    try {
+      const enabled = await getAutostartEnabled();
+      if (mounted.current) setAutostart((current) => autostartResultView(current, { ok: true, enabled }));
+    } catch (caught) {
+      const error = asCommandError(caught);
+      if (mounted.current) setAutostart((current) => autostartResultView(current, { ok: false, error }));
+    }
+  }, []);
+
+  /**
+   * Turn the login-autostart entry on or off.
+   *
+   * The plugin writes the operating-system entry and the row then re-reads it, so
+   * the shown state is always the confirmed one. A failure keeps the previous
+   * state and reports the sanitized error; the other settings are untouched and
+   * stay draft-only until Save.
+   */
+  const toggleAutostart = useCallback(async (next: boolean) => {
+    if (autostartWriteRef.current || !autostartToggleEnabled(autostartRef.current)) return;
+    autostartWriteRef.current = true;
+    setAutostart((current) => autostartPendingView(current));
+    try {
+      if (next) await enableAutostart();
+      else await disableAutostart();
+      const enabled = await getAutostartEnabled();
+      if (mounted.current) setAutostart((current) => autostartResultView(current, { ok: true, enabled }));
+    } catch (caught) {
+      const error = asCommandError(caught);
+      if (mounted.current) setAutostart((current) => autostartResultView(current, { ok: false, error }));
+    } finally {
+      autostartWriteRef.current = false;
+    }
+  }, []);
+
   const saveSettings = useCallback(async () => {
     if (!Number.isInteger(settingsDraft.timeoutMs) || settingsDraft.timeoutMs < MIN_TIMEOUT_MS || settingsDraft.timeoutMs > MAX_TIMEOUT_MS) {
       setSettingsError("timeout");
@@ -1588,7 +1657,8 @@ function App() {
   }, []);
 
   // The workbench header and the device select page open the same preferences
-  // modal, both seeded with the current saved values.
+  // modal, both seeded with the current saved values. Opening it also reads the
+  // real operating-system autostart state, so the row never shows a cached one.
   const openSettings = useCallback(() => {
     setSettingsDraft(settings);
     setPageZoomDraft(pageZoomPercent);
@@ -1599,7 +1669,8 @@ function App() {
     setAliasError(null);
     setSettingsError(null);
     setSettingsOpen(true);
-  }, [currentDeviceAlias, pageZoomPercent, privacySettings, settings]);
+    void refreshAutostart();
+  }, [currentDeviceAlias, pageZoomPercent, privacySettings, refreshAutostart, settings]);
 
   const updateLanguage = useCallback((next: LanguagePreference) => {
     if (!isLanguagePreference(next)) return;
@@ -1775,6 +1846,17 @@ function App() {
   const translatedError = errorCode ? translateCommandError(errorCode, locale) : null;
   const selectedInputError = inputError ? translateInputError(inputError, locale) : null;
   const settingsErrorMessage = settingsError ? typeof settingsError === "string" ? translateSettingsValidation(settingsError, locale, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_RETRIES) : translateCommandError(settingsError.code, locale) : null;
+  // Only ever the state the operating system confirmed: an unread or rejected
+  // state stays "unknown" instead of pretending the entry is off.
+  const autostartStatus = autostartStatusKind(autostart);
+  const autostartStatusLabel = autostartStatus === "unavailable"
+    ? copy.autostartUnavailable
+    : autostartStatus === "enabled"
+      ? copy.autostartEnabled
+      : autostartStatus === "disabled"
+        ? copy.autostartDisabled
+        : copy.autostartUnknown;
+  const autostartErrorMessage = autostart.error ? translateCommandError(autostart.error.code, locale) : null;
   const statusLabel = checking ? copy.statusChecking : connection.authState === "authenticated" ? copy.statusAuthenticated : copy.statusConnected;
 
   return (
@@ -2014,6 +2096,25 @@ function App() {
                     {aliasError === "tooLong" ? copy.deviceAliasTooLong(MAX_DEVICE_ALIAS_BYTES) : aliasError === "controlCharacter" ? copy.deviceAliasInvalid : copy.deviceAliasDuplicate}
                   </p>
                 ) : null}
+              </div>
+              <div className="border-t border-line pt-5">
+                <label className="flex items-start justify-between gap-4">
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-ink">{copy.autostart}</span>
+                    <small id="autostart-help" className="mt-1.5 block text-xs leading-relaxed text-ink-subtle">{copy.autostartHelp}</small>
+                  </span>
+                  <input
+                    id="autostart-setting"
+                    type="checkbox"
+                    checked={autostart.enabled === true}
+                    disabled={!autostartToggleEnabled(autostart)}
+                    aria-describedby="autostart-help autostart-status"
+                    onChange={(event) => { void toggleAutostart(event.target.checked); }}
+                    className="mt-1 h-4 w-4 shrink-0 accent-accent disabled:cursor-not-allowed disabled:opacity-40"
+                  />
+                </label>
+                <p id="autostart-status" className={`mt-2 text-xs ${autostartStatus === "unavailable" ? "text-ink-subtle" : "text-ink-muted"}`} role="status" aria-live="polite">{autostartStatusLabel}</p>
+                {autostartErrorMessage ? <p className="mt-1.5 flex items-center gap-1.5 text-sm text-danger" role="alert"><AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />{autostartErrorMessage}</p> : null}
               </div>
               <div className="border-t border-line pt-5">
                 <PreviewSettingStepper

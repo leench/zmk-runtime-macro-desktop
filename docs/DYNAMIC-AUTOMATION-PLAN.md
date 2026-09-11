@@ -17,7 +17,7 @@
 1. **Dynamic Protocol v2 backend、bridge/multislot model 和 presentation-first Dynamic Workspace 均已完成。** Rust protocol/client/commands 已按 v2 多槽位实现（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；`src/bridge.ts` 与 `src/types/dynamic.ts` 已提供 slot-aware dynamic command 和 per-object 状态模型；`src/features/dynamic/` 的页面级 Dynamic Workspace 已完成（Scenario 列表/编辑器、capability-driven target 行、状态矩阵和确认对话框），其中 DeviceSelect 入口仍用 in-memory fixture，connected Workbench 入口已接入真实 command，但**仍待人工视觉验收**。
 2. Dynamic Workspace 保留 presentation-first 的 Preview 路径：DeviceSelect 入口用 in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API；connected Workbench 入口则已接入真实 capability/service/store（见 §12 阶段 5），旧 `DynamicMacroModal`/`DynamicMacroPanel` 作为 fallback 保留到视觉验收通过。
 3. **托盘基础已实现并已接入真实状态/操作**（`src-tauri/src/tray.rs`、`src-tauri/src/lib.rs`、`src/App.tsx`、`src/features/dynamic/DynamicWorkspace.tsx`）：Tauri 2 tray icon 和原生菜单、打开/隐藏/明确退出、close-to-tray、单实例窗口恢复；菜单的设备/Dynamic/Scenario 状态行显示连接与本地观察状态（状态行始终 disabled，仅信息展示），`Choose scenario` / `Upload current scenario` / `Clear Dynamic Object` 由受限 runtime context 控制 enabled，并通过稳定全局 event `tray-action` 交给已连接窗口执行；菜单文本有 `en` / `zh-CN` 两套 labels，由受限 `set_tray_locale` 与 `set_tray_runtime_state` command 更新（Rust 只接受这两个精确 locale tag 与精确 status tag，不自行推断语言、不接受任意文本）。平台专属托盘行为仍需在对应平台人工验收。
-4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、场景持久化、设备 alias、自启、本地 HTTP API 和自动场景；DynamicService、UI 接入真实 HID、Scenario store、设备 alias 和托盘状态/操作已完成（托盘操作仍通过 frontend bridge，不绕过 DynamicService；alias 只是本机展示名，不写入设备）。
+4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、场景持久化、设备 alias、自启、本地 HTTP API 和自动场景；DynamicService、UI 接入真实 HID、Scenario store、设备 alias、托盘状态/操作和登录自启已完成（托盘操作仍通过 frontend bridge，不绕过 DynamicService；alias 只是本机展示名，不写入设备；自启用官方 autostart plugin，启动开关不携带任何凭据/正文/设备信息）。
 5. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
 6. 上面已完成的 v2 多槽位 backend 和 bridge 是后续接入基线，不从零重写，也不降级回单槽 v1。
 
@@ -148,7 +148,7 @@ src/App.tsx
 
 这些基础能力已实现（§4.2 列出真实行为与托盘状态/操作的边界）；托盘图标和菜单在 GNOME/KDE、Wayland/X11、Windows 和 macOS 上的实际表现仍需要对应平台人工验收。
 
-登录自启不属于第一阶段托盘基础，放在真实 DynamicService 和手动闭环稳定之后实现。
+登录自启不属于第一阶段托盘基础，放在真实 DynamicService 和手动闭环稳定之后实现；现已落地（见 §12 阶段 8：官方 plugin、固定 `--autostart` 开关、主窗口 `visible: false`、默认关闭）。
 
 ### 4.2 托盘菜单的真实状态与操作
 
@@ -177,7 +177,7 @@ Dynamic 状态         本地观察状态（unknown/ready/error/…）
 - **输入边界**：`set_tray_runtime_state` 是唯一的运行状态输入，它的单个参数 `runtime` 只接受 `deviceConnected`、`dynamicStatus`、`currentScenarioName`（可空、≤ 64 bytes、不含控制字符的显示文本）、`deviceAlias`（可空、≤ 64 bytes、不含控制字符的本地 alias）、`canChooseScenario`、`canUploadScenario`、`canClearDynamic`；非法 status tag 返回 `unsupported_tray_status`，非法名称返回 `invalid_tray_scenario_name`，非法 alias 返回 `invalid_tray_alias`，错误信息不回显被拒值。Rust 端再把三个 action flag 与 `deviceConnected` 取交集，并在断连时丢弃 alias，因此断连时永远不会 offer 设备操作、也不会残留上一台设备的名称。
 - **event payload**：`tray-action` 只携带三个稳定 action 之一（`chooseScenario` / `uploadScenario` / `clearDynamic`），不含正文、path、serial 或设备标识；未连接或未监听的窗口不会自行执行任何操作。
 - **菜单文本跟随 UI locale**：菜单标签集中为 `en` 与 `zh-CN` 两套（不进入前端 UI locale 文件，菜单本身归 Rust 持有）；`set_tray_locale` 命令只接受精确的 `"en"` / `"zh-CN"`，其他值返回 `unsupported_locale`；语言始终来自前端 `resolveLocale` 的结果，Rust 不读环境变量、存储偏好或设备信息来猜语言；`App.tsx` 在启动和 locale 变化时同步，无需重启，失败静默处理；locale 切换不重置 runtime context。
-- 仍未实现：autostart、托盘直接读写设备（不在计划中）和 HTTP API；真实硬件与跨平台托盘人工验收仍待完成。
+- 仍未实现：托盘直接读写设备（不在计划中）和 HTTP API；登录自启已实现（§12 阶段 8：官方 plugin + 固定 `--autostart` 开关 + 主窗口 `visible: false`，默认关闭）；真实硬件与跨平台托盘/自启人工验收仍待完成。
 
 ## 5. Presentation-first UI 阶段
 
@@ -425,7 +425,7 @@ src-tauri/src/
 ├── dynamic_service.rs   # 已落地：状态层、generation、observed state、唯一 DTO
 ├── scenario.rs          # 后续 Scenario 模型和原子持久化
 ├── tray.rs              # tray/window lifecycle 和真实状态菜单
-├── autostart.rs         # 后续 login autostart
+├── autostart.rs         # 已落地：官方 autostart plugin 注册 + --autostart 启动语义
 ├── api.rs               # 后续 loopback HTTP API
 ├── credentials.rs       # 后续 API token OS credential storage
 ├── commands.rs          # Tauri bridge
@@ -674,6 +674,17 @@ UI 视觉验收通过后：
 - 设置页显示实际 OS 注册状态；
 - 启动后 dynamic observed state 先为 `Unknown`，不得假设上次 Dynamic 仍存在。
 
+**已完成（阶段 8）：** 使用官方 `tauri-plugin-autostart`（Rust）+ `@tauri-apps/plugin-autostart`（前端），不自建 OS service/manager，也不写自有启动项文件或注册表。
+
+- 启动参数：`src-tauri/src/autostart.rs` 的 `AUTOSTART_ARG = "--autostart"` 是登录项携带的唯一个参数（裸开关，无 `=`、无空白分割），不可能携带密码、K、正文、serial、HID path 或设备标识；`is_autostart_launch` 只接受精确匹配，`--autostart=1` / `--autostart-extra` / `--AUTOSTART` 一律当作普通启动；
+- 窗口语义：`tauri.conf.json` 主窗口 `visible: false`（配置声明的可见窗口在 `setup` 前就已显示，必然闪窗），`lib.rs` 的 `setup` 先 `tray::init`，然后只在非 autostart 启动时 `tray::show_main_window`（show + unminimize + set_focus）；自启启动保持隐藏但托盘正常；
+- 单实例：single-instance callback 同样检查 argv；普通二次启动恢复窗口，自启二次启动不抬前台；
+- 无自动设备行为：自启不自动连接设备、不发 `AUTH_INFO`、不执行 capability discovery、不读写 Dynamic（`AppState` 的 `DynamicService` 初始即 `unknown`，启动路径只做一次设备枚举供隐形的设备列表使用），也不自动打开 Settings；自启不是新的工作线程或队列；
+- 真实 OS 状态：`bridge.ts` 提供 `autostartAvailable()` / `getAutostartEnabled()` / `enableAutostart()` / `disableAutostart()`，Settings 在打开时读取 `is_enabled`；切开关时先写入再重新读取确认，只有确认成功才更新显示，失败保留旧状态并显示 sanitized 错误（`autostart_unavailable` / `autostart_failed`，不回显 OS 原文）；读写中或状态未知时 toggle 禁用，双击不会并发写；不使用 `localStorage` 另存一份开关；
+- 权限：`capabilities/default.json` 只新增 `autostart:default`（等价 `allow-enable` / `allow-disable` / `allow-is-enabled`），窗口仍只有 `main`，不恢复 `core:default`；
+- 本机验证：`tests/autostart.test.ts`（命令名 `plugin:autostart|is_enabled` / `|enable` / `|disable`、三者参数为空、无 Tauri host 时不伪造状态或成功、插件失败 sanitized、行状态只显示 OS 确认值、失败保留旧状态、toggle 禁用条件、中英文错误文案存在）与 `src-tauri/src/autostart.rs` 的配置/启动契约测试（精确参数、裸开关、主窗口 `visible: false`、权限范围、bundle 平台列表）；
+- **仍待人工验收：** 真实登录项的写入/删除、自启启动不闪窗、普通启动仍显示并 focus、自启后托盘可用、单实例与自启组合，都必须在 Linux（GNOME/KDE、Wayland/X11）、Windows 和 macOS 上人工验收；本机只验证了配置、参数解析、命令契约和状态机，没有真的注册过登录项。
+
 **手动闭环验收点 B：**
 
 - 主窗口和托盘可打开、隐藏和明确退出；
@@ -747,7 +758,7 @@ v2 多 object capability/protocol contract 已经发布并实现：Rust backend 
 | PR-08 | UI bridge 接入真实 DynamicService/HID | PR-07 | 真实 capability/upload/clear；无 readback |
 | PR-09 | 当前 active device alias | PR-08 | alias 不暴露 serial/path；多候选不自动选择（已实现：安全摘要 key 绑定 + 本地唯一 + Scenario 显式绑定，见阶段 6） |
 | PR-10 | 托盘菜单接入真实 Scenario/service 状态 | PR-09 | 主窗口和 tray 共用 service；手动闭环准备（已实现：状态行 + 三个 action 经 `tray-action` event 交给窗口，设备行显示 alias，见阶段 6/7） |
-| PR-11 | Login autostart 和后台启动参数 | PR-10 | 默认关闭；普通启动和自启入口区分 |
+| PR-11 | Login autostart 和后台启动参数 | PR-10 | 默认关闭；普通启动和自启入口区分（已实现：官方 plugin + `--autostart` + `visible: false`，见阶段 8） |
 | **Gate B** | **首期手动闭环验收** | PR-11 | **真实 tray、autostart、Scenario、HID 和 static/auth 无回归** |
 | **Gate C** | **HTTP API 前验收** | Gate B | **确认 UI/tray/service/store/alias 已稳定，再决定是否开始 HTTP API** |
 | PR-12 | HTTP lifecycle、loopback、token credential、health、metadata | Gate C | API 默认关闭；token 不进普通配置/日志 |
@@ -765,6 +776,8 @@ v2 多 object capability/protocol contract 已经发布并实现：Rust backend 
 
 ```text
 npm ci
+npm test
+npx tsc --noEmit
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo test --locked --manifest-path src-tauri/Cargo.toml
@@ -772,6 +785,8 @@ cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D w
 npm run tauri build -- --no-bundle
 git diff --check
 ```
+
+配置/启动契约（`src-tauri/src/autostart.rs` 的测试）在 `cargo test` 中一并执行，并直接读 `tauri.conf.json` / `capabilities/default.json` 断言：主窗口 `visible: false`、权限只多出 `autostart:default`、bundle 仍是桌面平台列表。
 
 UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗口/截图/人工交互验收。若本机环境缺少特定平台依赖，应记录原因并在对应 runner 补充验证，而不是把“当前主机不可验证”写成项目限制。
 
@@ -800,6 +815,7 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 - mock/正式 object collection 和目标选择；
 - capability change、keep unsupported、oversize 和 target missing；
 - dynamic auth status 不触发 static login；
+- login autostart：启动开关只有精确 `--autostart`（近似值不得隐藏窗口）、主窗口保持 `visible: false` 而由 `setup` 按启动模式显示、自启不自动连接/不发 `AUTH_INFO`/不执行 capability discovery/不读写 Dynamic、toggle 只显示 OS 确认状态、无 Tauri host 时不伪造状态或成功、权限只多出 `autostart:default`；
 - API token、密码、Dynamic 正文、serial、HID path 和 raw frame 不进入日志、诊断、CI artifacts 或错误返回；
 - static slot/auth、隐私预览和既有 MagicPatterns UI 无回归。
 
@@ -815,7 +831,8 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 - 浏览器 URL、IDE project、Git branch 等复杂上下文的内置识别；
 - gRPC、消息队列、云端同步；
 - 不根据 desktop 假设猜测 object 编号、数量、容量、TTL 或 wire contract，一律以 `CAPABILITIES` 为准；
-- 在 UI-only 阶段调用 HID、写 localStorage、Scenario 持久化或接 HTTP API。
+- 在 UI-only 阶段调用 HID、写 localStorage、Scenario 持久化或接 HTTP API；
+- 自建 autostart OS service/manager、自写启动项文件或注册表，或用启动参数携带凭据、正文、设备标识（一律交给官方 autostart plugin 和单一裸开关）。
 
 ## 16. 完成定义
 

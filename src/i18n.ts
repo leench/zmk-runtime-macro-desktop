@@ -180,6 +180,12 @@ export type MessageTable = {
   deviceAliasTooLong: (max: number) => string;
   deviceAliasInvalid: string;
   deviceAliasDuplicate: string;
+  autostart: string;
+  autostartHelp: string;
+  autostartEnabled: string;
+  autostartDisabled: string;
+  autostartUnavailable: string;
+  autostartUnknown: string;
   previewCharacterCount: string;
   previewCharacterCountHelp: string;
   hoverRevealDelay: string;
@@ -542,6 +548,12 @@ const english: MessageTable = {
   deviceAliasTooLong: (max) => `The alias cannot exceed ${max} bytes.`,
   deviceAliasInvalid: "The alias cannot contain control characters.",
   deviceAliasDuplicate: "Another device already uses this alias. Aliases must be unique.",
+  autostart: "Login autostart",
+  autostartHelp: "Start the app at login and keep it running in the tray. The toggle writes the operating system entry immediately, independently of Save.",
+  autostartEnabled: "Enabled",
+  autostartDisabled: "Disabled",
+  autostartUnavailable: "Only available in the desktop application.",
+  autostartUnknown: "Status unknown",
   previewCharacterCount: "Preview character count",
   previewCharacterCountHelp: "Show up to five leading characters from each loaded slot.",
   hoverRevealDelay: "Hover reveal delay",
@@ -921,6 +933,12 @@ const chinese: MessageTable = {
   deviceAliasTooLong: (max) => `别名不能超过 ${max} bytes。`,
   deviceAliasInvalid: "别名不能包含控制字符。",
   deviceAliasDuplicate: "另一台设备已使用该别名。别名必须唯一。",
+  autostart: "开机自启动",
+  autostartHelp: "登录系统时自动启动应用，并保持在托盘中运行。该开关会立即写入系统启动项，与“保存”无关。",
+  autostartEnabled: "已启用",
+  autostartDisabled: "已关闭",
+  autostartUnavailable: "仅在桌面应用中可用。",
+  autostartUnknown: "状态未知",
   previewCharacterCount: "列表预览字符数",
   previewCharacterCountHelp: "显示每个已加载宏开头的最多五个字符。",
   hoverRevealDelay: "悬停显示延迟",
@@ -1168,6 +1186,8 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     dynamic_empty: english.dynamicTextRequired,
     dynamic_ttl_invalid: english.dynamicTtlInvalid,
     dynamic_keep_unsupported: english.dynamicSingleUseUnsupported,
+    autostart_unavailable: "Login autostart is only available in the desktop application.",
+    autostart_failed: "The login autostart setting could not be changed on this system.",
   },
   "zh-CN": {
     hid_backend_unavailable: "无法初始化 HID 后端。",
@@ -1207,6 +1227,8 @@ const ERROR_MESSAGES: Record<Locale, Record<string, string>> = {
     dynamic_empty: chinese.dynamicTextRequired,
     dynamic_ttl_invalid: chinese.dynamicTtlInvalid,
     dynamic_keep_unsupported: chinese.dynamicSingleUseUnsupported,
+    autostart_unavailable: "开机自启动仅在桌面应用中可用。",
+    autostart_failed: "无法在此系统上修改开机自启动设置。",
   },
 };
 
