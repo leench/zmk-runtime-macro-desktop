@@ -1,4 +1,4 @@
-import type { MouseEvent as ReactMouseEvent } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { Maximize, Minus, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -14,6 +14,8 @@ type TitleBarProps = {
   platform: Platform;
   title: string;
   labels: TitleBarLabels;
+  /** Optional compact control cluster placed left of the window controls. */
+  actions?: ReactNode;
 };
 
 function inTauri(): boolean {
@@ -42,7 +44,7 @@ function toggleMaximizeOnDoubleClick(event: ReactMouseEvent<HTMLElement>): void 
   void getCurrentWindow().toggleMaximize().catch(() => undefined);
 }
 
-export function TitleBar({ platform, title, labels }: TitleBarProps) {
+export function TitleBar({ platform, title, labels, actions }: TitleBarProps) {
   const mac = platform === "macos";
   const controlClass = mac
     ? "h-3.5 w-3.5 rounded-full"
@@ -77,6 +79,15 @@ export function TitleBar({ platform, title, labels }: TitleBarProps) {
     </div>
   );
 
+  // Buttons already opt out of dragging in beginDrag; the wrapper must too so
+  // the gap between them never starts a window drag. Double click stays on the
+  // header, so maximize/restore keeps working everywhere on the bar.
+  const actionGroup = actions ? (
+    <div className="flex items-center" onMouseDown={(event) => event.stopPropagation()}>
+      {actions}
+    </div>
+  ) : null;
+
   return (
     <header
       className={mac ? "flex h-12 shrink-0 items-center border-b border-line bg-surface-2 px-4" : "flex h-12 shrink-0 items-center justify-between border-b border-line bg-surface-2 px-4"}
@@ -88,12 +99,15 @@ export function TitleBar({ platform, title, labels }: TitleBarProps) {
         <>
           {controls}
           <span className="flex-1 text-center text-sm font-semibold text-ink-muted">{title}</span>
-          <span className="w-[74px]" aria-hidden="true" />
+          {actionGroup ? <span className="flex min-w-[74px] items-center justify-end">{actionGroup}</span> : <span className="w-[74px]" aria-hidden="true" />}
         </>
       ) : (
         <>
           <span className="text-sm font-semibold text-ink">{title}</span>
-          {controls}
+          <span className="flex items-center gap-2">
+            {actionGroup}
+            {controls}
+          </span>
         </>
       )}
     </header>

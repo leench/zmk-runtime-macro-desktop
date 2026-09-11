@@ -1,15 +1,22 @@
-import { ArrowRight, Check, FlaskConical, Keyboard, RefreshCw, Usb, Zap } from "lucide-react";
+import { ArrowRight, Check, FlaskConical, Keyboard, Moon, RefreshCw, Settings, Sun, Usb, Zap } from "lucide-react";
 import type { DeviceCandidate } from "../bridge";
 import type { Messages } from "../i18n";
+import { IconButton } from "../components/IconButton";
 import { TitleBar, type Platform } from "../components/TitleBar";
+import type { ThemeMode } from "../types/ui";
 
 function formatHex(value: number): string {
   return value.toString(16).padStart(4, "0");
 }
 
+function systemPrefersDark(): boolean {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
 type DeviceSelectProps = {
   copy: Messages;
   platform: Platform;
+  theme: ThemeMode;
   devices: DeviceCandidate[];
   selectedId: string;
   checking: boolean;
@@ -20,17 +27,30 @@ type DeviceSelectProps = {
   onSelect: (id: string) => void;
   onConnect: () => void;
   onRefresh: () => void;
+  onThemeChange: (theme: ThemeMode) => void;
+  /** Opens the existing preferences modal; no dedicated panel is added here. */
+  onSettings: () => void;
   /** Opens the UI-only Dynamic workspace without a device (preview entry). */
   onDynamicWorkspaceOpen: () => void;
 };
 
-export function DeviceSelect({ copy, platform, devices, selectedId, checking, busy, errorMessage, errorCode, dirtyDraft, onSelect, onConnect, onRefresh, onDynamicWorkspaceOpen }: DeviceSelectProps) {
+export function DeviceSelect({ copy, platform, theme, devices, selectedId, checking, busy, errorMessage, errorCode, dirtyDraft, onSelect, onConnect, onRefresh, onThemeChange, onSettings, onDynamicWorkspaceOpen }: DeviceSelectProps) {
   const selected = devices.some((device) => device.id === selectedId);
   const upgradeError = errorCode === "bad_version";
+  const dark = theme === "dark" || (theme === "system" && systemPrefersDark());
+
+  // Same preference cluster as the workbench header: the shortcut is only
+  // meaningful before a device is connected, so it lives in the title bar.
+  const preferences = (
+    <div role="group" aria-label={copy.preferences} className="flex items-center gap-0.5 rounded-xl border border-line bg-surface p-0.5">
+      <IconButton icon={dark ? Sun : Moon} label={copy.theme} onClick={() => onThemeChange(dark ? "light" : "dark")} grouped size="sm" />
+      <IconButton icon={Settings} label={copy.settings} onClick={onSettings} grouped size="sm" />
+    </div>
+  );
 
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-canvas">
-      <TitleBar platform={platform} title={copy.appName} labels={{ close: copy.close, minimize: copy.minimize, maximize: copy.maximize }} />
+      <TitleBar platform={platform} title={copy.appName} labels={{ close: copy.close, minimize: copy.minimize, maximize: copy.maximize }} actions={preferences} />
       <main className="flex flex-1 items-center justify-center overflow-y-auto px-8 py-10">
         <div className="w-full max-w-[560px]">
           <div className="text-center">

@@ -1377,6 +1377,16 @@ function App() {
     try { localStorage.setItem(THEME_STORAGE_KEY, nextTheme); } catch { /* optional preference */ }
   }, []);
 
+  // The workbench header and the device select page open the same preferences
+  // modal, both seeded with the current saved values.
+  const openSettings = useCallback(() => {
+    setSettingsDraft(settings);
+    setPageZoomDraft(pageZoomPercent);
+    setPrivacyDraft(privacySettings);
+    setSettingsError(null);
+    setSettingsOpen(true);
+  }, [pageZoomPercent, privacySettings, settings]);
+
   const updateLanguage = useCallback((next: LanguagePreference) => {
     if (!isLanguagePreference(next)) return;
     setLanguagePreference(next);
@@ -1526,6 +1536,7 @@ function App() {
         <DeviceSelect
           copy={copy}
           platform={platform}
+          theme={theme}
           devices={devices}
           selectedId={selectedDevice ? selectedDevice.id : selectedId}
           checking={checking}
@@ -1536,6 +1547,8 @@ function App() {
           onSelect={setSelectedId}
           onConnect={() => { if (selectedId) requestDeviceConnect(selectedId); }}
           onRefresh={() => void refreshDevices()}
+          onThemeChange={updateTheme}
+          onSettings={openSettings}
           onDynamicWorkspaceOpen={() => setDynamicWorkspaceOpen(true)}
         />
       ) : null}
@@ -1594,7 +1607,7 @@ function App() {
           onThemeChange={updateTheme}
           onRefresh={() => void refreshSlots()}
           onRefreshDevices={() => void refreshDevices()}
-          onSettings={() => { setSettingsDraft(settings); setPageZoomDraft(pageZoomPercent); setPrivacyDraft(privacySettings); setSettingsError(null); setSettingsOpen(true); }}
+          onSettings={openSettings}
           onDiagnostics={() => setDiagnosticsOpen((value) => !value)}
           onSetPassword={() => { setPasswordModalMode("setup"); setErrorCode(null); }}
           onChangePassword={() => { setPasswordModalMode("change"); setErrorCode(null); }}
