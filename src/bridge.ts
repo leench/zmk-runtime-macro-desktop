@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import type { Locale } from "./i18n";
+
 export type UsageMetadataStatus = "exact" | "missing";
 
 export type DeviceCandidate = {
@@ -157,4 +159,15 @@ export function getSettings(): Promise<ClientSettings> {
 
 export function setSettings(timeoutMs: number, retries: number): Promise<ClientSettings> {
   return invoke<ClientSettings>("set_settings", { timeoutMs, retries });
+}
+
+/**
+ * Mirrors the resolved UI locale onto the native tray menu.
+ *
+ * Rust accepts only the exact `en` / `zh-CN` tags and never derives a language
+ * itself, so the value must be a `resolveLocale` result, never the raw language
+ * preference or a navigator language.
+ */
+export function setTrayLocale(locale: Locale): Promise<void> {
+  return invoke("set_tray_locale", { locale });
 }

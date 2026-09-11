@@ -16,7 +16,7 @@
 
 1. **Dynamic Protocol v2 backend、bridge/multislot model 和 presentation-first Dynamic Workspace 均已完成。** Rust protocol/client/commands 已按 v2 多槽位实现（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；`src/bridge.ts` 与 `src/types/dynamic.ts` 已提供 slot-aware dynamic command 和 per-object 状态模型；`src/features/dynamic/` 的页面级 Dynamic Workspace 已按 in-memory fixture 实现（Scenario 列表/编辑器、capability-driven target 行、状态矩阵和确认对话框），但**仍待人工视觉验收**。
 2. Dynamic Workspace 采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。这些边界目前仍然成立，workspace 尚未调用任何真实 workspace command；真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供，旧入口作为 fallback 保留到视觉验收通过。
-3. **托盘基础已实现**（`src-tauri/src/tray.rs`、`src-tauri/src/lib.rs`、`src/App.tsx`）：Tauri 2 tray icon 和原生菜单、打开/隐藏/明确退出、close-to-tray、单实例窗口恢复；菜单中的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接真实状态。平台专属托盘行为仍需在对应平台人工验收。
+3. **托盘基础已实现**（`src-tauri/src/tray.rs`、`src-tauri/src/lib.rs`、`src/App.tsx`）：Tauri 2 tray icon 和原生菜单、打开/隐藏/明确退出、close-to-tray、单实例窗口恢复；菜单中的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接真实状态；菜单文本有 `en` / `zh-CN` 两套 labels，由 `set_tray_locale` command 跟随前端 `resolveLocale` 更新（Rust 只接受这两个精确 tag，不自行推断语言）。平台专属托盘行为仍需在对应平台人工验收。
 4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、DynamicService、场景持久化、UI 接入真实 HID、设备 alias、托盘真实状态、自启、本地 HTTP API 和自动场景。
 5. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
 6. 上面已完成的 v2 多槽位 backend 和 bridge 是后续接入基线，不从零重写，也不降级回单槽 v1。
@@ -150,7 +150,7 @@ src/App.tsx
 
 ### 4.2 托盘菜单的 UI-first 版本
 
-UI-only 阶段可以展示以下菜单结构和 mock 状态（下图为计划中的菜单结构，实际原生菜单为英文标签）：
+UI-only 阶段可以展示以下菜单结构和 mock 状态（下图为计划中的菜单结构，实际原生菜单提供 `en` / `zh-CN` 两套标签，`init` 时默认英文）：
 
 ```text
 打开 ZMK Runtime Macro
@@ -176,10 +176,10 @@ Dynamic 状态         Ready / Unknown / Error
 
 当前的托盘基础实现遵循这些边界，并明确区分“真实”和“preview”：
 
-- **真实行为**：`Open ZMK Runtime Macro`（以及 tray icon 左键点击）显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 终止应用（绕过 close-to-tray，退出时仍由 `AppState` 的 drop 执行 best-effort LOCK）；普通窗口关闭隐藏到托盘；第二次启动由 single-instance plugin 恢复已有窗口。
-- **preview 占位（disabled）**：`Device`、`Dynamic status`、`Current scenario` 三个状态行，以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 三个操作项。菜单标签直接写明 `preview only` / `(preview)`，因为当前没有 DynamicService，托盘不读取设备状态、不打开 HID、不发送 protocol frame、不调用任何 dynamic command，也不显示 HID path、serial 或正文。
+- **真实行为**：`Open ZMK Runtime Macro`（以及 tray icon 左键点击）显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 终止应用（绕过 close-to-tray，退出时仍由 `AppState` 的 drop 执行 best-effort LOCK）；普通窗口关闭隐藏到托盘；第二次启动由 single-instance plugin 恢复已有窗口；菜单文本跟在 UI locale 后面更新（见下一条），不触发任何设备操作。
+- **preview 占位（disabled）**：`Device`、`Dynamic status`、`Current scenario` 三个状态行，以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 三个操作项。菜单标签直接写明 `preview only` / `(preview)`，中文标签写明“仅预览”或“（预览）”，因为当前没有 DynamicService，托盘不读取设备状态、不打开 HID、不发送 protocol frame、不调用任何 dynamic command，也不显示 HID path、serial 或正文。
 - 启用条件：状态行需要阶段 7（托盘接入真实状态）和阶段 3 的 DynamicService；托盘上传/clear 与主窗口共用同一 service 后才能去掉 disabled。
-- 原生菜单当前只有英文标签（不进入 UI locale 文件）；状态值不使用 `Ready`/`CommittedLocally`/`ClearedLocally` 等会被误读为真实 ACK 的措辞。
+- **菜单文本跟随 UI locale**：菜单标签集中为 `en` 与 `zh-CN` 两套（不进入前端 UI locale 文件，菜单本身归 Rust 持有）；`set_tray_locale` 命令是唯一的语言输入，只接受精确的 `"en"` / `"zh-CN"`，其他值返回 `unsupported_locale` 且不写入菜单；语言始终来自前端 `resolveLocale` 的结果，Rust 不读环境变量、存储偏好或设备信息来猜语言；`App.tsx` 在启动和 locale 变化时同步，无需重启，失败静默处理。状态值不使用 `Ready`/`CommittedLocally`/`ClearedLocally` 等会被误读为真实 ACK 的措辞。
 - 未实现：托盘真实状态、autostart、DynamicService、场景持久化和 HTTP API。
 
 ## 5. Presentation-first UI 阶段
@@ -549,9 +549,10 @@ source priority、lease TTL、override 到期恢复属于自动场景阶段，�
 **本阶段托盘基础（已实现）。**
 
 1. 托盘 icon、打开/隐藏/退出、close-to-tray、单实例窗口入口；
-2. 可使用静态/mock 状态完成托盘菜单的视觉和菜单验收，但不得把 mock 结果标成真实设备操作结果。
+2. 菜单文本 `en` / `zh-CN` 两套，跟随 UI locale（`set_tray_locale`，只接受这两个精确 tag，不自行猜语言）；
+3. 可使用静态/mock 状态完成托盘菜单的视觉和菜单验收，但不得把 mock 结果标成真实设备操作结果。
 
-实现说明：`src-tauri/src/tray.rs` 提供 tray icon、原生菜单和 `show_main_window` helper（tray、菜单和 single-instance plugin 共用）；普通窗口关闭经 `onCloseRequested` 的 dirty 确认和 best-effort LOCK 后 `hide()` 到托盘，明确退出走 `app.exit(0)`；菜单状态行和 Dynamic 操作项是 disabled 的 preview 占位（§4.2）。本机自动验证（fmt/test/clippy/`npm test`/`npm run build`/`tauri build --no-bundle`）已通过；托盘图标、菜单交互、close-to-tray 和单实例恢复仍需要在 Windows/Linux（GNOME/KDE、Wayland/X11）和 macOS 上人工验收。
+实现说明：`src-tauri/src/tray.rs` 提供 tray icon、原生菜单和 `show_main_window` helper（tray、菜单和 single-instance plugin 共用）；普通窗口关闭经 `onCloseRequested` 的 dirty 确认和 best-effort LOCK 后 `hide()` 到托盘，明确退出走 `app.exit(0)`；菜单状态行和 Dynamic 操作项是 disabled 的 preview 占位（§4.2）；菜单标签提供 `en` / `zh-CN` 两套，由受限的 `set_tray_locale` command（只接受精确 `"en"` / `"zh-CN"`，非法值返回 `unsupported_locale`）通过已有 `MenuItem::set_text` 跟随 UI locale 更新，菜单 ID、结构、disabled 边界和 tray actions 不变。本机自动验证（fmt/test/clippy/`npm test`/`npm run build`/`tauri build --no-bundle`）已通过；托盘图标、菜单交互、close-to-tray 和单实例恢复仍需要在 Windows/Linux（GNOME/KDE、Wayland/X11）和 macOS 上人工验收。
 
 **UI 视觉验收点 A（尚未完成）：**
 
@@ -689,7 +690,7 @@ v2 多 object capability/protocol contract 已经发布并实现：Rust backend 
 
 | PR | 主要目标 | 依赖 | 验收重点 |
 |---|---|---|---|
-| PR-01 | Tauri tray 基础、窗口入口、close-to-tray、明确退出、单实例恢复 | 无 | tray/window 生命周期；不接真实 Dynamic service |
+| PR-01 | Tauri tray 基础、窗口入口、close-to-tray、明确退出、单实例恢复、菜单文本跟随 UI locale | 无 | tray/window 生命周期；不接真实 Dynamic service |
 | PR-02 | Dynamic Workspace 页面壳和 Static/Dynamic 入口 | PR-01 | 保持现有 MagicPatterns/static 视觉；不改旧 static UI |
 | PR-03 | Scenario 列表、编辑器、目标 object 区域和操作栏 | PR-02 | Scenario 与 Dynamic Object 概念清楚；Save/Upload/Clear/Delete 语义清楚 |
 | PR-04 | UI mock fixture、单/多 object preview、状态矩阵和对话框 | PR-03 | UI 视觉验收点 A；不接 HID、localStorage、HTTP |

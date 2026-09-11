@@ -13,6 +13,7 @@ use crate::hid::{
     DeviceRecord, DeviceSummary, HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
 use crate::protocol::{AuthInfo, DynamicCapabilities, Status};
+use crate::tray::{TrayLocale, TrayMenuItems};
 
 /// A stable, serializable error envelope used by every frontend command.
 ///
@@ -1453,6 +1454,41 @@ pub async fn clear_dynamic(
     .await
 }
 
+/// Switches the native tray menu labels to the frontend's resolved UI locale.
+///
+/// The locale always comes from the frontend's `resolveLocale` result: this
+/// command never reads an environment variable, a stored preference or device
+/// data, and it rejects every tag except the exact `en` and `zh-CN` values. Only
+/// menu text changes; menu ids, structure, enabled state, window lifecycle and
+/// the disabled Dynamic placeholders are untouched, so no HID or Dynamic
+/// operation is involved.
+#[tauri::command]
+pub async fn set_tray_locale(
+    locale: String,
+    menu: State<'_, TrayMenuItems>,
+) -> Result<(), CommandError> {
+    let locale = tray_locale_from_tag(&locale)?;
+    menu.apply(locale).map_err(|_| {
+        CommandError::new(
+            "tray_update_failed",
+            "The tray menu labels could not be updated.",
+        )
+    })
+}
+
+/// Maps a frontend locale tag onto a tray locale.
+///
+/// Only the two UI locales are accepted; an unknown tag is a stable error
+/// instead of a fallback, so an arbitrary string can never reach the menu.
+fn tray_locale_from_tag(tag: &str) -> Result<TrayLocale, CommandError> {
+    TrayLocale::from_tag(tag).ok_or_else(|| {
+        CommandError::new(
+            "unsupported_locale",
+            "Unsupported tray locale; expected \"en\" or \"zh-CN\".",
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2808,5 +2844,18 @@ mod tests {
             serde_json::to_string(&error).unwrap(),
             r#"{"code":"storage_error","message":"The device could not persist its settings."}"#
         );
+    }
+
+    #[test]
+    fn tray_locale_command_accepts_only_the_two_ui_locales() {
+        // The tray label command is the only locale input the backend has, so a
+        // wrong tag must fail with a stable error instead of guessing a
+        // language.
+        assert_eq!(tray_locale_from_tag("en").unwrap(), TrayLocale::En);
+        assert_eq!(tray_locale_from_tag("zh-CN").unwrap(), TrayLocale::ZhCn);
+        for rejected in ["", "EN", "zh-cn", "zh", "zh-Hans-CN", "en-US", "system"] {
+            let error = tray_locale_from_tag(rejected).unwrap_err();
+            assert_eq!(error.code, "unsupported_locale");
+        }
     }
 }

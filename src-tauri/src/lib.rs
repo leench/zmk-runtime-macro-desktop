@@ -35,6 +35,7 @@ pub fn run() {
             commands::clear_dynamic,
             commands::get_settings,
             commands::set_settings,
+            commands::set_tray_locale,
         ])
         .setup(|app| {
             tray::init(app)?;

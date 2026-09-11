@@ -20,6 +20,7 @@ import {
   setPassword as setPasswordCommand,
   setSettings as setSettingsCommand,
   setSlot as setSlotCommand,
+  setTrayLocale,
   uploadDynamic as uploadDynamicCommand,
   type AuthState,
   type ClientSettings,
@@ -1429,6 +1430,15 @@ function App() {
     document.documentElement.lang = locale;
     return () => { delete document.documentElement.dataset.theme; document.documentElement.lang = ""; };
   }, [locale, theme]);
+
+  // The native tray menu follows the same resolved locale as the UI, on startup
+  // and on every language change, without restarting the app. The browser
+  // preview never invokes Tauri, and a failed label update is not a macro or
+  // device error, so it stays silent.
+  useEffect(() => {
+    if (!inTauri()) return;
+    void setTrayLocale(locale).catch(() => undefined);
+  }, [locale]);
 
   useEffect(() => {
     mounted.current = true;
