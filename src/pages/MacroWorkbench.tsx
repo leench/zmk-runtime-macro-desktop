@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { DeviceCandidate, ConnectedDevice } from "../bridge";
 import type { Messages } from "../i18n";
 import type { ThemeMode } from "../types/ui";
@@ -44,7 +45,11 @@ type MacroWorkbenchProps = {
   onSwitchDevice: (id: string) => void;
   onDisconnect: () => void;
   onDynamicOpen: () => void;
-  dynamicModalOpen: boolean;
+  /** Highlighted while the dynamic workspace, the legacy dialog, or both are open. */
+  dynamicActive: boolean;
+  /** Page-level Dynamic workspace, kept mounted so preview state survives toggling. */
+  dynamicWorkspace: ReactNode;
+  dynamicWorkspaceOpen: boolean;
   onSelectSlot: (slot: number) => void;
   onMoveSelection: (offset: number) => void;
   onLabelChange: (value: string) => void;
@@ -101,7 +106,9 @@ export function MacroWorkbench({
   onSwitchDevice,
   onDisconnect,
   onDynamicOpen,
-  dynamicModalOpen,
+  dynamicActive,
+  dynamicWorkspace,
+  dynamicWorkspaceOpen,
   onSelectSlot,
   onMoveSelection,
   onLabelChange,
@@ -162,7 +169,7 @@ export function MacroWorkbench({
         onSwitchDevice={onSwitchDevice}
         onDisconnect={onDisconnect}
         onDynamicOpen={onDynamicOpen}
-        dynamicModalOpen={dynamicModalOpen}
+        dynamicActive={dynamicActive}
         disabled={busy}
       />
 
@@ -193,7 +200,7 @@ export function MacroWorkbench({
           </section>
         ) : null}
 
-        <div className="flex min-h-0 flex-1 overflow-hidden">
+        <div className={`min-h-0 flex-1 overflow-hidden ${dynamicWorkspaceOpen ? "hidden" : "flex"}`}>
           <SlotList
             copy={copy}
             slots={slotItems}
@@ -238,6 +245,10 @@ export function MacroWorkbench({
           ) : (
             <section className="flex min-w-0 flex-1 flex-col items-center justify-center bg-canvas px-8 text-center"><p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.inspector}</p><h2 className="mt-2 text-xl font-semibold text-ink">{copy.selectSlot}</h2><p className="mt-2 text-sm text-ink-muted">{copy.chooseSlotHelp}</p></section>
           )}
+        </div>
+
+        <div className={`min-h-0 flex-1 overflow-hidden ${dynamicWorkspaceOpen ? "flex flex-col" : "hidden"}`}>
+          {dynamicWorkspace}
         </div>
       </main>
     </div>

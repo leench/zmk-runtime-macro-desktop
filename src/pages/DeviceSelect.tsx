@@ -1,4 +1,4 @@
-import { ArrowRight, Check, Keyboard, RefreshCw, Usb } from "lucide-react";
+import { ArrowRight, Check, FlaskConical, Keyboard, RefreshCw, Usb, Zap } from "lucide-react";
 import type { DeviceCandidate } from "../bridge";
 import type { Messages } from "../i18n";
 import { TitleBar, type Platform } from "../components/TitleBar";
@@ -20,9 +20,11 @@ type DeviceSelectProps = {
   onSelect: (id: string) => void;
   onConnect: () => void;
   onRefresh: () => void;
+  /** Opens the UI-only Dynamic workspace without a device (preview entry). */
+  onDynamicWorkspaceOpen: () => void;
 };
 
-export function DeviceSelect({ copy, platform, devices, selectedId, checking, busy, errorMessage, errorCode, dirtyDraft, onSelect, onConnect, onRefresh }: DeviceSelectProps) {
+export function DeviceSelect({ copy, platform, devices, selectedId, checking, busy, errorMessage, errorCode, dirtyDraft, onSelect, onConnect, onRefresh, onDynamicWorkspaceOpen }: DeviceSelectProps) {
   const selected = devices.some((device) => device.id === selectedId);
   const upgradeError = errorCode === "bad_version";
 
@@ -97,6 +99,23 @@ export function DeviceSelect({ copy, platform, devices, selectedId, checking, bu
             </button>
           </div>
           <p className="mt-5 text-center text-xs text-ink-subtle">{copy.v2OnlyHelp}</p>
+
+          <div className="mt-6 rounded-2xl border border-dashed border-line-strong bg-surface-2 px-5 py-4 text-center">
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-line-strong px-2.5 py-1 font-mono text-[11px] uppercase tracking-wide text-ink-muted">
+              <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
+              {copy.dynamicPreviewBadge}
+            </span>
+            <p className="mt-2 text-xs leading-relaxed text-ink-muted">{copy.dynamicPreviewEntryHelp}</p>
+            <button
+              type="button"
+              onClick={onDynamicWorkspaceOpen}
+              disabled={busy}
+              className="mt-3 inline-flex h-11 items-center gap-2.5 rounded-xl border border-line-strong bg-surface px-4 text-sm font-semibold text-ink-muted transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Zap className="h-4 w-4" aria-hidden="true" />
+              {copy.dynamicWorkspace}
+            </button>
+          </div>
         </div>
       </main>
     </div>

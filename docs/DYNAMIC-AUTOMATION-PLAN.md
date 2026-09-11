@@ -12,13 +12,14 @@
 
 本文不修改固件协议，也不把复杂的自动化规则写死在 React UI 中。
 
-当前已经确认的实施方向是：
+当前已经确认的实施方向和实际进度是：
 
-1. **先做托盘基础、窗口入口/生命周期和完整 Dynamic UI。**
-2. UI 阶段采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。
-3. UI 视觉验收通过后，才依次实现 contract/DTO、DynamicService、场景持久化、真实 HID 接入、设备 alias、托盘真实状态、自启、本地 HTTP API 和自动场景。
-4. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
-5. desktop backend 已完成 Dynamic Protocol v2 多槽位迁移（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；该实现是后续接入基线，不从零重写，也不降级回单槽 v1。
+1. **Dynamic Protocol v2 backend、bridge/multislot model 和 presentation-first Dynamic Workspace 均已完成。** Rust protocol/client/commands 已按 v2 多槽位实现（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；`src/bridge.ts` 与 `src/types/dynamic.ts` 已提供 slot-aware dynamic command 和 per-object 状态模型；`src/features/dynamic/` 的页面级 Dynamic Workspace 已按 in-memory fixture 实现（Scenario 列表/编辑器、capability-driven target 行、状态矩阵和确认对话框），但**仍待人工视觉验收**。
+2. Dynamic Workspace 采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。这些边界目前仍然成立，workspace 尚未调用任何真实 workspace command；真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供，旧入口作为 fallback 保留到视觉验收通过。
+3. **当前下一阶段是托盘基础**：tray icon、窗口入口/生命周期、close-to-tray、单实例恢复，可用静态/mock 状态完成视觉和菜单验收。
+4. UI 人工视觉验收通过后，才依次实现 contract/DTO 冻结、DynamicService、场景持久化、UI 接入真实 HID、设备 alias、托盘真实状态、自启、本地 HTTP API 和自动场景。
+5. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
+6. 上面已完成的 v2 多槽位 backend 和 bridge 是后续接入基线，不从零重写，也不降级回单槽 v1。
 
 产品核心定位为：
 
@@ -118,12 +119,12 @@ src/App.tsx
 
 ### 3.3 当前 Dynamic UI 的产品方向
 
-当前 `DynamicMacroModal.tsx` 和 `DynamicMacroPanel.tsx` 是不满意的临时实现：它们把正文、TTL、keep、capability、lifecycle、警告和 clear/upload 操作堆在一个弹窗中。
+当前 `DynamicMacroModal.tsx` 和 `DynamicMacroPanel.tsx` 是不满意的临时实现：它们把正文、TTL、keep、capability、lifecycle、警告和 clear/upload 操作堆在一个弹窗中，因此不作为新的产品形态；同时它们仍是当前真实的 dynamic handler 和 fallback 入口。
 
-后续产品方向改为新的**页面级 Dynamic Workspace**：
+产品方向是新的**页面级 Dynamic Workspace**，并已按 presentation-first 实现（见 §12 阶段 1）：
 
 - 不再把 Dynamic 主体验设计成弹窗；
-- 保留旧入口作为过渡实现，直到新页面通过视觉验收；
+- presentation 阶段保留旧入口，直到新页面通过人工视觉验收；
 - 新 UI 验收后再移除或下线旧 `DynamicMacroModal`/`DynamicMacroPanel` 入口；
 - 不在新 UI 验收前把旧弹窗继续扩展成场景管理器。
 
@@ -342,7 +343,7 @@ Dynamic Object
 [ capability-provided label ▾ ]
 ```
 
-selector 的选项来自 `objects` collection，不来自硬编码数字列表。缺少目标 object 时显示明确错误并禁止上传，但保留 Scenario 正文和 dirty draft。
+selector 的选项来自 `objects` collection，不来自硬编码数字列表。缺少目标 object 时显示明确错误并禁止上传，但保留 Scenario 正文和 dirty draft；单 object 设备同样不自动采用唯一 object：saved target 未解析时该行显示 target unavailable，并要求用户显式重新绑定后才解除 upload/clear 限制。
 
 v2 capability 已正式发布多 object contract，`dynamic_object_count`、512-byte 上限和 slot 语义均为 wire contract 的一部分；reference client 与 desktop backend 已同步。UI 阶段直接按 capability 驱动选择，不再把 object 编号/数量当作猜测；desktop/API 可保留 collection、opaque object id/display label 和 `target_object` 的兼容形态。
 
@@ -504,7 +505,7 @@ GET    /api/v1/operations/{operation_id}
 
 ## 11. 多来源和并发规则
 
-当前 firmware 只有一个 Dynamic Object，同一时刻不能并行写入。后续服务必须：
+当前 firmware 已按 v2 报告多个 Dynamic Object（默认 8），但同一设备的 HID session 只有一个 writer，upload/clear 不能并行发送。后续服务必须：
 
 1. 每个设备只有一个 serialized HID writer；
 2. capability、upload、clear 共享同一 queue；
@@ -523,22 +524,26 @@ source priority、lease TTL、override 到期恢复属于自动场景阶段，�
 
 ## 12. 实施阶段和验收闸门
 
-### 阶段 1：托盘基础 + 高保真 Dynamic UI（先做）
+### 阶段 1：presentation-first Dynamic Workspace（已完成，待人工视觉验收）+ 托盘基础（下一步）
 
-这一阶段是 presentation-first，先让用户看到并验收完整产品形态：
+**本阶段已完成的 presentation-first Dynamic Workspace（UI-only）：**
+
+1. 保持现有 TitleBar、AppHeader、Static Slots 和全局 MagicPatterns 视觉风格，以页面级 workspace 接入现有 workbench；
+2. Scenario 列表、空状态、新建、编辑器、dirty 状态和操作栏；
+3. capability-driven target object 行：单 object（count = 1）为只读行、多 object（count = 8）为 selector；saved target 不在最新 capability 时显示 target missing，单 object 设备也不会自动采用唯一 object，必须由用户显式重新绑定；
+4. capability details、非 secret 警告和无 readback 文案；
+5. 全部状态矩阵和确认对话框的 mock/in-memory interaction；
+6. 不接 HID、不写 localStorage、不持久化 Scenario、不接 HTTP API；真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供；
+7. 新 UI 通过人工视觉和交互验收后，才移除旧 Dynamic modal 入口。
+
+**本阶段剩余工作：托盘基础。**
 
 1. 托盘 icon、打开/隐藏/退出、close-to-tray、单实例窗口入口；
-2. 保持现有 TitleBar、AppHeader、Static Slots 和全局 MagicPatterns 视觉风格；
-3. 用页面级 Dynamic Workspace 替代旧 Dynamic modal 的产品方向；
-4. Scenario 列表、空状态、新建、编辑器、dirty 状态和操作栏；
-5. 可选的单 object（count = 1）与多 object（count = 8）capability-driven selector 的 mock；
-6. capability details、非 secret 警告、无 readback 文案；
-7. 全部状态矩阵和确认对话框的 mock/in-memory interaction；
-8. 不接 HID、不写 localStorage、不持久化 Scenario、不接 HTTP API；
-9. 新 UI 通过人工视觉和交互验收后，才移除旧 Dynamic modal 入口。
+2. 可使用静态/mock 状态完成托盘菜单的视觉和菜单验收，但不得把 mock 结果标成真实设备操作结果。
 
-**UI 视觉验收点 A：**
+**UI 视觉验收点 A（尚未完成）：**
 
+- 该验收目前尚未完成：workspace 仍是 preview/mock surface，旧 dynamic handler 和 fallback 入口保留；
 - 页面与现有 Static Slots 的视觉质量一致；
 - 单 object 和多 object mock 均不破坏布局；
 - empty/new/dirty/disconnected/unknown/discovering/unsupported/ready/uploading/committed locally/clearing/cleared locally/error 等状态可检查；
@@ -654,17 +659,17 @@ Gate C 通过后实现：
 
 浏览器 URL、IDE project、Git branch、插件系统、脚本执行引擎和云同步继续后置。自动规则必须通过 DynamicService，不能直接打开 HID。
 
-### 阶段 11：正式多 Dynamic Object
+### 阶段 11：多 Dynamic Object 的真实接入
 
-只有 firmware 发布正式多 object capability/protocol contract 且 reference client 同步后才能实现：
+v2 多 object capability/protocol contract 已经发布并实现：Rust backend 的 slot-aware capability/upload/clear（默认 8 objects、512 bytes/object、逐 object clear、retry 从 BEGIN 重启）和 desktop bridge 的 per-object 状态模型都已完成，因此本阶段不再等待 firmware contract，只需把已发布的 contract 接入真实来源：
 
-- capability-driven object collection；
-- 多 object fake-HID、并发、TTL、clear 和 lifecycle tests；
+- capability-driven object collection 从真实 capability 进入 UI/API；
+- 多 object fake-HID、TTL、逐 object clear 和 lifecycle tests（同一设备仍由单一 writer 串行化）；
 - object-specific validation；
-- UI/API 的真实 object selector；
+- UI/API 的真实 object selector 取代 preview fixture；
 - 新 protocol version 或 capability negotiation。
 
-在此之前不猜测 object 数量、数字编号、容量、TTL 或 wire contract，不使用 static slot fallback。
+不猜测 object 数量、数字编号、容量、TTL 或 wire contract，不使用 static slot fallback。
 
 ## 13. Pull Request 拆分
 
@@ -690,7 +695,7 @@ Gate C 通过后实现：
 | PR-13 | HTTP devices/status/capabilities/upload/clear | PR-12 | API 只调用 DynamicService；不返回正文 |
 | PR-14 | operations、idempotency、错误映射和调用示例 | PR-13 | final ACK、async operation、request digest |
 | PR-15 | 自动场景基础规则和仲裁 | PR-14 | debounce、generation、manual override、external lease |
-| PR-16 | 正式多 Dynamic Object 支持 | firmware contract | 只实现已发布 contract，不猜测、不 fallback |
+| PR-16 | 多 Dynamic Object 真实接入（v2 contract 已发布） | PR-08/PR-13 | 只接入已发布的 v2 contract；不猜测 object 数量/编号/容量，不 fallback |
 | PR-17 | 跨平台人工验收、发布文档和 release hardening | 对应交付阶段 | Windows/Linux/macOS tray、autostart、打包和真实设备 |
 
 ## 14. 验证策略

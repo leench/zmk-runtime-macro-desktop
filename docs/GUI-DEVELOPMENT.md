@@ -6,7 +6,7 @@
 
 首版目标平台：Linux x86_64、macOS Intel/Apple Silicon、Windows x64。前端不直接访问 HID，所有枚举、认证、协议和传输都在 Rust/Tauri command 层完成。
 
-当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
+当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）已完成 presentation-first UI-only 阶段：Scenario 列表/编辑器、capability-driven target 行、18 个 in-memory preview 状态和确认对话框全部来自内存 fixture，不接真实 workspace command，真实 dynamic 操作仍由旧 `DynamicMacroModal`/`DynamicMacroPanel` 提供。该工作区仍待人工视觉验收。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
 
 ## 2. 固件和协议约束
 
@@ -116,7 +116,7 @@ Dynamic Macro 是独立于 static slot 的 RAM-only object collection，每个 o
 
 Dynamic 文本在任何 HID write 前完成本地校验：非空、不超过 `CAPABILITIES` 上报的 `max_dynamic_length`（capability 未加载时 UI 使用 512 bytes fallback）、仅 printable US ASCII/LF/Tab/Backspace；显式 TTL 必须落在 `CAPABILITIES` 上报的 min/max 内（fallback 1–86400 秒），缺省使用设备默认值（fallback 300 秒）。目标 object 先按协议上限（0–7）预检，再按 `CAPABILITIES` 返回的 object count 校验，非法 index 不会产生任何 HID 写入。BEGIN payload 只允许 0/1/4/5，keep-after-execute 只有 capability lifecycle bit 6 支持时才显示/发送，Tauri 参数使用 `slot`、`keepAfterExecute`。上传失败或 timeout 从新 request ID 的 BEGIN 重新开始；clear 逐个 object 幂等重试，没有 wire clear-all。Dynamic 文本只存在当前内存编辑区，不写 localStorage、日志、诊断、错误、报告或诊断摘要。
 
-UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object 选择器（count = 1 时只显示只读对象行），upload/clear 使用当前选中 object 的 wire slot；每个 object 独立保存内存 draft、TTL、keep、状态、progress、error 和 clear 确认。
+UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object 选择器（count = 1 时只显示只读对象行），upload/clear 使用当前选中 object 的 wire slot；每个 object 独立保存内存 draft、TTL、keep、状态、progress、error 和 clear 确认。本节描述旧 dynamic modal（真实 handler）；page-level Dynamic Workspace 的对应行为见 §4.7。
 
 状态文案区分 `Unknown`、`Unsupported`、`Uploading`、`Committed locally`、`Cleared locally` 和 `Error`；提交/清除仅表示本地收到 ACK，不是 readback 证明。断开、重连、重启或生命周期不确定后回到 Unknown，不自动 re-upload。capability flags 摘要、byte count、TTL、keep 开关和进度均为本地 UI 信息，不能推断设备当前仍保存动态文本。
 
@@ -128,6 +128,18 @@ UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object �
 - theme、页面缩放（`80–150%`，默认 `100%`）、timeout、retries 和隐私预览的两个数值可以存入本机偏好；页面缩放在设置控件输入或步进后立即调用当前 Tauri WebView 的 `setZoom`，取消设置会恢复打开设置前的已保存值；密码、K、正文、raw report、HID path 和 serial 不得存储；
 - timeout 默认 1000 ms（100–5000），retries 默认 2（0–5），后端标记为下一次连接生效；
 - 诊断默认折叠，只显示 Runtime Macro v2、USB HID、脱敏设备摘要、动态 slot count、最近白名单操作和安全 error code；不显示正文、凭据、path、serial 或 raw report。
+
+### 4.7 Dynamic Workspace（页面级场景工作区，UI-only 阶段）
+
+除真实 dynamic 操作所在的 modal（§4.5）之外，仓库已按 presentation-first 实现页面级 **Dynamic Workspace**：Scenario 是主要管理对象，Dynamic Object 是上传目标。该工作区目前是 UI-only 阶段：
+
+- 入口：workbench header 的 `Dynamic Macro`（Zap）按钮；设备选择页的 `Preview` 入口可在未连接设备时打开同一工作区；
+- 内容：Scenario 列表 + 编辑器（名称、正文、TTL、keep、target 行）、capability details、本地观察状态和确认对话框；
+- 数据来源：`src/features/dynamic/previewFixtures.ts` 的 18 个 in-memory preview 状态（`empty`、`new`、`dirty`、`disconnected`、`unknown`、`discovering`、`unsupported`、`ready`、`uploading`、`committed`、`clearing`、`cleared`、`error`、`staticLocked`、`keepUnsupported`、`targetMissing`、`capabilityChanged`、`oversize`）；Scenario 名称、正文和 TTL 只在 React 内存中，刷新即丢失，不写 `localStorage`；
+- 本阶段不接真实 workspace command：不调用 HID、不持久化 Scenario、不接 HTTP API，也不显示设备 readback；
+- 旧 `DynamicMacroModal`/`DynamicMacroPanel` 仍是真实 dynamic handler，从已连接 workbench 打开的 workspace header 保留 `Legacy dialog` fallback 按钮（无设备预览入口不提供该按钮），旧入口在新 UI 通过人工视觉验收后才移除；
+- target 行按 capability 驱动：单 object（count = 1）为只读行，多 object 为 selector；saved target 不在最新 capability 时显示 saved target unavailable / target missing 并保留正文和 dirty draft，单 object 设备也不会自动采用唯一 object，必须由用户主动点击 `Use this object` 重新绑定，绑定前 upload/clear 保持禁用；
+- 场景持久化、真实 DynamicService 接入、托盘入口和 v2 多 object 真实数据（§4.5）属于后续阶段。
 
 ## 5. 后端与前端边界
 
@@ -161,7 +173,8 @@ Runtime Macro protocol v2 / hidapi
 3. MagicPatterns UI 源代码迁移、真实 v2 auth/宏流程、密码设置/修改和视觉 gate；
 4. 列表隐私预览、认证窗口倒计时、`AUTH_REQUIRED`/错误恢复、自动重连和正常关闭 best-effort LOCK；
 5. 文档、跨平台行为/安装器配置检查和最终验证（含硬件边界检查）；
-6. Dynamic Macro v2 多槽位 capability（slot-aware capability/upload/clear、512-byte object、逐槽 clear）、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix。
+6. Dynamic Macro v2 多槽位 capability（slot-aware capability/upload/clear、512-byte object、逐槽 clear）、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix；
+7. Dynamic Workspace page-level UI-only 阶段（Scenario 列表/编辑器、capability-driven target 行、18 个 preview 状态、in-memory only）；真实 dynamic 操作仍走旧 modal。
 
 所有阶段均只支持 v2，不提供 Legacy v1 管理。MagicPatterns 是唯一视觉基准；仅在真实功能、v2 协议、安全约束或 Tauri 平台行为冲突时适配，并记录冲突原因。
 
@@ -170,7 +183,7 @@ Runtime Macro protocol v2 / hidapi
 自动验证至少包括：
 
 - `npm run build`；
-- `npm test`（前端 dynamic object 状态模型，Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
+- `npm test`（前端 dynamic object 状态模型和 page-level scenario model，含 `tests/scenario-model.test.ts` 的 target/scenario 解析、阻塞条件和 preview fixture 检查；Node 内置 test runner + 内置 TypeScript type stripping，需 Node 22.18+/24，无新增依赖）；
 - `cargo fmt --check`、`cargo test`、`cargo clippy --all-targets -- -D warnings`；
 - `npm run tauri build -- --no-bundle`；
 - `git diff --check` 和隐私/secret scan。
@@ -181,6 +194,6 @@ Runtime Macro protocol v2 / hidapi
 
 ## 9. 当前剩余工作与发布边界
 
-阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
+阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 presentation-first 阶段（§4.7）已完成代码和自动测试，但尚未通过人工视觉验收；该阶段不接真实 workspace command，dynamic upload/clear 仍由旧 modal 经既有 `bridge.ts` dynamic commands 执行。托盘基础是下一个待实现阶段。macOS、Windows 原生安装器和 Linux 基线 AppImage 仍需由对应 runner 或平台分别验证，不能用 Linux 本机结果替代。最终应用在代码、文档和验证门禁完成后打开供人工查看。
 
 后续维护必须继续遵守 v2-only 边界，不得恢复 Legacy v1 管理或把密码、K、正文、HID path、serial、raw report 写入持久化、日志和诊断。

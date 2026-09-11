@@ -1,3 +1,5 @@
+import type { PreviewStateId } from "./types/scenario";
+
 export type LanguagePreference = "system" | "zh-CN" | "en";
 export type Locale = "zh-CN" | "en";
 export const LANGUAGE_STORAGE_KEY = "zmk-runtime-macro-language:v1";
@@ -243,6 +245,94 @@ export type MessageTable = {
   dynamicTextTooLong: (maximum: number) => string;
   dynamicTtlInvalid: string;
   dynamicCapabilityError: string;
+  dynamicWorkspace: string;
+  dynamicWorkspaceEyebrow: string;
+  dynamicWorkspaceSummary: string;
+  dynamicPreviewBadge: string;
+  dynamicPreviewStateLabel: string;
+  dynamicPreviewStateHelp: string;
+  dynamicPreviewStateLabels: Record<PreviewStateId, string>;
+  dynamicPreviewMockNote: string;
+  dynamicPreviewDeviceName: string;
+  dynamicPreviewEntryHelp: string;
+  dynamicLegacyDialog: string;
+  dynamicLegacyDialogHelp: string;
+  dynamicWorkspaceWarningTitle: string;
+  dynamicWorkspaceWarning: string;
+  dynamicDeviceReady: string;
+  dynamicTarget: string;
+  dynamicTargetDevice: string;
+  dynamicTargetDeviceHelp: string;
+  dynamicTargetObject: string;
+  dynamicTargetChoose: string;
+  dynamicTargetUnavailable: string;
+  dynamicTargetMissingShort: string;
+  dynamicTargetMissingHelp: string;
+  dynamicTargetPending: string;
+  dynamicTargetPendingHelp: string;
+  dynamicTargetSingleHelp: string;
+  dynamicTargetUseOnly: string;
+  dynamicNoObjects: string;
+  dynamicNeedsTarget: string;
+  dynamicStaticLockedNote: string;
+  dynamicCapabilityChangedNotice: string;
+  dynamicCapabilityDetails: string;
+  dynamicCapabilityObjectCount: string;
+  dynamicCapabilityObject: string;
+  dynamicCapabilityMaxBytesLabel: string;
+  dynamicCapabilityTtlDefault: string;
+  dynamicCapabilityTtlRange: string;
+  dynamicCapabilityKeep: string;
+  dynamicObservation: string;
+  dynamicObservationNone: string;
+  dynamicObservationUploading: string;
+  dynamicObservationCommitted: string;
+  dynamicObservationClearing: string;
+  dynamicObservationCleared: string;
+  dynamicObservationErrorInterrupted: string;
+  dynamicObservationErrorTimeout: string;
+  dynamicObservationErrorUnsupported: string;
+  dynamicObservationTarget: string;
+  dynamicObservationReset: string;
+  dynamicScenarioListAria: string;
+  dynamicScenarios: string;
+  dynamicScenarioCount: (count: number) => string;
+  dynamicNewScenario: string;
+  dynamicNoScenarios: string;
+  dynamicUntitledScenario: string;
+  dynamicEmptyTitle: string;
+  dynamicEmptyHelp: string;
+  dynamicScenarioEyebrow: string;
+  dynamicScenarioName: string;
+  dynamicScenarioNameHelp: string;
+  dynamicScenarioSavedLocally: string;
+  dynamicScenarioNoTarget: string;
+  dynamicScenarioTarget: (label: string) => string;
+  dynamicScenarioTargetPending: string;
+  dynamicScenarioTargetMissingShort: string;
+  dynamicScenarioSwitchMessage: string;
+  dynamicScenarioSwitchAnyway: string;
+  dynamicScenarioDeleteTitle: string;
+  dynamicScenarioDeleteMessage: (name: string) => string;
+  dynamicScenarioDeleteConfirm: string;
+  dynamicScenarioSaveAndUpload: string;
+  dynamicScenarioClearDevice: string;
+  dynamicScenarioKeep: string;
+  dynamicScenarioKeepHelp: string;
+  dynamicScenarioKeepUnsupported: string;
+  dynamicConfirmUploadTitle: string;
+  dynamicConfirmUploadMessage: (name: string, target: string) => string;
+  dynamicConfirmUploadConfirm: string;
+  dynamicConfirmClearTitle: string;
+  dynamicConfirmClearMessage: (target: string) => string;
+  dynamicConfirmClearConfirm: string;
+  dynamicBlockerDisconnected: string;
+  dynamicBlockerUnknown: string;
+  dynamicBlockerOperating: string;
+  dynamicTextHelpPending: string;
+  dynamicSampleScenarioWork: string;
+  dynamicSampleScenarioBuild: string;
+  dynamicSampleScenarioScratch: string;
 };
 
 export type Messages = MessageTable;
@@ -485,6 +575,113 @@ const english: MessageTable = {
   dynamicTextTooLong: (maximum) => `Dynamic text cannot exceed ${maximum} bytes.`,
   dynamicTtlInvalid: "The Dynamic Macro TTL is outside the supported range.",
   dynamicCapabilityError: "Could not read the Dynamic Macro capability from this device. Reconnect and try again.",
+  dynamicWorkspace: "Dynamic scenarios",
+  dynamicWorkspaceEyebrow: "Dynamic workspace",
+  dynamicWorkspaceSummary: "RAM-only · no readback",
+  dynamicPreviewBadge: "Preview",
+  dynamicPreviewStateLabel: "Preview state",
+  dynamicPreviewStateHelp: "Preview build: every value on this page comes from an in-memory fixture. No device is contacted and nothing is written to disk or browser storage.",
+  dynamicPreviewStateLabels: {
+    empty: "Empty",
+    new: "New unsaved scenario",
+    dirty: "Unsaved changes",
+    disconnected: "Device disconnected",
+    unknown: "Device state unknown",
+    discovering: "Reading capability",
+    unsupported: "Dynamic unsupported",
+    ready: "Ready",
+    uploading: "Uploading",
+    committed: "Committed locally",
+    clearing: "Clearing",
+    cleared: "Cleared locally",
+    error: "Error",
+    staticLocked: "Static locked, dynamic available",
+    keepUnsupported: "Keep unsupported",
+    targetMissing: "Target missing",
+    capabilityChanged: "Capability changed",
+    oversize: "Text over limit",
+  },
+  dynamicPreviewMockNote: "Preview interaction only: this build never contacts a device, so nothing here is a device confirmation.",
+  dynamicPreviewDeviceName: "Preview keyboard",
+  dynamicPreviewEntryHelp: "Inspect the Dynamic scenario workspace with in-memory fixture data. No keyboard or device connection is required.",
+  dynamicLegacyDialog: "Legacy dialog",
+  dynamicLegacyDialogHelp: "Opens the previous Dynamic Macro dialog. Temporary fallback until this workspace passes visual review.",
+  dynamicWorkspaceWarningTitle: "Non-secret text only.",
+  dynamicWorkspaceWarning: "Dynamic macros are unencrypted and intended only for non-secret text. The app does not detect or filter secrets for you.",
+  dynamicDeviceReady: "Device ready",
+  dynamicTarget: "Upload target",
+  dynamicTargetDevice: "Target device",
+  dynamicTargetDeviceHelp: "Device aliases arrive in a later stage; preview data uses a fixed name.",
+  dynamicTargetObject: "Dynamic object",
+  dynamicTargetChoose: "Choose a target object…",
+  dynamicTargetUnavailable: "Saved target is unavailable",
+  dynamicTargetMissingShort: "Target missing from the current capability",
+  dynamicTargetMissingHelp: "The saved target object is not in the current capability. Choose a target again; the text and draft are kept.",
+  dynamicTargetPending: "Not checked yet",
+  dynamicTargetPendingHelp: "The target list comes from the device capability and is unavailable while the device is not ready.",
+  dynamicTargetSingleHelp: "This device reports a single Dynamic object, so the target is fixed.",
+  dynamicTargetUseOnly: "Use this object",
+  dynamicNoObjects: "This device reports no Dynamic objects.",
+  dynamicNeedsTarget: "Choose a target object first.",
+  dynamicStaticLockedNote: "Static management stays locked while dynamic objects remain available: Dynamic Macro does not use the static password gate.",
+  dynamicCapabilityChangedNotice: "Device capability changed. Re-check text length, TTL, keep-after-execute and the target before uploading.",
+  dynamicCapabilityDetails: "Device behavior & capability details",
+  dynamicCapabilityObjectCount: "Dynamic objects",
+  dynamicCapabilityObject: "Linked object",
+  dynamicCapabilityMaxBytesLabel: "Maximum length",
+  dynamicCapabilityTtlDefault: "Default TTL",
+  dynamicCapabilityTtlRange: "TTL range",
+  dynamicCapabilityKeep: "Keep after execution",
+  dynamicObservation: "Local observation",
+  dynamicObservationNone: "No local observation yet. Upload and clear results are only known from this session.",
+  dynamicObservationUploading: "Preview: an upload to the target object is shown as running.",
+  dynamicObservationCommitted: "Preview: this session marked the target object as uploaded. It is not a readback and does not prove the object is still there.",
+  dynamicObservationClearing: "Preview: a clear of the target object is shown as running.",
+  dynamicObservationCleared: "Preview: this session marked the target object as cleared. The device is not asked for confirmation.",
+  dynamicObservationErrorInterrupted: "Preview error: the transfer was interrupted. Reset the observation to continue.",
+  dynamicObservationErrorTimeout: "Preview error: the device did not confirm in time. Reset the observation to continue.",
+  dynamicObservationErrorUnsupported: "Preview error: the device rejected the request as unsupported. Reset the observation to continue.",
+  dynamicObservationTarget: "Observed target",
+  dynamicObservationReset: "Reset observation",
+  dynamicScenarioListAria: "Dynamic scenarios",
+  dynamicScenarios: "Scenarios",
+  dynamicScenarioCount: (count) => `${count} scenario${count === 1 ? "" : "s"}`,
+  dynamicNewScenario: "New scenario",
+  dynamicNoScenarios: "No scenarios yet. This preview fixture starts empty.",
+  dynamicUntitledScenario: "Untitled scenario",
+  dynamicEmptyTitle: "No scenarios yet",
+  dynamicEmptyHelp: "Scenarios are desktop-side templates that you name yourself. A Dynamic object on the device is only the upload target.",
+  dynamicScenarioEyebrow: "Dynamic scenario",
+  dynamicScenarioName: "Scenario name",
+  dynamicScenarioNameHelp: "Desktop-side name only; it is never sent to the device.",
+  dynamicScenarioSavedLocally: "Saved in memory (preview)",
+  dynamicScenarioNoTarget: "No target object",
+  dynamicScenarioTarget: (label) => `Target: ${label}`,
+  dynamicScenarioTargetPending: "Target: not checked yet",
+  dynamicScenarioTargetMissingShort: "Target missing",
+  dynamicScenarioSwitchMessage: "This scenario has unsaved changes. Switch scenarios anyway? Preview drafts stay in memory until the preview reloads.",
+  dynamicScenarioSwitchAnyway: "Switch anyway",
+  dynamicScenarioDeleteTitle: "Delete scenario",
+  dynamicScenarioDeleteMessage: (name) => `Remove ${name} from this preview? Device objects and their content are not affected.`,
+  dynamicScenarioDeleteConfirm: "Delete scenario",
+  dynamicScenarioSaveAndUpload: "Save & upload",
+  dynamicScenarioClearDevice: "Clear device",
+  dynamicScenarioKeep: "Keep after execution",
+  dynamicScenarioKeepHelp: "Leave the object in place after a successful execution instead of consuming it.",
+  dynamicScenarioKeepUnsupported: "This device does not support keep-after-execute. Turn it off to upload; the saved choice is not changed for you.",
+  dynamicConfirmUploadTitle: "Preview upload",
+  dynamicConfirmUploadMessage: (name, target) => `Save ${name} and mark it as uploaded to ${target}? No device is contacted in this preview.`,
+  dynamicConfirmUploadConfirm: "Mark as uploaded",
+  dynamicConfirmClearTitle: "Preview clear",
+  dynamicConfirmClearMessage: (target) => `Mark ${target} as cleared? The scenario and its text stay untouched.`,
+  dynamicConfirmClearConfirm: "Mark as cleared",
+  dynamicBlockerDisconnected: "Connect a device to upload or clear.",
+  dynamicBlockerUnknown: "The device state is unknown after a reconnect. Reopen the device to continue.",
+  dynamicBlockerOperating: "A preview operation is already running.",
+  dynamicTextHelpPending: "Printable US ASCII, LF, Tab, and Backspace. The length limit follows the device capability.",
+  dynamicSampleScenarioWork: "Work terminal",
+  dynamicSampleScenarioBuild: "Build watch",
+  dynamicSampleScenarioScratch: "Scratch",
 };
 
 const chinese: MessageTable = {
@@ -725,6 +922,113 @@ const chinese: MessageTable = {
   dynamicTextTooLong: (maximum) => `动态文本不能超过 ${maximum} bytes。`,
   dynamicTtlInvalid: "Dynamic Macro TTL 超出支持范围。",
   dynamicCapabilityError: "无法从该设备读取动态宏能力信息。请重新连接后重试。",
+  dynamicWorkspace: "Dynamic 场景",
+  dynamicWorkspaceEyebrow: "Dynamic 工作区",
+  dynamicWorkspaceSummary: "仅存 RAM · 不可读回",
+  dynamicPreviewBadge: "预览",
+  dynamicPreviewStateLabel: "预览状态",
+  dynamicPreviewStateHelp: "预览构建：本页所有数据都来自内存 fixture，不会连接设备，也不会写入磁盘或浏览器存储。",
+  dynamicPreviewStateLabels: {
+    empty: "空状态",
+    new: "新建未保存",
+    dirty: "有未保存修改",
+    disconnected: "设备已断开",
+    unknown: "设备状态未知",
+    discovering: "正在读取能力",
+    unsupported: "不支持 Dynamic",
+    ready: "就绪",
+    uploading: "上传中",
+    committed: "本次会话已提交",
+    clearing: "清除中",
+    cleared: "本次会话已清除",
+    error: "错误",
+    staticLocked: "静态已锁定，Dynamic 可用",
+    keepUnsupported: "不支持执行后保留",
+    targetMissing: "目标对象不存在",
+    capabilityChanged: "能力已变化",
+    oversize: "正文超出上限",
+  },
+  dynamicPreviewMockNote: "仅预览交互：当前构建不会连接设备，这里的结果都不是设备确认。",
+  dynamicPreviewDeviceName: "预览键盘",
+  dynamicPreviewEntryHelp: "使用内存 fixture 数据查看 Dynamic 场景工作区，无需连接键盘或设备。",
+  dynamicLegacyDialog: "旧版对话框",
+  dynamicLegacyDialogHelp: "打开旧的动态宏对话框。该入口在新工作区通过视觉验收前临时保留。",
+  dynamicWorkspaceWarningTitle: "仅限非敏感文本。",
+  dynamicWorkspaceWarning: "动态宏未加密，只适合非机密文本。应用不会替你识别或过滤机密内容。",
+  dynamicDeviceReady: "设备就绪",
+  dynamicTarget: "上传目标",
+  dynamicTargetDevice: "目标设备",
+  dynamicTargetDeviceHelp: "设备别名将在后续阶段实现；预览使用固定名称。",
+  dynamicTargetObject: "动态对象",
+  dynamicTargetChoose: "选择目标对象…",
+  dynamicTargetUnavailable: "已保存的目标当前不可用",
+  dynamicTargetMissingShort: "目标不在当前能力中",
+  dynamicTargetMissingHelp: "已保存的目标对象不在当前能力列表里。请重新选择目标；正文和草稿会保留。",
+  dynamicTargetPending: "尚未检查",
+  dynamicTargetPendingHelp: "目标列表来自设备能力；设备未就绪时不可用。",
+  dynamicTargetSingleHelp: "该设备只报告一个动态对象，因此目标是固定的。",
+  dynamicTargetUseOnly: "使用此对象",
+  dynamicNoObjects: "该设备未报告任何动态对象。",
+  dynamicNeedsTarget: "请先选择目标对象。",
+  dynamicStaticLockedNote: "静态管理保持锁定，但动态对象仍可用：Dynamic Macro 不经过静态密码闸门。",
+  dynamicCapabilityChangedNotice: "设备能力已变化。上传前请重新确认正文长度、TTL、执行后保留和目标对象。",
+  dynamicCapabilityDetails: "设备行为与能力详情",
+  dynamicCapabilityObjectCount: "动态对象数量",
+  dynamicCapabilityObject: "关联对象",
+  dynamicCapabilityMaxBytesLabel: "最大长度",
+  dynamicCapabilityTtlDefault: "默认 TTL",
+  dynamicCapabilityTtlRange: "TTL 范围",
+  dynamicCapabilityKeep: "执行后保留",
+  dynamicObservation: "本地观察",
+  dynamicObservationNone: "尚无本地观察。上传和清空结果只来自本次会话。",
+  dynamicObservationUploading: "预览：正在显示向目标对象上传。",
+  dynamicObservationCommitted: "预览：本次会话已将目标对象标记为已上传。这不是读回，也不能证明对象仍然存在。",
+  dynamicObservationClearing: "预览：正在显示清除目标对象。",
+  dynamicObservationCleared: "预览：本次会话已将目标对象标记为已清除。设备不会返回确认。",
+  dynamicObservationErrorInterrupted: "预览错误：传输被中断。可重置观察后继续。",
+  dynamicObservationErrorTimeout: "预览错误：设备未在超时前确认。可重置观察后继续。",
+  dynamicObservationErrorUnsupported: "预览错误：设备以不支持为由拒绝请求。可重置观察后继续。",
+  dynamicObservationTarget: "观察目标",
+  dynamicObservationReset: "重置观察",
+  dynamicScenarioListAria: "Dynamic 场景列表",
+  dynamicScenarios: "场景",
+  dynamicScenarioCount: (count) => `${count} 个场景`,
+  dynamicNewScenario: "新建场景",
+  dynamicNoScenarios: "还没有场景。该预览 fixture 从空状态开始。",
+  dynamicUntitledScenario: "未命名场景",
+  dynamicEmptyTitle: "还没有场景",
+  dynamicEmptyHelp: "场景是你自己命名的桌面端模板；设备上的动态对象只是上传目标。",
+  dynamicScenarioEyebrow: "Dynamic 场景",
+  dynamicScenarioName: "场景名称",
+  dynamicScenarioNameHelp: "仅用于桌面端显示，不会发送到设备。",
+  dynamicScenarioSavedLocally: "已保存到内存（预览）",
+  dynamicScenarioNoTarget: "未选择目标对象",
+  dynamicScenarioTarget: (label) => `目标：${label}`,
+  dynamicScenarioTargetPending: "目标：尚未检查",
+  dynamicScenarioTargetMissingShort: "目标不存在",
+  dynamicScenarioSwitchMessage: "该场景有未保存修改。仍要切换场景吗？预览草稿会保留在内存中，直到预览重载。",
+  dynamicScenarioSwitchAnyway: "仍然切换",
+  dynamicScenarioDeleteTitle: "删除场景",
+  dynamicScenarioDeleteMessage: (name) => `从预览中移除 ${name}？设备对象及其内容不受影响。`,
+  dynamicScenarioDeleteConfirm: "删除场景",
+  dynamicScenarioSaveAndUpload: "保存并上传",
+  dynamicScenarioClearDevice: "清除设备对象",
+  dynamicScenarioKeep: "执行后保留",
+  dynamicScenarioKeepHelp: "成功执行后保留对象，而不是消费它。",
+  dynamicScenarioKeepUnsupported: "该设备不支持执行后保留。请关闭该项后再上传；已保存的选择不会被自动改写。",
+  dynamicConfirmUploadTitle: "预览上传",
+  dynamicConfirmUploadMessage: (name, target) => `保存 ${name} 并标记为已上传到 ${target}？本次预览不会连接设备。`,
+  dynamicConfirmUploadConfirm: "标记为已上传",
+  dynamicConfirmClearTitle: "预览清除",
+  dynamicConfirmClearMessage: (target) => `将 ${target} 标记为已清除？场景及其正文不受影响。`,
+  dynamicConfirmClearConfirm: "标记为已清除",
+  dynamicBlockerDisconnected: "请先连接设备，再上传或清除。",
+  dynamicBlockerUnknown: "重新连接后设备状态未知。请重新打开设备后再继续。",
+  dynamicBlockerOperating: "已有预览操作正在进行。",
+  dynamicTextHelpPending: "支持可打印 US ASCII、LF、Tab 和 Backspace；长度上限以设备能力为准。",
+  dynamicSampleScenarioWork: "工作终端",
+  dynamicSampleScenarioBuild: "构建监视",
+  dynamicSampleScenarioScratch: "临时草稿",
 };
 
 const MESSAGE_TABLE: Record<Locale, MessageTable> = { en: english, "zh-CN": chinese };

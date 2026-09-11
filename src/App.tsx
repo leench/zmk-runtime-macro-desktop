@@ -49,9 +49,10 @@ import { MacroWorkbench } from "./pages/MacroWorkbench";
 import { Unlock } from "./pages/Unlock";
 import { PasswordSetupModal } from "./components/PasswordSetupModal";
 import { DynamicMacroModal } from "./components/DynamicMacroModal";
+import { DynamicWorkspace } from "./features/dynamic/DynamicWorkspace";
 import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
 import { SelectField } from "./components/SelectField";
-import type { Platform } from "./components/TitleBar";
+import { TitleBar, type Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
 import type { DynamicCapabilityStatus, DynamicObjectState, DynamicObjectStatus } from "./types/dynamic";
 import type { SlotAction, SlotState } from "./types/workbench";
@@ -367,6 +368,8 @@ function App() {
   const [dynamicObjects, setDynamicObjects] = useState<DynamicObjectState[]>(() => [createDynamicObjectState(FIRST_DYNAMIC_SLOT)]);
   const [selectedDynamicSlot, setSelectedDynamicSlot] = useState<number>(FIRST_DYNAMIC_SLOT);
   const [dynamicModalOpen, setDynamicModalOpen] = useState(false);
+  // Page-level dynamic workspace; the legacy dialog stays available as fallback.
+  const [dynamicWorkspaceOpen, setDynamicWorkspaceOpen] = useState(false);
 
   const mounted = useRef(false);
   const operation = useRef(0);
@@ -480,6 +483,7 @@ function App() {
       setDynamicCapabilities(null);
       setDynamicCapabilityStatus("unknown");
       setDynamicModalOpen(false);
+      setDynamicWorkspaceOpen(false);
       setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
       clearAuthDeadline();
       cancelPreviewLoads();
@@ -663,6 +667,7 @@ function App() {
         setDynamicCapabilities(null);
         setDynamicCapabilityStatus("unknown");
         setDynamicModalOpen(false);
+        setDynamicWorkspaceOpen(false);
         setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
       }
       if (!nextConnection.connected && nextDevices.length === 0) {
@@ -700,6 +705,7 @@ function App() {
     setDynamicCapabilities(null);
     setDynamicCapabilityStatus("unknown");
     setDynamicModalOpen(false);
+    setDynamicWorkspaceOpen(false);
     setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
     setConnection(disconnected);
     hideRevealed();
@@ -777,6 +783,7 @@ function App() {
       setDynamicCapabilities(null);
       setDynamicCapabilityStatus("unknown");
       setDynamicModalOpen(false);
+      setDynamicWorkspaceOpen(false);
       setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
       setSelectedId("");
       setClearConfirm(null);
@@ -811,6 +818,7 @@ function App() {
           setDynamicCapabilities(null);
           setDynamicCapabilityStatus("unknown");
           setDynamicModalOpen(false);
+          setDynamicWorkspaceOpen(false);
           setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
           clearAuthDeadline();
           cancelPreviewLoads();
@@ -1491,7 +1499,7 @@ function App() {
 
   return (
     <>
-      {route === "select" ? (
+      {route === "select" && !dynamicWorkspaceOpen ? (
         <DeviceSelect
           copy={copy}
           platform={platform}
@@ -1505,7 +1513,17 @@ function App() {
           onSelect={setSelectedId}
           onConnect={() => { if (selectedId) requestDeviceConnect(selectedId); }}
           onRefresh={() => void refreshDevices()}
+          onDynamicWorkspaceOpen={() => setDynamicWorkspaceOpen(true)}
         />
+      ) : null}
+
+      {route === "select" && dynamicWorkspaceOpen ? (
+        <div className="flex h-full w-full flex-col overflow-hidden bg-canvas">
+          <TitleBar platform={platform} title={copy.appName} labels={{ close: copy.close, minimize: copy.minimize, maximize: copy.maximize }} />
+          <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <DynamicWorkspace copy={copy} onClose={() => setDynamicWorkspaceOpen(false)} />
+          </main>
+        </div>
       ) : null}
 
       {route === "unlock" && connection.device ? (
@@ -1560,8 +1578,16 @@ function App() {
           onLock={() => void lockManagement()}
           onSwitchDevice={requestDeviceConnect}
           onDisconnect={() => void disconnectDevice()}
-          onDynamicOpen={() => setDynamicModalOpen(true)}
-          dynamicModalOpen={dynamicModalOpen}
+          onDynamicOpen={() => { setDynamicModalOpen(false); setDynamicWorkspaceOpen((value) => !value); }}
+          dynamicActive={dynamicModalOpen || dynamicWorkspaceOpen}
+          dynamicWorkspaceOpen={dynamicWorkspaceOpen}
+          dynamicWorkspace={
+            <DynamicWorkspace
+              copy={copy}
+              onClose={() => setDynamicWorkspaceOpen(false)}
+              onOpenLegacyDialog={() => setDynamicModalOpen(true)}
+            />
+          }
           onSelectSlot={selectSlot}
           onMoveSelection={(offset) => {
             const index = slots.findIndex((slot) => slot.slot === selectedSlot);
