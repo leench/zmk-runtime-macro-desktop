@@ -6,7 +6,7 @@
 
 首版目标平台：Linux x86_64、macOS Intel/Apple Silicon、Windows x64。前端不直接访问 HID，所有枚举、认证、协议和传输都在 Rust/Tauri command 层完成。
 
-当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）现有两条路径：DeviceSelect 的 Preview 入口继续使用 18 个 in-memory fixture，不调用 Tauri、不接 HID、不写盘；已连接 Workbench 的入口已通过 App bridge 接入真实 capability、无正文 DynamicService 状态、upload/clear 和 Scenario store。保存、删除、Save & Upload 遵守 dirty/失败保留语义，旧 `DynamicMacroModal`/`DynamicMacroPanel` 保留为 fallback。该工作区仍待真实设备和人工视觉验收。阶段 1 托盘基础（§4.8）已实现：Tauri 2 tray icon/原生菜单、打开/隐藏/明确退出、close-to-tray 和单实例窗口恢复；托盘菜单的设备/Dynamic/Scenario 状态行和 Dynamic 操作项仍是 disabled 的 preview 占位，不接 DynamicService、不调用 HID；菜单文本提供 `en` / `zh-CN` 两套 labels，由受限 command `set_tray_locale` 跟随前端 `resolveLocale` 实时更新（只接受精确 `"en"` / `"zh-CN"`，非法值返回 `unsupported_locale`），无需重启。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
+当前状态：阶段 1–5（v2 protocol/auth core、Tauri session/bridge、MagicPatterns UI、密码管理、隐私预览、认证窗口恢复、重连、best-effort LOCK、文档和本机最终门禁）已实现并通过自动验证；Dynamic Macro 后端已按 Dynamic Protocol v2 多槽位（slot-aware CAPABILITIES/DYNAMIC_BEGIN/DYNAMIC_DATA/DYNAMIC_CLEAR，最多 512 bytes/object）迁移完成，前端已按 `CAPABILITIES` 的 object count 提供多 object 选择（每个 object 独立内存 draft/状态，校验使用设备上报的长度和 TTL 范围）。页面级 Dynamic Workspace（§4.7）现有两条路径：DeviceSelect 的 Preview 入口继续使用 18 个 in-memory fixture，不调用 Tauri、不接 HID、不写盘；已连接 Workbench 的入口已通过 App bridge 接入真实 capability、无正文 DynamicService 状态、upload/clear 和 Scenario store。保存、删除、Save & Upload 遵守 dirty/失败保留语义，旧 `DynamicMacroModal`/`DynamicMacroPanel` 保留为 fallback。该工作区仍待真实设备和人工视觉验收。托盘（§4.8）已实现 tray icon/原生菜单、打开/隐藏/明确退出、close-to-tray 和单实例窗口恢复，并已接入真实状态与三个操作：`set_tray_runtime_state` 只接受精确 status tag 和有界显示名（非法值返回 `unsupported_tray_status` / `invalid_tray_scenario_name`），状态行始终 disabled，`Choose/Upload/Clear` 按 context 启用并通过全局 `tray-action` event 交给窗口执行（托盘不打开 HID、不调用 DynamicService/Scenario store）；菜单文本提供 `en` / `zh-CN` 两套 labels，由受限 `set_tray_locale` 跟随前端 `resolveLocale` 实时更新（只接受精确 `"en"` / `"zh-CN"`，非法值返回 `unsupported_locale`），无需重启。macOS/Windows 原生安装器和 Ubuntu 22.04 AppImage 仍需在对应 runner/平台完成实际安装验证；不在文档或发布流程中伪造硬件结果。
 
 ## 2. 固件和协议约束
 
@@ -141,19 +141,21 @@ UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object �
 - 保存、删除、Save & Upload 使用串行 store 写入；保存失败保留 dirty draft，Save & Upload 只有在本地保存成功后才调用设备；关闭和切换 Scenario 保留 dirty 确认；
 - 旧 `DynamicMacroModal`/`DynamicMacroPanel` 仍是真实 dynamic handler，从已连接 workbench 打开的 workspace header 保留 `Legacy dialog` fallback 按钮；
 - target 行按 capability 驱动：单 object（count = 1）为只读行，多 object 为 selector；saved target 不在最新 capability 时显示 saved target unavailable / target missing 并保留正文和 dirty draft，单 object 设备也不会自动采用唯一 object，必须由用户主动点击 `Use this object` 重新绑定，绑定前 upload/clear 保持禁用；
-- 托盘真实状态、HTTP API、自动 capability discovery 和 device alias 属于后续阶段。
+- 托盘状态行和三个托盘操作已接入（§4.8：受限 `set_tray_runtime_state` + 全局 `tray-action` event，托盘不直接读写设备）；HTTP API、自动 capability discovery 和 device alias 属于后续阶段。
 
-### 4.8 托盘基础与窗口生命周期
+### 4.8 托盘状态/操作与窗口生命周期
 
-阶段 1 托盘基础已实现，代码位于 `src-tauri/src/tray.rs`（Tauri 2 `TrayIconBuilder`/`MenuBuilder`/`TrayIconEvent`）和 `src/App.tsx` 的 close handler：
+托盘代码位于 `src-tauri/src/tray.rs`（Tauri 2 `TrayIconBuilder`/`MenuBuilder`/`TrayIconEvent`/`Emitter`）和 `src/App.tsx` 的 close handler；托盘是**视图，不是 worker**：它不打开 HID、不发送 protocol frame、不调用 `DynamicService`、不读取 Scenario store、也不显示 HID path、serial 或正文：
 
 - tray icon 复用 `tauri.conf.json` 中 `bundle.icon` 嵌入的默认窗口 PNG，不新增图片资源或 Tauri plugin 依赖；
 - 菜单文本提供 `en` 与 `zh-CN` 两套 labels（集中在 `tray.rs` 的 `TrayLabels`，不进入前端 UI locale 文件），menu item ID 稳定：`tray-open-main`、`tray-status-device`、`tray-status-dynamic`、`tray-status-scenario`、`tray-choose-scenario`、`tray-upload-scenario`、`tray-clear-dynamic`、`tray-settings`、`tray-quit`；
-- 托盘跟随 UI locale：`init` 先用英文默认 labels 建菜单并把 `MenuItem` handles 交给 Tauri managed state；受限 command `set_tray_locale` 只接受精确的 `"en"` / `"zh-CN"`（其他值返回稳定错误 `unsupported_locale`，不 fallback、不把任意字符串写进菜单），再用 `MenuItem::set_text` 更新已有菜单项，菜单结构、ID 和 disabled 状态不变。`App.tsx` 在 Tauri 环境启动时以及 locale 变化时把 `resolveLocale` 的结果同步给托盘，无需重启，失败静默处理；浏览器预览不调用 invoke。Rust 不读环境变量、localStorage 或设备信息来猜语言；
-- 真实行为只有窗口生命周期和菜单文本同步：`Open ZMK Runtime Macro` 和 tray icon 左键点击显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 绕过 close-to-tray，退出时由 `AppState` 的 drop 继续执行 best-effort LOCK；第二次启动由 single-instance plugin 恢复已有窗口；
+- 托盘跟随 UI locale：`init` 先用英文默认 labels 建菜单并把 `MenuItem` handles 交给 Tauri managed state；受限 command `set_tray_locale` 只接受精确的 `"en"` / `"zh-CN"`（其他值返回稳定错误 `unsupported_locale`，不 fallback、不把任意字符串写进菜单），再用 `MenuItem::set_text` / `set_enabled` 重写已有菜单项，菜单结构、ID 和 menu event 处理不变，locale 切换不重置 runtime context。`App.tsx` 在 Tauri 环境启动时以及 locale 变化时把 `resolveLocale` 的结果同步给托盘，无需重启，失败静默处理；浏览器预览不调用 invoke。Rust 不读环境变量、localStorage 或设备信息来猜语言；
+- 运行状态：受限 command `set_tray_runtime_state`（参数 `deviceConnected`、`dynamicStatus`、`currentScenarioName`、`canChooseScenario`、`canUploadScenario`、`canClearDynamic`）是唯一的运行状态输入，Rust 只接受精确 status tag 和一个有界显示名（≤ 64 bytes、无控制字符），校验失败返回 `unsupported_tray_status` / `invalid_tray_scenario_name`（不回显被拒值），并把三个 action flag 与 `deviceConnected` 取交集，因此断连时不会 offer 设备操作。状态行始终 disabled、仅展示；`App.tsx` 把连接状态、`DynamicService` status 和 workspace 回传的显示名/可用性同步过去，断连立即重置；
+- 操作菜单：`Choose scenario` / `Upload current scenario` / `Clear Dynamic Object` 仅在已连接且窗口报告无 blocker 时 enabled（目标缺失、超长、TTL、keep 不支持、store 不可用、操作进行中均保持 disabled）。点击时托盘先恢复并 focus 主窗口，再 emit 全局 event `tray-action`（payload 只有 `chooseScenario` / `uploadScenario` / `clearDynamic`）；`src/features/dynamic/DynamicWorkspace.tsx` 在连接模式下监听：choose 打开工作区，upload 复用 Save & Upload（先保存成功再上传），clear 复用现有确认，blocker 存在时就地安全忽略（DeviceSelect 的 Preview 实例不订阅）；
+- 窗口生命周期：`Open ZMK Runtime Macro` 和 tray icon 左键点击显示、取消最小化并 focus 主窗口；`Settings` 同样只显示并聚焦主窗口（设置界面在主窗口内）；`Quit ZMK Runtime Macro` 调用 `app.exit(0)` 绕过 close-to-tray，退出时由 `AppState` 的 drop 继续执行 best-effort LOCK；第二次启动由 single-instance plugin 恢复已有窗口；
 - close-to-tray：`onCloseRequested` 始终 `preventDefault`，dirty 时弹出与原来相同的确认 modal，确认后经 best-effort disconnect/LOCK（正常 Disconnect 路径，同时把本地状态回到 disconnected）再 `hide()`；窗口不再被 destroy，因此 close 路径会对下一次关闭请求重新生效，浏览器预览继续使用 `beforeunload`；
-- preview 占位（disabled）：`Device`、`Dynamic status`、`Current scenario` 状态行以及 `Choose scenario`、`Upload current scenario`、`Clear Dynamic Object` 操作项，英文标签直接写明 `preview only` / `(preview)`，中文标签写明“仅预览”或“（预览）”。托盘不读取 DynamicService 状态（状态层已存在于 §4.9，托盘接入属后续阶段），不读取设备状态、不打开 HID、不发送 protocol frame、不调用 dynamic command，也不显示 HID path、serial 或正文；启用它们需要阶段 7（托盘接入真实状态）；
-- 未实现：托盘真实状态、tray 上传/clear、autostart、HTTP API、自动 capability discovery 和 device alias；DynamicService 的 connected Workbench 接入与 Scenario store UI 接入已完成，DeviceSelect Preview 仍不接真实数据；
+- 菜单里的 Dynamic 行使用本地观察措辞（`Sent/Cleared · local confirmation`、`已发送/已清除 · 本地确认`），不当作设备 readback；状态行不使用会被误读为真实 ACK 的措辞；
+- 未实现：autostart、HTTP API、自动 capability discovery 和 device alias；设备行只显示是否连接，alias 属后续阶段；
 - 平台差异：Linux appindicator 在任意点击都会弹出菜单（`show_menu_on_left_click(false)` 在该平台无效），部分 Linux 桌面（如无托盘扩展的 GNOME）不提供 `TrayIconEvent::Click`，此时菜单内的 `Open ZMK Runtime Macro` 是兜底入口；这些需要在对应平台人工验收。
 
 ### 4.9 DynamicService 状态层与 DTO（backend）
@@ -166,7 +168,7 @@ UI 按 `CAPABILITIES` 的 object count 生成 capability-driven 目标 object �
 - `generation` 是本地 last-write-wins 计数器，不是 firmware 值、protocol request id 或设备版本：每次 capability/upload/clear 分配新 generation，过期完成不覆盖当前状态；新操作开始时清除被取代操作遗留的 in-flight object 状态，已确认的观察（含 byte length）保留；
 - 状态迁移：connect/disconnect/设备替换/应用退出（`AppState` drop）后为 `unknown`；capability 成功为 `ready`（并按 `dynamic_object_count` 生成 object 行），`BAD_OPCODE`/`BAD_VERSION` 为 `unsupported`，其他失败为 `error`；upload/clear 开始时为 `uploading`/`clearing`，成功只记录本地 ACK（`committedLocally`/`clearedLocally`）；Remote status 失败保留 session 并进入 `error`/`unsupported`，transport/protocol 失败丢弃 session 并回到 `unknown`；backend 不保存 draft，也不保存任何 dynamic 正文；
 - command：只读 `get_dynamic_state`（无 HID I/O）返回该无正文 DTO；`get_dynamic_capabilities`/`upload_dynamic`/`clear_dynamic` 与它共用同一状态层，返回值和错误映射不变；
-- connected Workbench 的 page-level Dynamic Workspace 已接入真实 capability、`get_dynamic_state`、upload/clear 和 Scenario store；DeviceSelect 的 Preview 路径仍只使用 fixture；托盘真实状态（§4.8 仍是 disabled preview 占位）、托盘 Scenario 选择和 HTTP API 仍未实现；连接后的自动 capability discovery 也仍未实现（仍由显式 command 触发）。
+- connected Workbench 的 page-level Dynamic Workspace 已接入真实 capability、`get_dynamic_state`、upload/clear 和 Scenario store；DeviceSelect 的 Preview 路径仍只使用 fixture；托盘状态行与三个操作已接入（§4.8：托盘只写受限 context 并 emit `tray-action`，操作由窗口执行）；HTTP API、连接后的自动 capability discovery（仍由显式 command 触发）和 device alias 仍未实现。
 
 ### 4.10 Scenario 原子持久化 store（backend + bridge）
 
@@ -195,7 +197,7 @@ Rust command layer
 Runtime Macro protocol v2 / hidapi
 ```
 
-前端只调用 `bridge.ts` 中的 Tauri commands。Rust 负责设备发现、显式候选选择、AUTH_INFO、认证 KDF/proof、static LIST/GET/SET/CLEAR、dynamic capability/upload/clear（含 object slot 校验）、重试、事务边界和错误映射。Dynamic commands 不经过 `ensure_management_access`，但仍复用同一 HID session/串行队列；Tauri IPC 使用 camelCase 参数（包括 `slot`、`ttlSeconds`、`keepAfterExecute`）。Dynamic 的本地观察状态由 `src-tauri/src/dynamic_service.rs` 的 `DynamicService` 维护（§4.9），只读 command `get_dynamic_state` 不做 HID I/O，只返回当前 session 的无正文观察状态。`set_tray_locale` 是唯一的托盘 command：参数名为 `locale`（前端按 camelCase 传 `{ locale }`），只更新原生菜单文本，不接 HID、不调用 DynamicService、不持久化任何配置。Tauri command 不返回 salt、iterations、K、nonce、proof、密码、dynamic 正文、dynamic readback 或 raw report。
+前端只调用 `bridge.ts` 中的 Tauri commands。Rust 负责设备发现、显式候选选择、AUTH_INFO、认证 KDF/proof、static LIST/GET/SET/CLEAR、dynamic capability/upload/clear（含 object slot 校验）、重试、事务边界和错误映射。Dynamic commands 不经过 `ensure_management_access`，但仍复用同一 HID session/串行队列；Tauri IPC 使用 camelCase 参数（包括 `slot`、`ttlSeconds`、`keepAfterExecute`、`deviceConnected`、`dynamicStatus`、`currentScenarioName`）。Dynamic 的本地观察状态由 `src-tauri/src/dynamic_service.rs` 的 `DynamicService` 维护（§4.9），只读 command `get_dynamic_state` 不做 HID I/O，只返回当前 session 的无正文观察状态。托盘有两个受限 command：`set_tray_locale`（参数 `locale`，只接受精确 `"en"` / `"zh-CN"`）和 `set_tray_runtime_state`（参数 `deviceConnected` / `dynamicStatus` / `currentScenarioName` / `canChooseScenario` / `canUploadScenario` / `canClearDynamic`，校验后仅重写菜单文本与 enabled 状态）；两者都不接 HID、不调用 DynamicService、不读取 Scenario store、不持久化任何配置，托盘操作通过全局 event `tray-action` 回到窗口执行。Tauri command 不返回 salt、iterations、K、nonce、proof、密码、dynamic 正文、dynamic readback 或 raw report。
 
 ## 6. Tauri window 权限
 
@@ -206,7 +208,7 @@ Runtime Macro protocol v2 / hidapi
 - `core:window:allow-close`、`allow-destroy`、`allow-minimize`、`allow-toggle-maximize`、`allow-start-dragging`；
 - `core:window:allow-hide`（close-to-tray：窗口关闭时隐藏到托盘，而不是销毁窗口）。
 
-tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(0)`）和菜单文本更新（`MenuItem::set_text`）都在 Rust 侧执行，不需要额外窗口权限；托盘只新增了一个 invoke entry：`set_tray_locale`（参数 `locale`，只接受精确 `"en"` / `"zh-CN"`，非法值返回稳定错误 `unsupported_locale`，不 panic），它不读取 HID 信息、不改变 close-to-tray 和 tray actions。
+tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(0)`）、菜单文本与 enabled 更新（`MenuItem::set_text` / `set_enabled`）和 `tray-action` event（`Emitter::emit`）都在 Rust 侧执行，不需要额外窗口权限；托盘只新增两个 invoke entry：`set_tray_locale`（参数 `locale`，只接受精确 `"en"` / `"zh-CN"`，非法值返回 `unsupported_locale`）与 `set_tray_runtime_state`（参数为受限 context 字段，非法 status 返回 `unsupported_tray_status`，非法场景名返回 `invalid_tray_scenario_name`，不 panic）；两者都不读取 HID 信息、不改变 close-to-tray 和 tray actions。前端监听 `tray-action` 复用已有的 `core:event:allow-listen` 权限，不新增 capability。
 
 不得为了方便恢复 `core:default` 全量权限。浏览器开发环境不能因为不存在 Tauri internals 而报错。
 
@@ -219,10 +221,11 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 5. 文档、跨平台行为/安装器配置检查和最终验证（含硬件边界检查）；
 6. Dynamic Macro v2 多槽位 capability（slot-aware capability/upload/clear、512-byte object、逐槽 clear）、keep-after-execute、unknown lifecycle 和 fake-HID/golden matrix；
 7. Dynamic Workspace page-level UI-only 阶段（Scenario 列表/编辑器、capability-driven target 行、18 个 preview 状态、in-memory only）；真实 dynamic 操作仍走旧 modal；
-8. 托盘基础（Tauri 2 tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复）和菜单文本多语言（`en` / `zh-CN` 两套 labels，`set_tray_locale` 跟随 UI locale，Rust 只接受这两个精确 tag）；设备/Dynamic/Scenario 状态行和 Dynamic 操作项为 disabled preview 占位，不接 DynamicService；
-9. DynamicService 状态层和 DTO（`src-tauri/src/dynamic_service.rs`、`get_dynamic_state` command、`bridge.ts` 类型 wrapper、generation 与单一 HID writer 边界，见 §4.9）；connected Workbench 的 UI Workspace 已接入，托盘真实状态和 HTTP API 仍未接入；
+8. 托盘（Tauri 2 tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复）、菜单文本多语言（`en` / `zh-CN` 两套 labels，`set_tray_locale` 跟随 UI locale，Rust 只接受这两个精确 tag）和真实状态/操作：`set_tray_runtime_state` 只接受精确 status tag 与有界显示名，状态行始终 disabled，三个操作按 context 启用并通过全局 `tray-action` event 交给窗口执行（托盘不打开 HID）；
+9. DynamicService 状态层和 DTO（`src-tauri/src/dynamic_service.rs`、`get_dynamic_state` command、`bridge.ts` 类型 wrapper、generation 与单一 HID writer 边界，见 §4.9）；connected Workbench 的 UI Workspace 已接入，HTTP API 仍未接入；
 10. Scenario store（`src-tauri/src/scenario_store.rs`、`load_scenarios` / `save_scenarios` command、`bridge.ts` 的 `PersistedScenario`/`ScenarioStore` wrapper，见 §4.10）；文件 schema、原子写和损坏可恢复行为已实现，connected Workbench 已调用 store，DeviceSelect Preview 仍保持 in-memory；
-11. Connected Dynamic Workspace integration：真实 capability、无正文 observed state、objectId/wireSlot 显式映射、Scenario dirty/atomic persistence 和 Save & Upload 顺序已实现；托盘真实状态、HTTP、自动 discovery、device alias 和真实设备人工验收仍待完成。
+11. Connected Dynamic Workspace integration：真实 capability、无正文 observed state、objectId/wireSlot 显式映射、Scenario dirty/atomic persistence 和 Save & Upload 顺序已实现；
+12. 托盘状态与操作接入：`src-tauri/src/tray.rs` 的 `TrayRuntimeContext`（受限字段 + 精确 status allowlist + 有界显示名）、`set_tray_runtime_state` command、三个 action 的 `tray-action` event，以及 `App.tsx`/`DynamicWorkspace.tsx` 的同步与监听（blocker 存在时安全忽略）；HTTP、自动 discovery、device alias 和真实设备/跨平台人工验收仍待完成。
 
 所有阶段均只支持 v2，不提供 Legacy v1 管理。MagicPatterns 是唯一视觉基准；仅在真实功能、v2 协议、安全约束或 Tauri 平台行为冲突时适配，并记录冲突原因。
 
@@ -242,6 +245,6 @@ tray icon、原生菜单、`show`/`unminimize`/`set_focus`、`Quit`（`app.exit(
 
 ## 9. 当前剩余工作与发布边界
 
-阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 connected Workbench 路径已接入真实 capability、无正文 DynamicService observed state、upload/clear 和 Scenario store；DeviceSelect 路径仍保持纯 Preview，不调用 Tauri、不接 HID、不写盘。真实设备和页面视觉仍需人工验收。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复、菜单文本跟随 UI locale），本机自动验证已通过（含两套 labels、`preview` 标记和非法 locale 的单元测试），但托盘图标/菜单交互、菜单文本在实际系统上的渲染与切换、close-to-tray、Wayland/X11 和单实例行为仍需在对应平台人工验收；托盘菜单中的设备/Dynamic/Scenario 状态和 Dynamic 操作仍是 preview 占位。DynamicService 状态层和 `get_dynamic_state` DTO（§4.9）只发布本地观察状态（service/object 状态、byte length、本地 generation、可选 TTL/keep），不保存也不返回正文、HID path、serial 或 raw frame；本机 Rust/前端测试覆盖了初始/`unknown`、capability 成功与 `unsupported`/`error`、多 object、upload/clear 成功与失败、过期 generation 和 DTO 字段集合检查。Scenario store（`scenario_store.rs`、`load_scenarios`/`save_scenarios`、`bridge.ts` wrapper）及 connected Workbench 接入已通过本机 Rust/前端测试：缺文件返回空 schema v1、round trip、schema 版本拒绝、损坏 JSON 保留原文件、重复/空 id、name/字符集/TTL/count 校验、原子替换与临时文件清理、Windows 备份替换路径，以及无 Tauri host 时前端不伪造成功；这些测试只断言结构、长度和错误码，不输出正文，也未连接真实硬件。托盘真实状态、HTTP API、自动 capability discovery、device alias 和三平台人工验收仍待后续。
+阶段 5 已完成文档一致性、跨平台配置/构建检查、最终自动验证和硬件边界记录；本阶段未连接真实硬件，也未执行 `GET`、`SET` 或 `CLEAR`。Dynamic Workspace 的 connected Workbench 路径已接入真实 capability、无正文 DynamicService observed state、upload/clear 和 Scenario store；DeviceSelect 路径仍保持纯 Preview，不调用 Tauri、不接 HID、不写盘。真实设备和页面视觉仍需人工验收。托盘基础（§4.8）已实现（tray icon、原生菜单、close-to-tray、明确退出、单实例窗口恢复、菜单文本跟随 UI locale），并已接入真实状态与三个操作（受限 `set_tray_runtime_state` + 全局 `tray-action` event；托盘不打开 HID、不调用 DynamicService/Scenario store）。本机自动验证已通过（含两套 labels、status allowlist、非法 status/名称拒绝、状态行始终 disabled、action enabled 边界、event payload 只含三个 action，以及无 Tauri host 时前端不伪造成功），但托盘图标/菜单在实际系统上的渲染、菜单文本与 enabled 切换、close-to-tray、Wayland/X11、三个托盘操作的真实硬件效果和单实例行为仍需在对应平台人工验收。DynamicService 状态层和 `get_dynamic_state` DTO（§4.9）只发布本地观察状态（service/object 状态、byte length、本地 generation、可选 TTL/keep），不保存也不返回正文、HID path、serial 或 raw frame；本机 Rust/前端测试覆盖了初始/`unknown`、capability 成功与 `unsupported`/`error`、多 object、upload/clear 成功与失败、过期 generation 和 DTO 字段集合检查。Scenario store（`scenario_store.rs`、`load_scenarios`/`save_scenarios`、`bridge.ts` wrapper）及 connected Workbench 接入已通过本机 Rust/前端测试：缺文件返回空 schema v1、round trip、schema 版本拒绝、损坏 JSON 保留原文件、重复/空 id、name/字符集/TTL/count 校验、原子替换与临时文件清理、Windows 备份替换路径，以及无 Tauri host 时前端不伪造成功；这些测试只断言结构、长度和错误码，不输出正文，也未连接真实硬件。HTTP API、自动 capability discovery、device alias 和三平台人工验收仍待后续。
 
 后续维护必须继续遵守 v2-only 边界，不得恢复 Legacy v1 管理或把密码、K、正文、HID path、serial、raw report 写入持久化、日志和诊断。

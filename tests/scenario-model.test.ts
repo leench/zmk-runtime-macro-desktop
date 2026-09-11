@@ -211,7 +211,9 @@ test("upload blockers cover device state, target, text, TTL and keep support", (
   assert.deepEqual(gate(editScenario(valid, { ttlSeconds: 60 })), []);
   assert.deepEqual(gate(editScenario(valid, { ttlSeconds: 86_400 })), []);
   assert.ok(gate(editScenario(valid, { keepAfterExecute: true }), { capability: capabilitiesFor("keepUnsupported") }).includes("keepUnsupported"));
-  assert.deepEqual(gate(null), []);
+  // Upload needs an explicit scenario and target: with a reported capability an
+  // unselected scenario is an unresolved target, not an available action.
+  assert.deepEqual(gate(null), ["targetMissing"]);
   assert.ok(uploadBlockers({ device: "ready", capability: null, scenario: valid, observation }).includes("capabilityDiscovering"));
 });
 
@@ -224,6 +226,10 @@ test("clear blockers need a device and a target but ignore text, TTL and keep", 
   assert.ok(blockersFor("unsupported").clear.includes("dynamicUnsupported"));
   assert.ok(blockersFor("targetMissing").clear.includes("targetMissing"));
   assert.ok(blockersFor("uploading").clear.includes("operationInProgress"));
+  // A reported capability without a selected scenario has no target to clear.
+  const capability = capabilitiesFor("ready");
+  const observation: DynamicObservation = { status: "none", targetObjectId: null, errorKind: null };
+  assert.deepEqual(clearBlockers({ device: "ready", capability, scenario: null, observation }), ["targetMissing"]);
 });
 
 test("scenario text length is counted in bytes", () => {

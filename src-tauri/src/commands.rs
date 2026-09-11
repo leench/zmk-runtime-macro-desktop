@@ -16,7 +16,19 @@ use crate::hid::{
     DeviceRecord, DeviceSummary, HidTransport, RUNTIME_MACRO_USAGE, RUNTIME_MACRO_USAGE_PAGE,
 };
 use crate::protocol::{AuthInfo, DynamicCapabilities, Status};
-use crate::tray::{TrayLocale, TrayMenuItems};
+use crate::tray::{
+    tray_context_from_parts, TrayContextError, TrayLocale, TrayMenuItems, TrayRuntimeContext,
+};
+
+/// Maps a rejected tray runtime input onto the stable command error envelope.
+///
+/// Neither variant echoes the rejected value, so a bad status tag or an unsafe
+/// scenario name can never travel back to the frontend or into a menu label.
+impl From<TrayContextError> for CommandError {
+    fn from(error: TrayContextError) -> Self {
+        Self::new(error.code(), error.message())
+    }
+}
 
 // The dynamic capability DTO lives in the service state layer, which is its only
 // definition. The crate path of the command module stays a valid alias for it.
@@ -1517,21 +1529,78 @@ pub async fn get_dynamic_state(
 /// The locale always comes from the frontend's `resolveLocale` result: this
 /// command never reads an environment variable, a stored preference or device
 /// data, and it rejects every tag except the exact `en` and `zh-CN` values. Only
-/// menu text changes; menu ids, structure, enabled state, window lifecycle and
-/// the disabled Dynamic placeholders are untouched, so no HID or Dynamic
-/// operation is involved.
+/// menu text and the enabled flags are rewritten from the stored runtime
+/// context; menu ids, menu structure, window lifecycle and the tray actions are
+/// untouched, so no HID or Dynamic operation is involved.
 #[tauri::command]
 pub async fn set_tray_locale(
     locale: String,
     menu: State<'_, TrayMenuItems>,
 ) -> Result<(), CommandError> {
     let locale = tray_locale_from_tag(&locale)?;
-    menu.apply(locale).map_err(|_| {
+    menu.set_locale(locale).map_err(|_| {
         CommandError::new(
             "tray_update_failed",
             "The tray menu labels could not be updated.",
         )
     })
+}
+
+/// Mirrors the connected window's runtime state onto the native tray menu.
+///
+/// The tray is a view, not a worker: this command only stores the validated
+/// context and rewrites menu text and enabled flags. It never opens HID, never
+/// calls the Dynamic service and never reads the scenario store, and the only
+/// scenario information it accepts is a bounded display name. An unknown status
+/// tag or an unsafe name is rejected with a stable sanitized error instead of
+/// being written into the menu.
+#[tauri::command]
+pub async fn set_tray_runtime_state(
+    device_connected: bool,
+    dynamic_status: String,
+    current_scenario_name: Option<String>,
+    can_choose_scenario: bool,
+    can_upload_scenario: bool,
+    can_clear_dynamic: bool,
+    menu: State<'_, TrayMenuItems>,
+) -> Result<(), CommandError> {
+    let context = tray_runtime_context_from_input(
+        device_connected,
+        &dynamic_status,
+        current_scenario_name,
+        can_choose_scenario,
+        can_upload_scenario,
+        can_clear_dynamic,
+    )?;
+    menu.set_context(context).map_err(|_| {
+        CommandError::new(
+            "tray_update_failed",
+            "The tray menu state could not be updated.",
+        )
+    })
+}
+
+/// Validates raw frontend values into a tray runtime context.
+///
+/// Kept as a free function so the validation and the two stable error codes stay
+/// testable without a live tray.
+fn tray_runtime_context_from_input(
+    device_connected: bool,
+    dynamic_status: &str,
+    current_scenario_name: Option<String>,
+    can_choose_scenario: bool,
+    can_upload_scenario: bool,
+    can_clear_dynamic: bool,
+) -> Result<TrayRuntimeContext, CommandError> {
+    tray_context_from_parts(
+        device_connected,
+        dynamic_status,
+        current_scenario_name,
+        can_choose_scenario,
+        can_upload_scenario,
+        can_clear_dynamic,
+    )
+    .map_err(CommandError::from)
 }
 
 /// Maps a frontend locale tag onto a tray locale.
@@ -3258,5 +3327,82 @@ mod tests {
             let error = tray_locale_from_tag(rejected).unwrap_err();
             assert_eq!(error.code, "unsupported_locale");
         }
+    }
+
+    #[test]
+    fn tray_runtime_state_command_validates_status_and_scenario_name() {
+        // A valid payload carries only bounded display data: the status tag and
+        // the scenario display name, never dynamic text or an identifier.
+        let context = tray_runtime_context_from_input(
+            true,
+            "committedLocally",
+            Some("Work terminal".to_string()),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(context.current_scenario_name(), Some("Work terminal"));
+        assert_eq!(context.dynamic_status().tag(), "committedLocally");
+        assert!(!context.upload_scenario_enabled());
+        assert!(context.clear_dynamic_enabled());
+
+        // An unknown status tag is a stable sanitized error, never a fallback.
+        for rejected in [
+            "",
+            "Ready",
+            "committed_locally",
+            "committed",
+            "unknown ",
+            "idle",
+            "system",
+        ] {
+            let error = tray_runtime_context_from_input(true, rejected, None, true, true, true)
+                .unwrap_err();
+            assert_eq!(error.code, "unsupported_tray_status", "{rejected:?}");
+            assert!(!error.message.contains('\n'));
+            assert!(!error.message.contains(rejected) || rejected.is_empty());
+        }
+
+        // An unsafe scenario name is rejected the same way, so an arbitrary
+        // string can never reach a native menu label.
+        for rejected in [
+            "",
+            "  ",
+            "name\nwith-newline",
+            "name\twith-tab",
+            "control\u{7f}",
+            "c1\u{9f}",
+        ] {
+            let error = tray_runtime_context_from_input(
+                true,
+                "ready",
+                Some(rejected.to_string()),
+                true,
+                true,
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_tray_scenario_name", "{rejected:?}");
+        }
+        let long_name = "n".repeat(crate::scenario_store::MAX_SCENARIO_NAME_BYTES + 1);
+        assert_eq!(
+            tray_runtime_context_from_input(true, "ready", Some(long_name), true, true, true)
+                .unwrap_err()
+                .code,
+            "invalid_tray_scenario_name"
+        );
+
+        // A disconnected window that offers nothing is always valid, and its
+        // device actions stay disabled even if a caller sets the flags.
+        assert_eq!(
+            tray_runtime_context_from_input(false, "unknown", None, false, false, false).unwrap(),
+            TrayRuntimeContext::default()
+        );
+        let forced =
+            tray_runtime_context_from_input(false, "ready", None, true, true, true).unwrap();
+        assert!(!forced.choose_scenario_enabled());
+        assert!(!forced.upload_scenario_enabled());
+        assert!(!forced.clear_dynamic_enabled());
     }
 }

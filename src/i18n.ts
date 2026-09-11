@@ -317,6 +317,7 @@ export type MessageTable = {
   dynamicStoreLoading: string;
   dynamicStoreLoadFailedTitle: string;
   dynamicStoreSaveFailedTitle: string;
+  dynamicStoreNotReady: string;
   dynamicScenarioNoTarget: string;
   dynamicScenarioTarget: (label: string) => string;
   dynamicScenarioTargetPending: string;
@@ -684,6 +685,7 @@ const english: MessageTable = {
   dynamicStoreLoading: "Loading saved scenarios…",
   dynamicStoreLoadFailedTitle: "Saved scenarios could not be loaded.",
   dynamicStoreSaveFailedTitle: "Scenarios could not be saved.",
+  dynamicStoreNotReady: "The local scenario store is not available yet.",
   dynamicScenarioNoTarget: "No target object",
   dynamicScenarioTarget: (label) => `Target: ${label}`,
   dynamicScenarioTargetPending: "Target: not checked yet",
@@ -1049,6 +1051,7 @@ const chinese: MessageTable = {
   dynamicStoreLoading: "正在加载已保存场景…",
   dynamicStoreLoadFailedTitle: "无法加载已保存的场景。",
   dynamicStoreSaveFailedTitle: "场景未能保存。",
+  dynamicStoreNotReady: "本地场景库尚不可用。",
   dynamicScenarioNoTarget: "未选择目标对象",
   dynamicScenarioTarget: (label) => `目标：${label}`,
   dynamicScenarioTargetPending: "目标：尚未检查",

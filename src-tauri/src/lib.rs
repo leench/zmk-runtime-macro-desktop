@@ -39,6 +39,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::set_tray_locale,
+            commands::set_tray_runtime_state,
             scenario_store::load_scenarios,
             scenario_store::save_scenarios,
         ])

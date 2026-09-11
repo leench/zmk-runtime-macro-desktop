@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type { Locale } from "./i18n";
 
@@ -156,20 +157,25 @@ export function clearDynamic(slot: number): Promise<void> {
 /**
  * Serialized status of the Rust Dynamic service for the current session.
  *
- * These status values are the serialized backend contract. The UI-only scenario
- * model (`src/types/dynamic.ts`) keeps its own presentation vocabulary until the
- * Dynamic Workspace is wired to the real service (plan §12 stage 5).
+ * These status values are the serialized backend contract: the connected
+ * Workbench Dynamic Workspace consumes them through `utils/scenario.ts`, while
+ * the device-free `DeviceSelect` preview and the legacy Dynamic dialog keep their
+ * own in-memory vocabulary (`src/types/dynamic.ts`; plan §12 stage 5 is done for
+ * the connected workspace).
  */
-export type DynamicServiceStatus =
-  | "unknown"
-  | "discovering"
-  | "ready"
-  | "unsupported"
-  | "uploading"
-  | "committedLocally"
-  | "clearing"
-  | "clearedLocally"
-  | "error";
+export const DYNAMIC_SERVICE_STATUSES = [
+  "unknown",
+  "discovering",
+  "ready",
+  "unsupported",
+  "uploading",
+  "committedLocally",
+  "clearing",
+  "clearedLocally",
+  "error",
+] as const;
+
+export type DynamicServiceStatus = (typeof DYNAMIC_SERVICE_STATUSES)[number];
 
 /** Local observation status of one dynamic object in the current session. */
 export type DynamicObjectStatus =
@@ -240,6 +246,90 @@ export function setSettings(timeoutMs: number, retries: number): Promise<ClientS
  */
 export function setTrayLocale(locale: Locale): Promise<void> {
   return invoke("set_tray_locale", { locale });
+}
+
+/**
+ * Runtime state the native tray menu mirrors.
+ *
+ * This is a bounded view, never a data channel: no dynamic text, no HID path, no
+ * serial number and no device identifier. `dynamicStatus` must be one of
+ * `DYNAMIC_SERVICE_STATUSES` and `currentScenarioName` is only a display label
+ * (at most 64 bytes, no control characters) — Rust re-validates both and rejects
+ * anything else instead of writing it into the menu.
+ */
+export type TrayRuntimeState = {
+  deviceConnected: boolean;
+  dynamicStatus: DynamicServiceStatus;
+  /** Current scenario display name, or `null` when nothing is selected. */
+  currentScenarioName: string | null;
+  canChooseScenario: boolean;
+  canUploadScenario: boolean;
+  canClearDynamic: boolean;
+};
+
+/**
+ * Mirror the connected window's state onto the native tray menu.
+ *
+ * The tray only stores the validated context and rewrites menu text and enabled
+ * flags: it never opens HID, never calls the Dynamic service and never reads the
+ * scenario store.
+ */
+export function setTrayRuntimeState(state: TrayRuntimeState): Promise<void> {
+  return invoke("set_tray_runtime_state", {
+    deviceConnected: state.deviceConnected,
+    dynamicStatus: state.dynamicStatus,
+    currentScenarioName: state.currentScenarioName,
+    canChooseScenario: state.canChooseScenario,
+    canUploadScenario: state.canUploadScenario,
+    canClearDynamic: state.canClearDynamic,
+  });
+}
+
+/** Stable global event name the native tray uses for its three real actions. */
+export const TRAY_ACTION_EVENT = "tray-action";
+
+/**
+ * The only actions the tray may ask the window to perform.
+ *
+ * The window owns every device call, so the tray never does more than request
+ * one of these three flows; a disabled menu item never emits one.
+ */
+export const TRAY_ACTIONS = ["chooseScenario", "uploadScenario", "clearDynamic"] as const;
+
+export type TrayAction = (typeof TRAY_ACTIONS)[number];
+
+export type TrayActionPayload = { action: TrayAction };
+
+/** Rejects every payload that is not one of the three exact action tags. */
+export function isTrayAction(value: unknown): value is TrayAction {
+  return typeof value === "string" && (TRAY_ACTIONS as readonly string[]).includes(value);
+}
+
+/**
+ * Reads the action out of an event payload.
+ *
+ * Only the documented `{ action }` shape is accepted, and only one of the three
+ * tags: any other payload (missing field, extra text, another type) is dropped
+ * instead of being interpreted.
+ */
+export function trayActionFromPayload(payload: unknown): TrayAction | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const action: unknown = (payload as { action?: unknown }).action;
+  return isTrayAction(action) ? action : null;
+}
+
+/**
+ * Subscribe to the tray actions.
+ *
+ * The listener is only wired in the Tauri host: a browser preview calls no Tauri
+ * API and therefore never receives or fabricates a tray action. Payloads that
+ * are not one of the three actions are dropped instead of being handled.
+ */
+export function subscribeTrayAction(handler: (action: TrayAction) => void): Promise<UnlistenFn> {
+  return listen<TrayActionPayload>(TRAY_ACTION_EVENT, (event) => {
+    const action = trayActionFromPayload(event.payload);
+    if (action !== null) handler(action);
+  });
 }
 
 /** Only supported on-disk Scenario store version. */

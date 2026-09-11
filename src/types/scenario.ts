@@ -159,6 +159,21 @@ export type DynamicClearTarget = {
 };
 
 /**
+ * Tray-visible summary of the connected workspace.
+ *
+ * It carries only a display name and three booleans, so the native tray can show
+ * the current scenario and enable `choose`, `upload` and `clear` exactly when the
+ * window would. The scenario text never leaves the workspace.
+ */
+export type WorkspaceTrayContext = {
+  /** Display name of the selected scenario, already bounded and control-free. */
+  scenarioName: string | null;
+  canChooseScenario: boolean;
+  canUploadScenario: boolean;
+  canClearDynamic: boolean;
+};
+
+/**
  * Real DynamicService and scenario store behind a connected workspace.
  *
  * The App owns every Tauri command and passes the results in; the workspace
@@ -180,4 +195,8 @@ export type DynamicWorkspaceBackend = {
   saveScenarios: (store: ScenarioStore) => Promise<ScenarioStore>;
   upload: (target: DynamicUploadTarget) => Promise<CommandError | null>;
   clear: (target: DynamicClearTarget) => Promise<CommandError | null>;
+  /** Opens (or re-raises) this workspace in the main window. */
+  openWorkspace: () => void;
+  /** Publishes the bounded tray summary; called on every context change. */
+  reportTrayContext: (context: WorkspaceTrayContext) => void;
 };

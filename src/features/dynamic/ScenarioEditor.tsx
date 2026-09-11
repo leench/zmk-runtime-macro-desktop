@@ -116,6 +116,8 @@ function blockerMessage(copy: Messages, blocker: ScenarioIssue, maximum: number 
       return copy.dynamicUnsupportedText;
     case "storeTextTooLong":
       return copy.dynamicScenarioTextTooLongForStore(SCENARIO_TEXT_LIMIT_BYTES);
+    case "storeUnavailable":
+      return copy.dynamicStoreNotReady;
     default:
       return copy.dynamicScenarioKeepUnsupported;
   }

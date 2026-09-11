@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, ShieldAlert, X } from "lucide-react";
-import { asCommandError, type CommandError, type ScenarioStore } from "../../bridge";
+import {
+  asCommandError,
+  subscribeTrayAction,
+  type CommandError,
+  type ScenarioStore,
+  type TrayAction,
+} from "../../bridge";
 import type { Messages } from "../../i18n";
 import type {
   DynamicObservation,
@@ -13,9 +19,10 @@ import type {
 } from "../../types/scenario";
 import {
   type ScenarioIssue,
-  clearBlockers,
+  clearActionIssues,
   createScenario,
   createSerialRunner,
+  DEFAULT_WORKSPACE_TRAY_CONTEXT,
   editScenario,
   hasScenarioContent,
   isScenarioDirty,
@@ -28,6 +35,7 @@ import {
   scenariosMatch,
   storeBlockers,
   storeFromScenarios,
+  trayContextFromWorkspace,
   uploadBlockers,
 } from "../../utils/scenario";
 import { DynamicPreviewControls } from "./DynamicPreviewControls";
@@ -36,6 +44,10 @@ import { ScenarioEditor } from "./ScenarioEditor";
 import { ScenarioEmptyState } from "./ScenarioEmptyState";
 import { ScenarioList } from "./ScenarioList";
 import { buildPreviewFixture } from "./previewFixtures";
+
+function inTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
 
 type DynamicWorkspaceProps = {
   copy: Messages;
@@ -200,17 +212,90 @@ export function DynamicWorkspace({ copy, onClose, onOpenLegacyDialog, backend, f
       : null;
 
   const busyIssues: ScenarioIssue[] = operation !== null || storePending ? ["operationInProgress"] : [];
-  const storeIssues: ScenarioIssue[] = backend && selectedScenario ? storeBlockers(selectedScenario.draft) : [];
+  // The local store is the only place a scenario can be saved, so a store that is
+  // still loading or failed blocks saving and uploading. Clearing is a device-only
+  // action and never touches the store, so it is derived separately below.
+  const storeReadyIssues: ScenarioIssue[] = !previewMode && storeStatus !== "ready" ? ["storeUnavailable"] : [];
+  const storeIssues: ScenarioIssue[] = [
+    ...storeReadyIssues,
+    ...(backend && selectedScenario ? storeBlockers(selectedScenario.draft) : []),
+  ];
   const uploadReasons: ScenarioIssue[] = [
     ...busyIssues,
     ...storeIssues,
     ...uploadBlockers({ device, capability, scenario: selectedScenario, observation }),
   ];
-  const clearReasons: ScenarioIssue[] = [
-    ...busyIssues,
-    ...clearBlockers({ device, capability, scenario: selectedScenario, observation }),
-  ];
+  // Clear device only talks to the device: store availability and the save-schema
+  // limits of the current draft never disable it.
+  const clearReasons: ScenarioIssue[] = clearActionIssues({ operation, device, capability, scenario: selectedScenario, observation });
   const saveReasons: ScenarioIssue[] = [...busyIssues, ...storeIssues];
+
+  // The native tray mirrors this workspace through a bounded summary: the
+  // scenario display name and the same three action flags the footer uses. Only
+  // the connected workspace reports; the device-free preview never does.
+  const reportTrayContext = backend?.reportTrayContext ?? null;
+  const trayContext = trayContextFromWorkspace({
+    scenario: selectedScenario,
+    operation,
+    uploadBlockers: uploadReasons,
+    clearBlockers: clearReasons,
+  });
+  const trayScenarioName = trayContext.scenarioName;
+  const trayCanChoose = trayContext.canChooseScenario;
+  const trayCanUpload = trayContext.canUploadScenario;
+  const trayCanClear = trayContext.canClearDynamic;
+  useEffect(() => {
+    if (!reportTrayContext) return;
+    reportTrayContext({ scenarioName: trayScenarioName, canChooseScenario: trayCanChoose, canUploadScenario: trayCanUpload, canClearDynamic: trayCanClear });
+  }, [reportTrayContext, trayCanChoose, trayCanClear, trayCanUpload, trayScenarioName]);
+
+  // Leaving the workspace (Unlock, disconnect, closing the page) must not leave a
+  // stale scenario name or a stale enabled action in the native menu. The reset is
+  // an unmount cleanup only, so an ordinary context update never clears the
+  // summary it just published. The device-free preview has no reporter and never
+  // touches the tray.
+  useEffect(() => {
+    if (!reportTrayContext) return undefined;
+    return () => reportTrayContext(DEFAULT_WORKSPACE_TRAY_CONTEXT);
+  }, [reportTrayContext]);
+
+  // Tray actions ask the window to run one of the three real flows. The handler
+  // lives in a ref so the subscription is created once and still uses the newest
+  // blockers: a blocked action stays a safe no-op instead of bypassing the dirty,
+  // target or store checks the window itself would show.
+  const trayHandlerRef = useRef<(action: TrayAction) => void>(() => {});
+  trayHandlerRef.current = (action: TrayAction) => {
+    if (!backend) return;
+    if (action === "chooseScenario") {
+      backend.openWorkspace();
+      return;
+    }
+    if (action === "uploadScenario") {
+      if (uploadReasons.length > 0) return;
+      backend.openWorkspace();
+      setDialog({ kind: "upload" });
+      return;
+    }
+    if (clearReasons.length > 0) return;
+    backend.openWorkspace();
+    setDialog({ kind: "clear" });
+  };
+  const trayActionsAvailable = backend !== undefined;
+  useEffect(() => {
+    if (!trayActionsAvailable || !inTauri()) return undefined;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void subscribeTrayAction((action) => trayHandlerRef.current(action))
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [trayActionsAvailable]);
 
   const updateSelected = (patch: Partial<ScenarioFields>) => {
     if (!selectedId) return;

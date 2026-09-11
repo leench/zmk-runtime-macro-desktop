@@ -25,6 +25,7 @@ import {
   setSettings as setSettingsCommand,
   setSlot as setSlotCommand,
   setTrayLocale,
+  setTrayRuntimeState,
   uploadDynamic as uploadDynamicCommand,
   type AuthState,
   type ClientSettings,
@@ -57,7 +58,7 @@ import { Unlock } from "./pages/Unlock";
 import { PasswordSetupModal } from "./components/PasswordSetupModal";
 import { DynamicMacroModal } from "./components/DynamicMacroModal";
 import { DynamicWorkspace } from "./features/dynamic/DynamicWorkspace";
-import type { DynamicClearTarget, DynamicUploadTarget, DynamicWorkspaceBackend } from "./types/scenario";
+import type { DynamicClearTarget, DynamicUploadTarget, DynamicWorkspaceBackend, WorkspaceTrayContext } from "./types/scenario";
 import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
 import { SelectField } from "./components/SelectField";
 import { TitleBar, type Platform } from "./components/TitleBar";
@@ -76,7 +77,7 @@ import {
   validateDynamicText,
   validateDynamicTtl,
 } from "./utils/dynamic";
-import { capabilityPresentationFromBackend, serviceDeviceState, targetMatchesCapability } from "./utils/scenario";
+import { capabilityPresentationFromBackend, serviceDeviceState, targetMatchesCapability, DEFAULT_WORKSPACE_TRAY_CONTEXT, sameWorkspaceTrayContext } from "./utils/scenario";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
 const THEME_STORAGE_KEY = "zmk-runtime-macro-theme:v1";
@@ -382,6 +383,9 @@ function App() {
   const [dynamicModalOpen, setDynamicModalOpen] = useState(false);
   // Page-level dynamic workspace; the legacy dialog stays available as fallback.
   const [dynamicWorkspaceOpen, setDynamicWorkspaceOpen] = useState(false);
+  // Tray-visible summary of the connected workspace: the selected scenario's
+  // display name and the three action flags. It never carries scenario text.
+  const [workspaceTrayContext, setWorkspaceTrayContext] = useState<WorkspaceTrayContext>(DEFAULT_WORKSPACE_TRAY_CONTEXT);
 
   const mounted = useRef(false);
   const operation = useRef(0);
@@ -1379,6 +1383,14 @@ function App() {
 
   const formatCommandError = useCallback((error: CommandError) => translateCommandError(error.code, locale), [locale]);
 
+  // Stable identities for the workspace: opening the page is a plain state flip,
+  // and the tray summary is only replaced when one of its fields actually
+  // changes, so reporting never loops back into the workspace.
+  const openDynamicWorkspace = useCallback(() => setDynamicWorkspaceOpen(true), []);
+  const reportTrayContext = useCallback((next: WorkspaceTrayContext) => {
+    setWorkspaceTrayContext((current) => sameWorkspaceTrayContext(current, next) ? current : next);
+  }, []);
+
   const dynamicWorkspaceBackend = useMemo<DynamicWorkspaceBackend>(() => ({
     schemaVersion: SCENARIO_STORE_SCHEMA_VERSION,
     deviceName: connection.device?.productName || copy.unnamedDevice,
@@ -1390,6 +1402,8 @@ function App() {
     saveScenarios: saveScenarioStore,
     upload: uploadScenarioDynamic,
     clear: clearScenarioDynamic,
+    openWorkspace: openDynamicWorkspace,
+    reportTrayContext,
   }), [
     clearScenarioDynamic,
     connection.authState,
@@ -1400,6 +1414,8 @@ function App() {
     dynamicCapabilities,
     dynamicServiceState,
     loadScenarioStore,
+    openDynamicWorkspace,
+    reportTrayContext,
     saveScenarioStore,
     uploadScenarioDynamic,
   ]);
@@ -1604,6 +1620,30 @@ function App() {
     if (!inTauri()) return;
     void setTrayLocale(locale).catch(() => undefined);
   }, [locale]);
+
+  // The native tray menu mirrors the same connection, Dynamic and scenario state
+  // the window shows. Only the connected window publishes it, and a disconnect
+  // resets the menu immediately so nothing from the previous device stays visible.
+  useEffect(() => {
+    if (!inTauri()) return;
+    const deviceConnected = connection.connected;
+    const context = deviceConnected ? workspaceTrayContext : DEFAULT_WORKSPACE_TRAY_CONTEXT;
+    void setTrayRuntimeState({
+      deviceConnected,
+      dynamicStatus: deviceConnected ? dynamicServiceState?.status ?? "unknown" : "unknown",
+      currentScenarioName: context.scenarioName,
+      canChooseScenario: context.canChooseScenario,
+      canUploadScenario: context.canUploadScenario,
+      canClearDynamic: context.canClearDynamic,
+    }).catch(() => undefined);
+  }, [connection.connected, dynamicServiceState?.status, workspaceTrayContext]);
+
+  // A disconnect drops the workspace summary as well, so a later reconnect never
+  // republishes the previous device's scenario name.
+  useEffect(() => {
+    if (connection.connected) return;
+    setWorkspaceTrayContext((current) => sameWorkspaceTrayContext(current, DEFAULT_WORKSPACE_TRAY_CONTEXT) ? current : DEFAULT_WORKSPACE_TRAY_CONTEXT);
+  }, [connection.connected]);
 
   useEffect(() => {
     mounted.current = true;

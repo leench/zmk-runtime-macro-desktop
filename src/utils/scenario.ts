@@ -17,6 +17,7 @@ import type {
   PreviewDeviceState,
   Scenario,
   ScenarioFields,
+  WorkspaceTrayContext,
 } from "../types/scenario";
 import { dynamicByteLength, dynamicLimits, dynamicObjectSlots, validateDynamicText } from "./dynamic.ts";
 
@@ -195,9 +196,20 @@ function deviceBlockers(gate: ScenarioGate): ScenarioBlocker[] {
   return blockers;
 }
 
+/**
+ * Target blockers of the device actions.
+ *
+ * Without a capability there is nothing to judge yet, so the device gate's
+ * `capabilityDiscovering` stays the only reason. With a reported capability
+ * both actions address one object of the selected scenario, so a missing
+ * scenario is the same unresolved target as a saved target the capability no
+ * longer reports: neither upload nor clear may look available without an
+ * explicit scenario and target.
+ */
 function targetBlockers(gate: ScenarioGate): ScenarioBlocker[] {
+  if (!gate.capability) return [];
   const scenario = gate.scenario;
-  if (!scenario || !gate.capability) return [];
+  if (!scenario) return ["targetMissing"];
   if (!scenario.draft.targetObjectId || !findTargetObject(gate.capability, scenario.draft.targetObjectId)) return ["targetMissing"];
   return [];
 }
@@ -236,8 +248,16 @@ export function clearBlockers(gate: ScenarioGate): ScenarioBlocker[] {
  */
 export type ScenarioStoreBlocker = "nameRequired" | "nameTooLong" | "storeTextUnsupported" | "storeTextTooLong";
 
+/**
+ * Reasons the workspace cannot act yet, independent of the current fields.
+ *
+ * The local store is the only place a scenario can be saved, so while it is
+ * loading, corrupt or unavailable no scenario action is offered.
+ */
+export type ScenarioStoreStateBlocker = "storeUnavailable";
+
 /** Any reason the editor has to report next to the action bar. */
-export type ScenarioIssue = ScenarioBlocker | ScenarioStoreBlocker;
+export type ScenarioIssue = ScenarioBlocker | ScenarioStoreBlocker | ScenarioStoreStateBlocker;
 
 function storedTextIsSupported(text: string): boolean {
   const bytes = new TextEncoder().encode(text);
@@ -257,6 +277,35 @@ export function storeBlockers(fields: ScenarioFields): ScenarioStoreBlocker[] {
   if (textBytes > SCENARIO_TEXT_LIMIT_BYTES) blockers.push("storeTextTooLong");
   else if (!storedTextIsSupported(fields.text)) blockers.push("storeTextUnsupported");
   return blockers;
+}
+
+/**
+ * Reasons `Clear device` stays disabled.
+ *
+ * Clearing only talks to the device: it never writes the local scenario store,
+ * so an unusable store or a draft that cannot be saved (missing or oversized
+ * name, unstorable text) must not disable it. The only non-device reason left is
+ * an operation already in flight, which keeps the confirmation flow from
+ * overlapping another device command. The workspace and the tray both derive
+ * Clear from this single list, so they can never disagree about it.
+ */
+export function clearActionIssues(input: {
+  operation: "upload" | "clear" | null;
+  device: PreviewDeviceState;
+  capability: DynamicCapabilitiesPresentation | null;
+  scenario: Scenario | null;
+  observation: DynamicObservation;
+}): ScenarioIssue[] {
+  const busy: ScenarioIssue[] = input.operation !== null ? ["operationInProgress"] : [];
+  return [
+    ...busy,
+    ...clearBlockers({
+      device: input.device,
+      capability: input.capability,
+      scenario: input.scenario,
+      observation: input.observation,
+    }),
+  ];
 }
 
 /**
@@ -510,5 +559,65 @@ export function createSerialRunner(): SerialRunner {
     const queued = tail.then(task, task);
     tail = queued.then(() => undefined, () => undefined);
     return queued;
+  };
+}
+
+/**
+ * Safe native-menu display name of the selected scenario.
+ *
+ * The name is trimmed, bounded to the on-disk schema length in bytes and
+ * rejected when it contains a control character, so arbitrary text can never
+ * become a native menu label. `null` means "no scenario name to show".
+ */
+export function traySafeScenarioName(name: string | null): string | null {
+  if (name === null) return null;
+  const trimmed = name.trim();
+  if (trimmed.length === 0) return null;
+  if (dynamicByteLength(trimmed) > SCENARIO_NAME_LIMIT_BYTES) return null;
+  for (const character of trimmed) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return null;
+  }
+  return trimmed;
+}
+
+/** Tray summary of a window that has nothing connected and nothing selected. */
+export const DEFAULT_WORKSPACE_TRAY_CONTEXT: WorkspaceTrayContext = {
+  scenarioName: null,
+  canChooseScenario: false,
+  canUploadScenario: false,
+  canClearDynamic: false,
+};
+
+export function sameWorkspaceTrayContext(left: WorkspaceTrayContext, right: WorkspaceTrayContext): boolean {
+  return left.scenarioName === right.scenarioName
+    && left.canChooseScenario === right.canChooseScenario
+    && left.canUploadScenario === right.canUploadScenario
+    && left.canClearDynamic === right.canClearDynamic;
+}
+
+/**
+ * Tray summary of the connected workspace.
+ *
+ * The action flags are derived from the same blocker arrays the editor uses, so
+ * the tray can never offer an action the window itself would refuse: a scenario
+ * that cannot be uploaded (missing target, unsupported text, oversize, invalid
+ * TTL, unsupported keep, running operation, unusable store) also disables the
+ * tray entry. Clear is device-only, so its blocker array comes from
+ * [`clearActionIssues`] and never contains a store reason.
+ */
+export function trayContextFromWorkspace(input: {
+  scenario: Scenario | null;
+  operation: "upload" | "clear" | null;
+  uploadBlockers: readonly ScenarioIssue[];
+  clearBlockers: readonly ScenarioIssue[];
+}): WorkspaceTrayContext {
+  const busy = input.operation !== null;
+  return {
+    scenarioName: traySafeScenarioName(input.scenario?.draft.name ?? null),
+    // Choosing only re-raises this workspace, which exists while connected.
+    canChooseScenario: true,
+    canUploadScenario: !busy && input.uploadBlockers.length === 0,
+    canClearDynamic: !busy && input.clearBlockers.length === 0,
   };
 }
