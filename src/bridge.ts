@@ -143,12 +143,12 @@ export function getDynamicCapabilities(): Promise<DynamicCapabilities> {
   return invoke<DynamicCapabilities>("get_dynamic_capabilities");
 }
 
-export function uploadDynamic(text: string, ttlSeconds: number | null, keepAfterExecute: boolean): Promise<void> {
-  return invoke("upload_dynamic", { text, ttlSeconds, keepAfterExecute });
+export function uploadDynamic(slot: number, text: string, ttlSeconds: number | null, keepAfterExecute: boolean): Promise<void> {
+  return invoke("upload_dynamic", { slot, text, ttlSeconds, keepAfterExecute });
 }
 
-export function clearDynamic(): Promise<void> {
-  return invoke("clear_dynamic");
+export function clearDynamic(slot: number): Promise<void> {
+  return invoke("clear_dynamic", { slot });
 }
 
 export function getSettings(): Promise<ClientSettings> {

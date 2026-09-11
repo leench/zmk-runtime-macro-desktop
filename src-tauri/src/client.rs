@@ -8,12 +8,13 @@ use crate::protocol::{
     build_auth_challenge_request, build_auth_info_request, build_auth_prove_request,
     build_capabilities_request, build_dynamic_begin_request, build_dynamic_clear_request,
     build_dynamic_data_request, build_frame, build_lock_request, build_password_set_chunk,
-    normalize_response, parse_auth_challenge_response, parse_auth_info_response,
-    parse_dynamic_capabilities_response, read_u16, response_identity_matches,
-    validate_empty_success, validate_response, validate_text, AuthInfo, DynamicCapabilities, Frame,
-    Opcode, Status, DYNAMIC_MAX_TTL_SECONDS, DYNAMIC_MIN_TTL_SECONDS, LIST_SLOT, MAX_TEXT_LENGTH,
-    OFFSET_OFFSET, OPCODE_OFFSET, PASSWORD_SET_LENGTH, PAYLOAD_LENGTH_OFFSET, PAYLOAD_OFFSET,
-    PAYLOAD_SIZE, STATUS_OFFSET, TOTAL_LENGTH_OFFSET,
+    dynamic_slot_is_valid, normalize_response, parse_auth_challenge_response,
+    parse_auth_info_response, parse_dynamic_capabilities_response, read_u16,
+    response_identity_matches, validate_empty_success, validate_response, validate_text, AuthInfo,
+    DynamicCapabilities, Frame, Opcode, Status, DYNAMIC_MAX_TTL_SECONDS, DYNAMIC_MIN_TTL_SECONDS,
+    DYNAMIC_SLOT_COUNT_MAX, LIST_SLOT, MAX_DYNAMIC_TEXT_LENGTH, MAX_TEXT_LENGTH, OFFSET_OFFSET,
+    OPCODE_OFFSET, PASSWORD_SET_LENGTH, PAYLOAD_LENGTH_OFFSET, PAYLOAD_OFFSET, PAYLOAD_SIZE,
+    STATUS_OFFSET, TOTAL_LENGTH_OFFSET,
 };
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
@@ -468,10 +469,10 @@ impl<T: Transport> RuntimeMacroClient<T> {
         if data.is_empty() {
             return Err(ClientError::EmptyDynamicText);
         }
-        if data.len() > MAX_TEXT_LENGTH {
+        if data.len() > MAX_DYNAMIC_TEXT_LENGTH {
             return Err(ClientError::LengthExceeded {
                 length: data.len(),
-                maximum: MAX_TEXT_LENGTH,
+                maximum: MAX_DYNAMIC_TEXT_LENGTH,
             });
         }
         validate_text(data)?;
@@ -483,16 +484,43 @@ impl<T: Transport> RuntimeMacroClient<T> {
         Ok(())
     }
 
+    /// Reject a dynamic object index that cannot be valid on any device. This
+    /// runs before the capability exchange so an invalid index never reaches
+    /// the HID interface, including the static `LIST_SLOT` sentinel `0xff`.
+    fn validate_dynamic_slot_before_discovery(slot: u8) -> Result<(), ClientError> {
+        if !dynamic_slot_is_valid(slot, DYNAMIC_SLOT_COUNT_MAX) {
+            return Err(ClientError::InvalidDynamicSlot { slot });
+        }
+        Ok(())
+    }
+
+    /// Reject a dynamic object index the connected device does not have.
+    fn validate_dynamic_slot_for_device(
+        slot: u8,
+        capabilities: &DynamicCapabilities,
+    ) -> Result<(), ClientError> {
+        if !dynamic_slot_is_valid(slot, capabilities.dynamic_object_count) {
+            return Err(ClientError::InvalidDynamicSlot { slot });
+        }
+        Ok(())
+    }
+
     fn upload_dynamic_once(
         &mut self,
+        slot: u8,
         data: &[u8],
         ttl_seconds: Option<u32>,
         keep_after_execute: bool,
         request_id: u8,
     ) -> Result<(), DynamicUploadAttemptError> {
-        let begin =
-            build_dynamic_begin_request(request_id, data.len(), ttl_seconds, keep_after_execute)
-                .map_err(|error| DynamicUploadAttemptError::Begin(error.into()))?;
+        let begin = build_dynamic_begin_request(
+            request_id,
+            slot,
+            data.len(),
+            ttl_seconds,
+            keep_after_execute,
+        )
+        .map_err(|error| DynamicUploadAttemptError::Begin(error.into()))?;
         let response = self
             .call(&begin)
             .map_err(DynamicUploadAttemptError::Begin)?;
@@ -501,9 +529,14 @@ impl<T: Transport> RuntimeMacroClient<T> {
 
         for offset in (0..data.len()).step_by(PAYLOAD_SIZE) {
             let end = (offset + PAYLOAD_SIZE).min(data.len());
-            let request =
-                build_dynamic_data_request(request_id, offset, data.len(), &data[offset..end])
-                    .map_err(|error| DynamicUploadAttemptError::Data(error.into()))?;
+            let request = build_dynamic_data_request(
+                request_id,
+                slot,
+                offset,
+                data.len(),
+                &data[offset..end],
+            )
+            .map_err(|error| DynamicUploadAttemptError::Data(error.into()))?;
             let response = self
                 .call(&request)
                 .map_err(DynamicUploadAttemptError::Data)?;
@@ -550,16 +583,23 @@ impl<T: Transport> RuntimeMacroClient<T> {
 
     /// Upload one dynamic object atomically. Every retry starts with a fresh
     /// request ID and a new BEGIN; no DATA is ever replayed in isolation.
+    ///
+    /// `slot` is a dynamic object index, never the static `LIST_SLOT` sentinel.
+    /// It must be inside the device's reported object count, which is
+    /// discovered before any BEGIN or DATA is written.
     pub fn upload_dynamic(
         &mut self,
+        slot: u8,
         data: &[u8],
         ttl_seconds: Option<u32>,
         keep_after_execute: bool,
     ) -> Result<(), ClientError> {
-        // This validation deliberately precedes capability discovery, and
-        // therefore precedes every HID write.
+        // These validations deliberately precede capability discovery, and
+        // therefore precede every HID write.
         Self::validate_dynamic_input(data, ttl_seconds)?;
+        Self::validate_dynamic_slot_before_discovery(slot)?;
         let capabilities = self.dynamic_capabilities()?;
+        Self::validate_dynamic_slot_for_device(slot, &capabilities)?;
         if data.len() > capabilities.max_dynamic_length as usize {
             return Err(ClientError::LengthExceeded {
                 length: data.len(),
@@ -578,7 +618,8 @@ impl<T: Transport> RuntimeMacroClient<T> {
         let mut last_error = None;
         for _ in 0..=self.retries {
             let request_id = self.take_request_id();
-            match self.upload_dynamic_once(data, ttl_seconds, keep_after_execute, request_id) {
+            match self.upload_dynamic_once(slot, data, ttl_seconds, keep_after_execute, request_id)
+            {
                 Ok(()) => return Ok(()),
                 Err(DynamicUploadAttemptError::Begin(error)) => {
                     if matches!(&error, ClientError::Transport(transport) if transport.is_retryable())
@@ -605,12 +646,15 @@ impl<T: Transport> RuntimeMacroClient<T> {
         Err(last_error.expect("at least one dynamic upload attempt is always made"))
     }
 
-    /// Clear the dynamic object after capability discovery. CLEAR is canonical
-    /// and idempotent, so transport failures may use a fresh request ID.
-    pub fn clear_dynamic(&mut self) -> Result<(), ClientError> {
-        self.dynamic_capabilities()?;
+    /// Clear one dynamic object after capability discovery. CLEAR is canonical
+    /// and idempotent, so transport failures may use a fresh request ID. There
+    /// is no wire clear-all: every object is cleared individually.
+    pub fn clear_dynamic(&mut self, slot: u8) -> Result<(), ClientError> {
+        Self::validate_dynamic_slot_before_discovery(slot)?;
+        let capabilities = self.dynamic_capabilities()?;
+        Self::validate_dynamic_slot_for_device(slot, &capabilities)?;
         let response = self.call_with_transport_retry(|request_id| {
-            build_dynamic_clear_request(request_id).map_err(ClientError::from)
+            build_dynamic_clear_request(request_id, slot).map_err(ClientError::from)
         })?;
         validate_empty_success(&response, "DYNAMIC_CLEAR")?;
         Ok(())
@@ -1006,12 +1050,17 @@ mod tests {
         ))]
     }
 
-    fn dynamic_capabilities_ok(request: &Frame, flags: u16) -> Vec<ReadResult> {
+    fn dynamic_capabilities_ok_with(
+        request: &Frame,
+        object_count: u8,
+        flags: u16,
+        max_length: u16,
+    ) -> Vec<ReadResult> {
         let mut payload = [0u8; crate::protocol::DYNAMIC_CAPABILITIES_LENGTH];
-        payload[0] = 1;
-        payload[1] = 1;
+        payload[0] = crate::protocol::DYNAMIC_CAPABILITY_VERSION;
+        payload[1] = object_count;
         payload[2..4].copy_from_slice(&flags.to_le_bytes());
-        payload[4..6].copy_from_slice(&(MAX_TEXT_LENGTH as u16).to_le_bytes());
+        payload[4..6].copy_from_slice(&max_length.to_le_bytes());
         payload[6..10].copy_from_slice(&300_u32.to_le_bytes());
         payload[10..14].copy_from_slice(&1_u32.to_le_bytes());
         payload[14..18].copy_from_slice(&86_400_u32.to_le_bytes());
@@ -1025,41 +1074,93 @@ mod tests {
         ))]
     }
 
+    fn dynamic_capabilities_ok(request: &Frame, flags: u16) -> Vec<ReadResult> {
+        dynamic_capabilities_ok_with(
+            request,
+            crate::protocol::DYNAMIC_SLOT_COUNT_MAX,
+            flags,
+            crate::protocol::MAX_DYNAMIC_TEXT_LENGTH as u16,
+        )
+    }
+
     #[test]
     fn dynamic_capabilities_are_strictly_validated() {
         let mut client = client_with_handler(
             |request| {
                 assert_eq!(request[OPCODE_OFFSET], Opcode::Capabilities as u8);
-                assert_eq!(request[SLOT_OFFSET], LIST_SLOT);
+                assert_eq!(request[SLOT_OFFSET], crate::protocol::DYNAMIC_FIRST_SLOT);
                 assert_eq!(request[PAYLOAD_LENGTH_OFFSET], 0);
                 dynamic_capabilities_ok(request, 0x004f)
             },
             0,
         );
         let capabilities = client.dynamic_capabilities().unwrap();
+        assert_eq!(capabilities.capability_version, 2);
+        assert_eq!(capabilities.dynamic_object_count, 8);
+        assert_eq!(capabilities.max_dynamic_length, 512);
         assert_eq!(capabilities.lifecycle_flags, 0x004f);
         assert!(capabilities.supports_keep_after_execute());
         assert_eq!(client.transport_mut().writes.len(), 1);
 
-        let mut malformed = client_with_handler(
+        // A one-object device is a valid v2 capability answer.
+        let mut single_object = client_with_handler(
+            |request| dynamic_capabilities_ok_with(request, 1, 0x004f, 512),
+            0,
+        );
+        assert_eq!(
+            single_object
+                .dynamic_capabilities()
+                .unwrap()
+                .dynamic_object_count,
+            1
+        );
+
+        // Non-zero reserved lifecycle bits make the whole answer malformed.
+        let mut reserved = client_with_handler(
             |request| {
-                let mut response = dynamic_capabilities_ok(request, 0x004f)
+                let mut response: Frame = dynamic_capabilities_ok(request, 0x004f)
                     .pop()
                     .unwrap()
-                    .unwrap();
+                    .unwrap()
+                    .try_into()
+                    .expect("fixture response is one 32-byte frame");
                 response[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4]
                     .copy_from_slice(&0x008f_u16.to_le_bytes());
-                vec![Ok(response)]
+                vec![Ok(response.to_vec())]
             },
             3,
         );
         assert!(matches!(
-            malformed.dynamic_capabilities(),
+            reserved.dynamic_capabilities(),
             Err(ClientError::Protocol(
                 ProtocolError::InvalidDynamicCapabilities
             ))
         ));
-        assert_eq!(malformed.transport_mut().writes.len(), 1);
+        assert_eq!(reserved.transport_mut().writes.len(), 1);
+
+        // A capability answer that does not echo the probed object index is
+        // stale traffic, never accepted metadata. `0xff` is the static
+        // LIST sentinel and `7` is not the object this client probed.
+        for foreign_slot in [LIST_SLOT, 7] {
+            let mut foreign = client_with_handler(
+                move |request| {
+                    let mut response: Frame = dynamic_capabilities_ok(request, 0x004f)
+                        .pop()
+                        .unwrap()
+                        .unwrap()
+                        .try_into()
+                        .expect("fixture response is one 32-byte frame");
+                    response[SLOT_OFFSET] = foreign_slot;
+                    vec![Ok(response.to_vec())]
+                },
+                1,
+            );
+            assert_eq!(
+                foreign.dynamic_capabilities(),
+                Err(ClientError::Transport(TransportError::Timeout))
+            );
+            assert_eq!(foreign.transport_mut().writes.len(), 2);
+        }
     }
 
     #[test]
@@ -1086,14 +1187,87 @@ mod tests {
             (Vec::new(), None),
             (vec![0x00], None),
             (vec![0x80], None),
-            (vec![b'x'; MAX_TEXT_LENGTH + 1], None),
+            (vec![b'x'; MAX_DYNAMIC_TEXT_LENGTH + 1], None),
             (vec![b'x'], Some(0)),
             (vec![b'x'], Some(86_401)),
         ] {
             let mut client = client_with_handler(|_| Vec::new(), 0);
-            assert!(client.upload_dynamic(&data, ttl, false).is_err());
+            assert!(client.upload_dynamic(0, &data, ttl, false).is_err());
             assert!(client.transport_mut().writes.is_empty());
         }
+    }
+
+    #[test]
+    fn dynamic_slot_is_rejected_before_any_hid_write() {
+        for slot in [LIST_SLOT, 8, 0xfe] {
+            let mut client = client_with_handler(|_| Vec::new(), 0);
+            assert_eq!(
+                client.upload_dynamic(slot, b"x", None, false),
+                Err(ClientError::InvalidDynamicSlot { slot })
+            );
+            assert_eq!(
+                client.clear_dynamic(slot),
+                Err(ClientError::InvalidDynamicSlot { slot })
+            );
+            assert!(client.transport_mut().writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn dynamic_slot_is_rejected_against_device_object_count_after_discovery() {
+        let mut single_object = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::Capabilities => dynamic_capabilities_ok_with(request, 1, 0x004f, 512),
+                opcode => panic!("no dynamic write may follow an invalid slot: {opcode:?}"),
+            },
+            2,
+        );
+        assert_eq!(
+            single_object.upload_dynamic(1, b"x", None, false),
+            Err(ClientError::InvalidDynamicSlot { slot: 1 })
+        );
+        assert_eq!(
+            single_object.clear_dynamic(1),
+            Err(ClientError::InvalidDynamicSlot { slot: 1 })
+        );
+        assert_eq!(single_object.transport_mut().writes.len(), 2);
+
+        // The highest protocol object index stays valid on an eight-object device.
+        let mut eight_objects = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                Opcode::DynamicBegin => vec![ok_response(
+                    request,
+                    0,
+                    read_u16(request, TOTAL_LENGTH_OFFSET),
+                )],
+                Opcode::DynamicData => vec![ok_response(
+                    request,
+                    read_u16(request, OFFSET_OFFSET) + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                    read_u16(request, TOTAL_LENGTH_OFFSET),
+                )],
+                Opcode::DynamicClear => vec![ok_response(request, 0, 0)],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+        eight_objects.upload_dynamic(7, b"xy", None, false).unwrap();
+        eight_objects.clear_dynamic(7).unwrap();
+        let writes = &eight_objects.transport_mut().writes;
+        assert_eq!(writes.len(), 5);
+        assert_eq!(
+            writes
+                .iter()
+                .map(|frame| (frame[OPCODE_OFFSET], frame[SLOT_OFFSET]))
+                .collect::<Vec<_>>(),
+            vec![
+                (Opcode::Capabilities as u8, 0),
+                (Opcode::DynamicBegin as u8, 7),
+                (Opcode::DynamicData as u8, 7),
+                (Opcode::Capabilities as u8, 0),
+                (Opcode::DynamicClear as u8, 7),
+            ]
+        );
     }
 
     #[test]
@@ -1124,15 +1298,17 @@ mod tests {
                 },
                 0,
             );
-            client.upload_dynamic(b"xy", ttl, keep).unwrap();
+            client.upload_dynamic(0, b"xy", ttl, keep).unwrap();
             let writes = &client.transport_mut().writes;
             assert_eq!(writes.len(), 3);
             assert_eq!(writes[1][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+            assert_eq!(writes[1][SLOT_OFFSET], 0);
             assert_eq!(
                 writes[1][PAYLOAD_LENGTH_OFFSET] as usize,
                 expected_payload_length
             );
             assert_eq!(writes[2][OPCODE_OFFSET], Opcode::DynamicData as u8);
+            assert_eq!(writes[2][SLOT_OFFSET], 0);
             assert_eq!(writes[1][REQUEST_ID_OFFSET], writes[2][REQUEST_ID_OFFSET]);
             assert!(writes.iter().all(|frame| {
                 frame[PAYLOAD_OFFSET + frame[PAYLOAD_LENGTH_OFFSET] as usize..]
@@ -1155,7 +1331,7 @@ mod tests {
             2,
         );
         assert_eq!(
-            client.upload_dynamic(b"x", None, true),
+            client.upload_dynamic(0, b"x", None, true),
             Err(ClientError::DynamicKeepAfterExecuteUnsupported)
         );
         assert_eq!(client.transport_mut().writes.len(), 1);
@@ -1175,7 +1351,7 @@ mod tests {
                 3,
             );
             assert_eq!(
-                client.upload_dynamic(b"xy", None, false),
+                client.upload_dynamic(0, b"xy", None, false),
                 Err(ClientError::Remote(failure))
             );
             let writes = &client.transport_mut().writes;
@@ -1212,14 +1388,18 @@ mod tests {
                 },
                 1,
             );
-            client.upload_dynamic(&[b'x'; 23], None, false).unwrap();
+            client.upload_dynamic(7, &[b'x'; 23], None, false).unwrap();
             let writes = &client.transport_mut().writes;
             assert_eq!(writes.len(), 6);
+            assert_eq!(writes[1][SLOT_OFFSET], 7);
+            assert_eq!(writes[2][SLOT_OFFSET], 7);
+            assert_eq!(writes[3][SLOT_OFFSET], 7);
             assert_eq!(writes[1][REQUEST_ID_OFFSET], 1);
             assert_eq!(writes[2][REQUEST_ID_OFFSET], 1);
             assert_eq!(writes[3][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
             assert_eq!(writes[3][REQUEST_ID_OFFSET], 2);
             assert_eq!(read_u16(&writes[3], OFFSET_OFFSET), 0);
+            assert_eq!(read_u16(&writes[3], TOTAL_LENGTH_OFFSET), 23);
         }
     }
 
@@ -1249,7 +1429,7 @@ mod tests {
             },
             2,
         );
-        client.upload_dynamic(&[b'y'; 23], None, false).unwrap();
+        client.upload_dynamic(7, &[b'y'; 23], None, false).unwrap();
         let writes = &client.transport_mut().writes;
         assert_eq!(writes.len(), 9);
         assert_eq!(writes[1][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
@@ -1257,6 +1437,7 @@ mod tests {
         assert_eq!(writes[3][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
         assert_eq!(writes[1][REQUEST_ID_OFFSET], 1);
         assert_eq!(writes[3][REQUEST_ID_OFFSET], 2);
+        assert!(writes[1..].iter().all(|frame| frame[SLOT_OFFSET] == 7));
     }
 
     #[test]
@@ -1275,11 +1456,79 @@ mod tests {
             1,
         );
         client.auth_session.install_authenticated();
-        client.clear_dynamic().unwrap();
+        client.clear_dynamic(0).unwrap();
         assert!(client.is_authenticated());
         assert_eq!(client.transport_mut().writes.len(), 3);
+        assert_eq!(client.transport_mut().writes[1][SLOT_OFFSET], 0);
         assert_eq!(client.transport_mut().writes[1][REQUEST_ID_OFFSET], 1);
         assert_eq!(client.transport_mut().writes[2][REQUEST_ID_OFFSET], 2);
+    }
+
+    #[test]
+    fn dynamic_full_object_upload_uses_24_chunks_with_slot_identity() {
+        let mut client = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                Opcode::DynamicBegin => vec![ok_response(
+                    request,
+                    0,
+                    read_u16(request, TOTAL_LENGTH_OFFSET),
+                )],
+                Opcode::DynamicData => vec![ok_response(
+                    request,
+                    read_u16(request, OFFSET_OFFSET) + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                    read_u16(request, TOTAL_LENGTH_OFFSET),
+                )],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+        client.upload_dynamic(7, &[b'z'; 512], None, false).unwrap();
+
+        let writes = &client.transport_mut().writes;
+        assert_eq!(writes.len(), 26);
+        assert_eq!(writes[1][OPCODE_OFFSET], Opcode::DynamicBegin as u8);
+        assert_eq!(read_u16(&writes[1], TOTAL_LENGTH_OFFSET), 512);
+        let request_id = writes[1][REQUEST_ID_OFFSET];
+        let chunks = &writes[2..];
+        assert_eq!(chunks.len(), 24);
+        let mut offset = 0usize;
+        for (index, frame) in chunks.iter().enumerate() {
+            assert_eq!(frame[OPCODE_OFFSET], Opcode::DynamicData as u8);
+            assert_eq!(frame[SLOT_OFFSET], 7);
+            assert_eq!(frame[REQUEST_ID_OFFSET], request_id);
+            assert_eq!(read_u16(frame, TOTAL_LENGTH_OFFSET), 512);
+            assert_eq!(read_u16(frame, OFFSET_OFFSET) as usize, offset);
+            let expected_length = if index == 23 { 6 } else { 22 };
+            assert_eq!(frame[PAYLOAD_LENGTH_OFFSET] as usize, expected_length);
+            offset += expected_length;
+        }
+        assert_eq!(offset, 512);
+    }
+
+    #[test]
+    fn dynamic_response_with_a_foreign_slot_is_discarded_as_stale() {
+        let mut client = client_with_handler(
+            |request| match Opcode::try_from(request[OPCODE_OFFSET]).unwrap() {
+                Opcode::Capabilities => dynamic_capabilities_ok(request, 0x004f),
+                Opcode::DynamicBegin => {
+                    let mut stale = FakeTransport::response(request, Status::Ok, &[], 0, 2);
+                    stale[SLOT_OFFSET] = 3;
+                    vec![Ok(stale), ok_response(request, 0, 2)]
+                }
+                Opcode::DynamicData => vec![ok_response(
+                    request,
+                    read_u16(request, OFFSET_OFFSET) + request[PAYLOAD_LENGTH_OFFSET] as u16,
+                    read_u16(request, TOTAL_LENGTH_OFFSET),
+                )],
+                opcode => panic!("unexpected fixture opcode: {opcode:?}"),
+            },
+            0,
+        );
+        client.upload_dynamic(0, b"xy", None, false).unwrap();
+        let writes = &client.transport_mut().writes;
+        assert_eq!(writes.len(), 3);
+        assert!(writes.iter().all(|frame| frame[SLOT_OFFSET] == 0));
     }
 
     #[test]
@@ -1293,7 +1542,7 @@ mod tests {
             3,
         );
         assert!(matches!(
-            client.upload_dynamic(b"x", None, false),
+            client.upload_dynamic(0, b"x", None, false),
             Err(ClientError::Protocol(
                 ProtocolError::DynamicAckOffset { .. }
             ))
@@ -1303,24 +1552,23 @@ mod tests {
 
     #[test]
     fn dynamic_auth_status_does_not_clear_static_session() {
-        let mut client = client_with_handler(
-            |request| {
-                vec![Ok(FakeTransport::response(
-                    request,
-                    Status::AuthRequired,
-                    &[],
-                    0,
-                    0,
-                ))]
-            },
-            0,
-        );
-        client.auth_session.install_authenticated();
-        assert_eq!(
-            client.dynamic_capabilities(),
-            Err(ClientError::Remote(Status::AuthRequired))
-        );
-        assert!(client.is_authenticated());
+        for status in [Status::AuthRequired, Status::CredentialInvalid] {
+            let mut client = client_with_handler(
+                move |request| vec![Ok(FakeTransport::response(request, status, &[], 0, 0))],
+                0,
+            );
+            client.auth_session.install_authenticated();
+            assert_eq!(
+                client.dynamic_capabilities(),
+                Err(ClientError::Remote(status))
+            );
+            assert_eq!(
+                client.upload_dynamic(0, b"x", None, false),
+                Err(ClientError::Remote(status))
+            );
+            assert_eq!(client.clear_dynamic(0), Err(ClientError::Remote(status)));
+            assert!(client.is_authenticated());
+        }
     }
 
     #[test]

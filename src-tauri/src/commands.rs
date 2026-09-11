@@ -174,6 +174,10 @@ impl From<ClientError> for CommandError {
             ClientError::InvalidSlot(_) => {
                 Self::new("invalid_slot", "The selected slot is invalid.")
             }
+            ClientError::InvalidDynamicSlot { .. } => Self::new(
+                "invalid_slot",
+                "The selected Dynamic Macro object is invalid.",
+            ),
             ClientError::InvalidText(_) => {
                 Self::new("invalid_text", "The slot contains unsupported text bytes.")
             }
@@ -510,6 +514,7 @@ pub trait MacroSession: Send {
 
     fn upload_dynamic(
         &mut self,
+        _slot: u8,
         _text: &[u8],
         _ttl_seconds: Option<u32>,
         _keep_after_execute: bool,
@@ -519,7 +524,7 @@ pub trait MacroSession: Send {
         ))
     }
 
-    fn clear_dynamic(&mut self) -> Result<(), ClientError> {
+    fn clear_dynamic(&mut self, _slot: u8) -> Result<(), ClientError> {
         Err(ClientError::InvalidConfiguration(
             "session does not implement dynamic macro protocol",
         ))
@@ -576,15 +581,16 @@ impl MacroSession for RuntimeMacroClient<HidTransport> {
 
     fn upload_dynamic(
         &mut self,
+        slot: u8,
         text: &[u8],
         ttl_seconds: Option<u32>,
         keep_after_execute: bool,
     ) -> Result<(), ClientError> {
-        RuntimeMacroClient::upload_dynamic(self, text, ttl_seconds, keep_after_execute)
+        RuntimeMacroClient::upload_dynamic(self, slot, text, ttl_seconds, keep_after_execute)
     }
 
-    fn clear_dynamic(&mut self) -> Result<(), ClientError> {
-        RuntimeMacroClient::clear_dynamic(self)
+    fn clear_dynamic(&mut self, slot: u8) -> Result<(), ClientError> {
+        RuntimeMacroClient::clear_dynamic(self, slot)
     }
 
     fn auth_info(&mut self) -> Result<AuthInfo, ClientError> {
@@ -940,6 +946,7 @@ impl<F: SessionFactory> AppState<F> {
             | ClientError::Auth(_)
             | ClientError::InvalidConfiguration(_)
             | ClientError::InvalidSlot(_)
+            | ClientError::InvalidDynamicSlot { .. }
             | ClientError::InvalidText(_)
             | ClientError::LengthExceeded { .. }
             | ClientError::EmptyDynamicText
@@ -1059,6 +1066,7 @@ impl<F: SessionFactory> AppState<F> {
 
     pub fn upload_dynamic(
         &mut self,
+        slot: u8,
         text: &str,
         ttl_seconds: Option<u32>,
         keep_after_execute: bool,
@@ -1071,7 +1079,7 @@ impl<F: SessionFactory> AppState<F> {
             .as_mut()
             .expect("connection was checked above")
             .session
-            .upload_dynamic(text.as_bytes(), ttl_seconds, keep_after_execute);
+            .upload_dynamic(slot, text.as_bytes(), ttl_seconds, keep_after_execute);
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1083,7 +1091,7 @@ impl<F: SessionFactory> AppState<F> {
         }
     }
 
-    pub fn clear_dynamic(&mut self) -> Result<(), CommandError> {
+    pub fn clear_dynamic(&mut self, slot: u8) -> Result<(), CommandError> {
         if self.connection.is_none() {
             return Err(CommandError::not_connected());
         }
@@ -1092,7 +1100,7 @@ impl<F: SessionFactory> AppState<F> {
             .as_mut()
             .expect("connection was checked above")
             .session
-            .clear_dynamic();
+            .clear_dynamic(slot);
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1110,6 +1118,7 @@ impl<F: SessionFactory> AppState<F> {
             ClientError::Remote(_) => self.connection.is_some(),
             ClientError::Auth(_)
             | ClientError::InvalidSlot(_)
+            | ClientError::InvalidDynamicSlot { .. }
             | ClientError::InvalidText(_)
             | ClientError::LengthExceeded { .. }
             | ClientError::EmptyDynamicText
@@ -1413,6 +1422,7 @@ pub async fn get_dynamic_capabilities(
 
 #[tauri::command]
 pub async fn upload_dynamic(
+    slot: u8,
     text: String,
     ttl_seconds: Option<u32>,
     keep_after_execute: bool,
@@ -1423,19 +1433,22 @@ pub async fn upload_dynamic(
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
-        state.upload_dynamic(&text, ttl_seconds, keep_after_execute)
+        state.upload_dynamic(slot, &text, ttl_seconds, keep_after_execute)
     })
     .await
 }
 
 #[tauri::command]
-pub async fn clear_dynamic(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), CommandError> {
+pub async fn clear_dynamic(
+    slot: u8,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), CommandError> {
     let state = Arc::clone(state.inner());
     run_on_hid_worker(move || {
         let mut state = state
             .lock()
             .map_err(|_| CommandError::state_unavailable())?;
-        state.clear_dynamic()
+        state.clear_dynamic(slot)
     })
     .await
 }
@@ -1449,7 +1462,7 @@ mod tests {
 
     type SetCall = (u8, Vec<u8>);
     type SetCalls = Arc<StdMutex<Vec<SetCall>>>;
-    type DynamicUploadCall = (Vec<u8>, Option<u32>, bool);
+    type DynamicUploadCall = (u8, Vec<u8>, Option<u32>, bool);
 
     fn record(path: &[u8], usage_page: u16, usage: u16, interface_number: i32) -> DeviceRecord {
         DeviceRecord::for_test(
@@ -1490,7 +1503,7 @@ mod tests {
         clear_calls: Arc<StdMutex<Vec<u8>>>,
         dynamic_capabilities_calls: Arc<StdMutex<usize>>,
         dynamic_upload_calls: Arc<StdMutex<Vec<DynamicUploadCall>>>,
-        dynamic_clear_calls: Arc<StdMutex<usize>>,
+        dynamic_clear_calls: Arc<StdMutex<Vec<u8>>>,
     }
 
     struct FakeSession {
@@ -1514,7 +1527,7 @@ mod tests {
         clear_calls: Arc<StdMutex<Vec<u8>>>,
         dynamic_capabilities_calls: Arc<StdMutex<usize>>,
         dynamic_upload_calls: Arc<StdMutex<Vec<DynamicUploadCall>>>,
-        dynamic_clear_calls: Arc<StdMutex<usize>>,
+        dynamic_clear_calls: Arc<StdMutex<Vec<u8>>>,
     }
 
     impl MacroSession for FakeSession {
@@ -1545,11 +1558,13 @@ mod tests {
 
         fn upload_dynamic(
             &mut self,
+            slot: u8,
             text: &[u8],
             ttl_seconds: Option<u32>,
             keep_after_execute: bool,
         ) -> Result<(), ClientError> {
             self.dynamic_upload_calls.lock().unwrap().push((
+                slot,
                 text.to_vec(),
                 ttl_seconds,
                 keep_after_execute,
@@ -1557,8 +1572,8 @@ mod tests {
             self.dynamic_upload_result.clone()
         }
 
-        fn clear_dynamic(&mut self) -> Result<(), ClientError> {
-            *self.dynamic_clear_calls.lock().unwrap() += 1;
+        fn clear_dynamic(&mut self, slot: u8) -> Result<(), ClientError> {
+            self.dynamic_clear_calls.lock().unwrap().push(slot);
             self.dynamic_clear_result.clone()
         }
 
@@ -1633,12 +1648,12 @@ mod tests {
                 set_result: Ok(()),
                 clear_result: Ok(()),
                 dynamic_capabilities_result: Ok(DynamicCapabilities {
-                    capability_version: 1,
-                    dynamic_object_count: 1,
+                    capability_version: crate::protocol::DYNAMIC_CAPABILITY_VERSION,
+                    dynamic_object_count: crate::protocol::DYNAMIC_SLOT_COUNT_MAX,
                     lifecycle_flags: crate::protocol::DYNAMIC_LIFECYCLE_REQUIRED_MASK
                         | crate::protocol::DYNAMIC_LIFECYCLE_CLEAR_ON_USB_DISCONNECT
                         | crate::protocol::DYNAMIC_LIFECYCLE_SUPPORTS_KEEP_AFTER_EXECUTE,
-                    max_dynamic_length: crate::protocol::MAX_TEXT_LENGTH as u16,
+                    max_dynamic_length: crate::protocol::MAX_DYNAMIC_TEXT_LENGTH as u16,
                     default_ttl_seconds: crate::protocol::DYNAMIC_DEFAULT_TTL_SECONDS,
                     min_ttl_seconds: crate::protocol::DYNAMIC_MIN_TTL_SECONDS,
                     max_ttl_seconds: crate::protocol::DYNAMIC_MAX_TTL_SECONDS,
@@ -1669,7 +1684,7 @@ mod tests {
                 clear_calls: Arc::new(StdMutex::new(Vec::new())),
                 dynamic_capabilities_calls: Arc::new(StdMutex::new(0)),
                 dynamic_upload_calls: Arc::new(StdMutex::new(Vec::new())),
-                dynamic_clear_calls: Arc::new(StdMutex::new(0)),
+                dynamic_clear_calls: Arc::new(StdMutex::new(Vec::new())),
             },
             count,
         )
@@ -2084,16 +2099,18 @@ mod tests {
         state.connect(&candidate.id).unwrap();
 
         let capabilities = state.dynamic_capabilities().unwrap();
-        assert_eq!(capabilities.max_dynamic_length, 256);
-        state.upload_dynamic("x", Some(60), true).unwrap();
-        state.clear_dynamic().unwrap();
+        assert_eq!(capabilities.capability_version, 2);
+        assert_eq!(capabilities.dynamic_object_count, 8);
+        assert_eq!(capabilities.max_dynamic_length, 512);
+        state.upload_dynamic(7, "x", Some(60), true).unwrap();
+        state.clear_dynamic(7).unwrap();
         assert_eq!(state.connection_state().auth_state, AuthState::Locked);
         assert_eq!(*dynamic_capabilities_calls.lock().unwrap(), 1);
         assert_eq!(
             dynamic_upload_calls.lock().unwrap().as_slice(),
-            &[(b"x".to_vec(), Some(60), true)]
+            &[(7, b"x".to_vec(), Some(60), true)]
         );
-        assert_eq!(*dynamic_clear_calls.lock().unwrap(), 1);
+        assert_eq!(dynamic_clear_calls.lock().unwrap().as_slice(), &[7]);
         assert_eq!(*list_calls.lock().unwrap(), 0);
         assert!(get_calls.lock().unwrap().is_empty());
         assert!(set_calls.lock().unwrap().is_empty());
@@ -2128,6 +2145,30 @@ mod tests {
             ))
         );
         assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn dynamic_object_slot_error_is_reported_without_dropping_the_session() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_upload_result = Err(ClientError::InvalidDynamicSlot { slot: 3 });
+        factory.dynamic_clear_result = Err(ClientError::InvalidDynamicSlot { slot: 3 });
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"dynamic-slot",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        let expected = Err(CommandError::new(
+            "invalid_slot",
+            "The selected Dynamic Macro object is invalid.",
+        ));
+        assert_eq!(state.upload_dynamic(3, "x", None, false), expected);
+        assert_eq!(state.clear_dynamic(3), expected);
         assert!(state.connection_state().connected);
     }
 

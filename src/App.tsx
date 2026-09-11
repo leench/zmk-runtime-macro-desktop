@@ -55,7 +55,7 @@ import type { Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
 import type { SlotAction, SlotState } from "./types/workbench";
 import { MAX_TEXT_BYTES, macroBytes, textFromTokens, tokensFromText } from "./utils/macro";
-import { validateDynamicText, validateDynamicTtl } from "./utils/dynamic";
+import { FIRST_DYNAMIC_SLOT, validateDynamicText, validateDynamicTtl } from "./utils/dynamic";
 import type { DynamicMacroStatus } from "./components/DynamicMacroPanel";
 
 const disconnected: ConnectionState = { connected: false, device: null, authState: "disconnected" };
@@ -1163,7 +1163,7 @@ function App() {
     recordOperation("DYNAMIC_UPLOAD");
     try {
       setDynamicProgress(25);
-      await enqueueProtocolOperation(() => uploadDynamicCommand(dynamicText, dynamicTtlSeconds, dynamicKeepAfterExecute));
+      await enqueueProtocolOperation(() => uploadDynamicCommand(FIRST_DYNAMIC_SLOT, dynamicText, dynamicTtlSeconds, dynamicKeepAfterExecute));
       if (!mounted.current || operation.current !== sequence) return null;
       setDynamicProgress(null);
       setDynamicStatus("committed");
@@ -1202,7 +1202,7 @@ function App() {
     recordOperation("DYNAMIC_CLEAR");
     try {
       setDynamicProgress(50);
-      await enqueueProtocolOperation(() => clearDynamicCommand());
+      await enqueueProtocolOperation(() => clearDynamicCommand(FIRST_DYNAMIC_SLOT));
       if (!mounted.current || operation.current !== sequence) return null;
       setDynamicProgress(null);
       setDynamicStatus("cleared");

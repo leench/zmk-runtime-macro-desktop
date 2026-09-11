@@ -310,10 +310,20 @@ pub enum ClientError {
     Auth(AuthError),
     Remote(Status),
     InvalidSlot(u8),
+    /// A dynamic object index that is not inside the device's reported object
+    /// count, or that cannot be valid on any device (`0xff`, `>= 8`).
+    InvalidDynamicSlot {
+        slot: u8,
+    },
     InvalidText(TextError),
-    LengthExceeded { length: usize, maximum: usize },
+    LengthExceeded {
+        length: usize,
+        maximum: usize,
+    },
     EmptyDynamicText,
-    InvalidDynamicTtl { value: u32 },
+    InvalidDynamicTtl {
+        value: u32,
+    },
     DynamicKeepAfterExecuteUnsupported,
     InvalidConfiguration(&'static str),
 }
@@ -330,6 +340,9 @@ impl fmt::Display for ClientError {
                 *status as u8
             ),
             Self::InvalidSlot(slot) => write!(formatter, "slot {slot} must be between 0 and 254"),
+            Self::InvalidDynamicSlot { slot } => {
+                write!(formatter, "slot {slot} is not a valid dynamic object index")
+            }
             Self::InvalidText(error) => error.fmt(formatter),
             Self::LengthExceeded { length, maximum } => {
                 write!(

@@ -6,10 +6,9 @@
 
 本文与固件模块中的以下文档配套使用：
 
-- `docs/DYNAMIC_PROTOCOL.md`：Dynamic Macro wire contract；
-- `docs/DYNAMIC_DESKTOP_APP_SPEC.md`：Dynamic desktop integration 行为和验收规范；
-- `tools/runtime_macro_cli.py`：Python reference client；
-- 本文：desktop 产品形态、UI 交付顺序、服务边界、场景模型和后续多 Dynamic Object 兼容计划。
+- `docs/DYNAMIC_PROTOCOL.md`：Dynamic Macro wire contract（当前已实现的 v2 多槽位版本，取代早期单槽 v1）；
+- `tools/runtime_macro_cli.py`：Python reference client（已按 v2 contract 同步）；
+- 本文：desktop 产品形态、UI 交付顺序、服务边界、场景模型和多 Dynamic Object 处理计划。
 
 本文不修改固件协议，也不把复杂的自动化规则写死在 React UI 中。
 
@@ -19,7 +18,7 @@
 2. UI 阶段采用 presentation-first：使用 mock/in-memory fixture 完成高保真视觉和交互评审，不接真实 HID、不做场景持久化、不接 HTTP API。
 3. UI 视觉验收通过后，才依次实现 contract/DTO、DynamicService、场景持久化、真实 HID 接入、设备 alias、托盘真实状态、自启、本地 HTTP API 和自动场景。
 4. 当前主机可以执行适用的 frontend、Rust、Tauri build/test；跨平台专属行为仍必须在对应平台或 runner 上验证。
-5. 当前已完成的 Dynamic v1 wire/client/upload/clear/retry 作为后续接入基线，不从零重写。
+5. desktop backend 已完成 Dynamic Protocol v2 多槽位迁移（slot-aware capability/upload/clear、每 object 最大 512 bytes、逐槽 clear、retry 从 BEGIN 重启）；该实现是后续接入基线，不从零重写，也不降级回单槽 v1。
 
 产品核心定位为：
 
@@ -56,14 +55,14 @@ Scenario 是 desktop 的逻辑对象。它不是固件里的 Dynamic Object，�
 - UI 以 Scenario 为主要管理对象，Dynamic Object 是目标资源；
 - 不把 Scenario 列表误画成 firmware object 列表，也不把 Dynamic Object 当作可读回的文本槽位。
 
-### 2.3 当前单 object alias
+### 2.3 当前 Dynamic Object 模型
 
-当前 firmware 的 Dynamic v1 capability 只有一个 object。desktop 对它使用兼容 alias `default`：
+当前 firmware 的 Dynamic Protocol v2 capability 报告 `dynamic_object_count`（默认 8，范围 1–8）和 512-byte `max_dynamic_length`；wire slot 必须是 `0..dynamic_object_count-1`，`0xff` 是 static `LIST_SLOT` 而不是合法 dynamic object。desktop 的 object 模型因此直接以 capability 为准：
 
-- `default` 是 desktop/API 的 alias，不是对未来 object 编号的猜测；
-- 当前单 object UI 仍显示目标 object 行，并以只读方式显示 `default`；
-- 未来 capability 返回多个 object 时，同一行变为 capability-driven selector；
-- 不硬编码未来 object 数量、数字编号、容量、TTL 边界或 wire contract。
+- desktop/API 可以在 object 编号之外提供一个稳定的展示 alias，但 alias 不是对未来编号的猜测；
+- UI 必须能读取 capability 的 object count 并在其上选择目标 object；
+- 不硬编码 object 数量、编号范围、容量、TTL 边界或 wire contract，一律以 `CAPABILITIES` 返回值为准；
+- 单 object 设备（count = 1）和多 object 设备必须能用同一套 UI 模型表达。
 
 ### 2.4 观察状态
 
@@ -81,10 +80,10 @@ TTL 倒计时如果展示，必须标记为估计值，不能表示可靠的设�
 - Rust 负责 HID 枚举、连接、协议、重试和错误映射；
 - 前端不直接访问 HID；
 - Runtime Macro v2 固定 32-byte frame；
-- Dynamic v1 `CAPABILITIES`、`DYNAMIC_BEGIN`、`DYNAMIC_DATA`、`DYNAMIC_CLEAR`；
+- Dynamic v2 `CAPABILITIES`、`DYNAMIC_BEGIN`、`DYNAMIC_DATA`、`DYNAMIC_CLEAR`（slot-aware，object count 默认 8，每 object 512 bytes）；
 - capability 严格解析；
-- upload 的 22-byte DATA 分块和原子 transaction；
-- clear 和 upload retry；upload retry 使用新 request ID 并从 BEGIN 重启；
+- upload 的 22-byte DATA 分块和原子 transaction（512 bytes 最多 24 chunks）；
+- clear 和 upload retry；upload retry 使用新 request ID 并从 BEGIN 重启；clear 逐 object 幂等，无 wire clear-all；
 - fake HID、protocol/client/command 相关测试；
 - Dynamic 绕过 static password gate，但不应触发 static login；
 - dynamic 文本仅允许 printable ASCII、LF、Tab 和 Backspace；
@@ -182,7 +181,7 @@ UI 阶段只完成高保真页面、状态展示和评审用交互。允许：
 - 在开发预览中切换状态；
 - 点击场景、对象 selector、下拉框、确认对话框和按钮；
 - 在内存中切换 dirty、selected、mock operation 状态；
-- 使用单 object 和多 object fixture 做布局验收；
+- 使用单 object（count = 1）和多 object（count = 8）两种合法 fixture 做布局验收；
 - 使用截图、运行中的窗口和人工操作完成视觉评审。
 
 UI 阶段禁止：
@@ -291,11 +290,11 @@ Dynamic macros are unencrypted and intended only for non-secret text.
 
 该提示不应暗示应用已经识别或过滤所有 secret。
 
-## 6. 单 object 与未来多 object 的 UI 模型
+## 6. Dynamic Object 的 UI 模型
 
 ### 6.1 Presentation model
 
-UI 从第一天就使用 collection 形态，但这只是 desktop presentation model，不提前冻结未来 firmware wire contract：
+UI 从第一天就使用 collection 形态，但这只是 desktop presentation model，不提前冻结 firmware wire contract：
 
 ```ts
 type DynamicObjectPresentation = {
@@ -316,19 +315,19 @@ type DynamicCapabilitiesPresentation = {
 };
 ```
 
-UI 不得根据 objectId 的格式猜测数字 slot，也不得预设未来一定有几个 object、各 object 的容量、TTL 或 lifecycle policy。mock fixture 中的对象数量和属性只用于布局和状态评审，必须明确标记为 preview data。
+UI 不得根据 objectId 的格式猜测数字 slot，也不得预设 object 数量、各 object 的容量、TTL 或 lifecycle policy；backend 已按 v2 把真实 `dynamic_object_count`、512-byte 上限、TTL 边界和 keep 支持位透传到 capability DTO。mock fixture 中的对象数量和属性只用于布局和状态评审，必须明确标记为 preview data。
 
-### 6.2 当前单 object
+### 6.2 单 object 设备（`dynamic_object_count = 1`）
 
-当前 firmware 只有一个 Dynamic Object 时：
+当 v2 capability 报告只有一个 Dynamic Object 时：
 
 - `objects` collection 只有一个展示项；
-- desktop/API 目标 alias 使用 `default`；
+- desktop/API 可以给该唯一 object 一个稳定展示 alias；
 - 目标 object 行仍然保留，不因只有一个 object 而删除；
-- 该行以只读展示为主，例如 `Default` 或 `default`；
+- 该行以只读展示为主；
 - 不显示“当前设备文本”，因为没有 readback。
 
-### 6.3 未来多 object mock
+### 6.3 多 object 设备
 
 UI preview 必须至少提供：
 
@@ -336,7 +335,7 @@ UI preview 必须至少提供：
 2. 多个 object 的 fixture；
 3. 当前 target object 缺失的 fixture。
 
-单 object 时目标行是只读信息；多 object 时同一位置变为 capability-driven selector：
+单 object 时目标行是只读信息；多 object 时同一位置变为 capability-driven selector。v2 已允许最多 8 个 object，因此 selector 不是“未来形态”：
 
 ```text
 Dynamic Object
@@ -345,7 +344,7 @@ Dynamic Object
 
 selector 的选项来自 `objects` collection，不来自硬编码数字列表。缺少目标 object 时显示明确错误并禁止上传，但保留 Scenario 正文和 dirty draft。
 
-正式多 object 功能必须等待 firmware 发布正式 capability/protocol contract，并同步 reference client 后再实现。此前只能保留 collection、opaque object id/display label、`target_object` 和当前 `default` alias。
+v2 capability 已正式发布多 object contract，`dynamic_object_count`、512-byte 上限和 slot 语义均为 wire contract 的一部分；reference client 与 desktop backend 已同步。UI 阶段直接按 capability 驱动选择，不再把 object 编号/数量当作猜测；desktop/API 可保留 collection、opaque object id/display label 和 `target_object` 的兼容形态。
 
 ## 7. UI mock 状态矩阵
 
@@ -391,7 +390,7 @@ UI 视觉验收之后，所有真实来源必须共用一个 Rust `DynamicServic
 │   ├─ observed state                      │
 │   ├─ generation / last-write-wins        │
 │   ├─ per-device serialized writer        │
-│   └─ existing Dynamic v1 client          │
+│   └─ Dynamic v2 slot-aware client        │
 │              │                           │
 │              ▼                           │
 │ Runtime Macro management HID             │
@@ -403,7 +402,7 @@ UI 视觉验收之后，所有真实来源必须共用一个 Rust `DynamicServic
 - frontend 只通过 Tauri command/event 使用 backend，不直接访问 HID；
 - UI、tray、自动规则和 HTTP API 不得各自创建 HID session；
 - 一个设备只有一个 HID writer；capability、upload、clear 共用同一串行 queue；
-- Dynamic retry 必须遵循已有 v1 client 规则：新 request ID，并从 BEGIN 重启；
+- Dynamic retry 必须遵循已有 v2 client 规则：新 request ID，并从 BEGIN 重启，slot/request ID/total 全程保持一致；
 - generation 用于淘汰尚未开始的旧请求并阻止过期 operation 覆盖当前 state；
 - disconnect、reconnect 和应用重启后 observed state 为 `Unknown`；
 - Dynamic 操作绕过 static auth gate，但不调用、刷新或自动登录 static auth；
@@ -474,7 +473,7 @@ DELETE /api/v1/devices/{device}/dynamic-objects/{object}
 GET    /api/v1/operations/{operation_id}
 ```
 
-设备使用用户配置的 alias，不暴露 serial 或 HID path。当前单 object 使用 `default` alias，并保留复数路径和 object 标识。
+设备使用用户配置的 alias，不暴露 serial 或 HID path。object 数量以 `CAPABILITIES` 为准（1–8），路径和 object 标识保留复数形式。
 
 ### 10.2 API 行为
 
@@ -532,7 +531,7 @@ source priority、lease TTL、override 到期恢复属于自动场景阶段，�
 2. 保持现有 TitleBar、AppHeader、Static Slots 和全局 MagicPatterns 视觉风格；
 3. 用页面级 Dynamic Workspace 替代旧 Dynamic modal 的产品方向；
 4. Scenario 列表、空状态、新建、编辑器、dirty 状态和操作栏；
-5. 单 object `default` alias 与多 object capability-driven selector 的 mock；
+5. 可选的单 object（count = 1）与多 object（count = 8）capability-driven selector 的 mock；
 6. capability details、非 secret 警告、无 readback 文案；
 7. 全部状态矩阵和确认对话框的 mock/in-memory interaction；
 8. 不接 HID、不写 localStorage、不持久化 Scenario、不接 HTTP API；
@@ -552,16 +551,16 @@ source priority、lease TTL、override 到期恢复属于自动场景阶段，�
 UI 视觉验收通过后：
 
 - 冻结 `DynamicObject` collection、`DynamicCapabilities`、`DynamicObservedState`、`DynamicUploadRequest`、`Scenario` 和 `OperationStatus`；
-- 固定 current single object 到 `default` alias 的映射；
+- 定义 `DynamicObject` collection 到 capability `dynamic_object_count` 的映射（含可选展示 alias）；
 - 定义状态、错误和 operation metadata，不在 DTO 中放正文、HID path、serial 或 token；
-- 从已有 Python reference client 和 Dynamic v1 文档建立 golden frame fixtures；
+- 从已有 Python reference client 和 Dynamic Protocol v2 文档建立 golden frame fixtures；
 - 增加适用于当前主机的 frontend build、Rust fmt/test/clippy、Tauri no-bundle 和 privacy checks；
 - 保留现有 release workflow；
 - Linux、macOS、Windows 的平台专属构建和行为验证继续由对应 runner/平台完成。
 
 ### 阶段 3：DynamicService、队列和 generation
 
-- 复用已有 Dynamic v1 client/protocol/upload/clear/retry；
+- 复用已有 Dynamic v2 slot-aware client/protocol/upload/clear/retry；
 - 将 capability、upload、clear 接入统一 Rust DynamicService；
 - 只维护一个 active device 和一个 HID writer；
 - 每次新连接重新 discovery；
@@ -728,11 +727,11 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 
 至少覆盖：
 
-- Dynamic v1 capability、upload、clear、22-byte DATA、retry 和 stale/malformed response；
+- Dynamic v2 capability、slot-aware upload、逐 object clear、22-byte DATA（512 bytes/24 chunks）、retry 和 stale/malformed response；
 - 每个设备只有一个 writer；
 - 新 generation 淘汰 pending 旧请求；
 - disconnect/reconnect/restart 后 `Unknown`；
-- 单 object `default` alias；
+- capability 驱动的 object 数量（含 count = 1）与目标选择；
 - mock/正式 object collection 和目标选择；
 - capability change、keep unsupported、oversize 和 target missing；
 - dynamic auth status 不触发 static login；
@@ -750,7 +749,7 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 - 为每种自动化软件开发 desktop 内置插件；
 - 浏览器 URL、IDE project、Git branch 等复杂上下文的内置识别；
 - gRPC、消息队列、云端同步；
-- 在 firmware 正式多 object contract 发布前猜测 object 编号、数量、容量、TTL 或 wire contract；
+- 不根据 desktop 假设猜测 object 编号、数量、容量、TTL 或 wire contract，一律以 `CAPABILITIES` 为准；
 - 在 UI-only 阶段调用 HID、写 localStorage、Scenario 持久化或接 HTTP API。
 
 ## 16. 完成定义
@@ -763,7 +762,7 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 2. Dynamic Workspace 与现有 Static Slots、TitleBar、AppHeader 的视觉质量一致；
 3. 新 UI 已替代旧 Dynamic modal 的产品方向，但旧入口在验收前仍可保留；
 4. Scenario 是主要管理对象，Dynamic Object 明确为上传目标；
-5. 单 object `default` 和多 object collection mock 均可展示；
+5. 单 object（count = 1）和多 object（count = 8）collection mock 均可展示；
 6. 规定的状态矩阵、对话框和操作语义可人工检查；
 7. UI-only 阶段没有 HID、localStorage、HTTP API 或真实业务完成假象；
 8. 用户完成视觉/交互验收后，旧 Dynamic modal 入口才可移除。
@@ -772,7 +771,7 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 
 阶段 1 之后，完成 PR-05 至 PR-11 并满足：
 
-1. Dynamic v1 已复用并接入统一 DynamicService；
+1. Dynamic v2 slot-aware client 已复用并接入统一 DynamicService；
 2. UI、tray 和后续来源共用一个 serialized writer/queue；
 3. Scenario 可创建、编辑、删除、原子持久化和手动 Save & Upload；
 4. 支持当前 active device alias；
@@ -792,6 +791,6 @@ UI-only PR 至少执行 frontend build、`git diff --check`，并完成本地窗
 - API、tray、UI 和自动规则都通过同一 DynamicService；
 - HTTP status/operation 不提供 readback 假象；
 - 自动场景遵守 generation 和仲裁优先级；
-- firmware 发布正式多 object contract 后完成 capability-driven 多 object 支持；
+- UI 完成基于 v2 `CAPABILITIES`（`dynamic_object_count` 1–8）的 capability-driven 多 object 选择支持；
 - 三平台构建、打包、tray/autostart、真实 HID 和 static/auth 回归全部验收；
 - 文档、测试、日志、诊断和 artifacts 持续符合公开仓库隐私边界。

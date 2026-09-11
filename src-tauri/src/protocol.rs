@@ -6,6 +6,9 @@ pub const FRAME_SIZE: usize = 32;
 pub const HEADER_SIZE: usize = 10;
 pub const PAYLOAD_SIZE: usize = FRAME_SIZE - HEADER_SIZE;
 pub const MAX_TEXT_LENGTH: usize = 256;
+/// Dynamic Protocol v2 text objects are independent from the static slots and
+/// allow up to 512 bytes each.
+pub const MAX_DYNAMIC_TEXT_LENGTH: usize = 512;
 pub const VERSION: u8 = 2;
 pub const LIST_SLOT: u8 = 0xff;
 pub const AUTH_SLOT: u8 = LIST_SLOT;
@@ -14,6 +17,13 @@ pub const AUTH_INFO_LENGTH: usize = 22;
 pub const AUTH_CHALLENGE_LENGTH: usize = NONCE_SIZE;
 pub const AUTH_PROVE_LENGTH: usize = 16;
 pub const DYNAMIC_CAPABILITIES_LENGTH: usize = 22;
+pub const DYNAMIC_CAPABILITY_VERSION: u8 = 2;
+/// Dynamic object indices are `0..dynamic_object_count-1`. The protocol-level
+/// maximum object count is 8, so `0xff` (the static `LIST_SLOT` sentinel) and
+/// every index at or above 8 are invalid on every device.
+pub const DYNAMIC_FIRST_SLOT: u8 = 0;
+pub const DYNAMIC_SLOT_COUNT_MIN: u8 = 1;
+pub const DYNAMIC_SLOT_COUNT_MAX: u8 = 8;
 pub const DYNAMIC_DEFAULT_TTL_SECONDS: u32 = 300;
 pub const DYNAMIC_MIN_TTL_SECONDS: u32 = 1;
 pub const DYNAMIC_MAX_TTL_SECONDS: u32 = 86_400;
@@ -212,6 +222,14 @@ fn write_u16(frame: &mut Frame, offset: usize, value: u16) {
     frame[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
+/// Report whether `slot` is a valid dynamic object index for a device that
+/// reports `object_count` dynamic objects. Before capability discovery only
+/// the protocol-level bound is known, which is expressed by passing
+/// [`DYNAMIC_SLOT_COUNT_MAX`].
+pub fn dynamic_slot_is_valid(slot: u8, object_count: u8) -> bool {
+    (DYNAMIC_SLOT_COUNT_MIN..=DYNAMIC_SLOT_COUNT_MAX).contains(&object_count) && slot < object_count
+}
+
 fn valid_dynamic_begin_payload(payload: &[u8]) -> bool {
     match payload.len() {
         0 => true,
@@ -303,9 +321,9 @@ pub fn build_frame(
             });
         }
         Opcode::DynamicBegin
-            if slot != LIST_SLOT
+            if !dynamic_slot_is_valid(slot, DYNAMIC_SLOT_COUNT_MAX)
                 || offset != 0
-                || !(1..=MAX_TEXT_LENGTH as u16).contains(&total_length)
+                || !(1..=MAX_DYNAMIC_TEXT_LENGTH as u16).contains(&total_length)
                 || !valid_dynamic_begin_payload(payload) =>
         {
             return Err(ProtocolError::InvalidRequest {
@@ -313,8 +331,8 @@ pub fn build_frame(
             });
         }
         Opcode::DynamicData
-            if slot != LIST_SLOT
-                || !(1..=MAX_TEXT_LENGTH as u16).contains(&total_length)
+            if !dynamic_slot_is_valid(slot, DYNAMIC_SLOT_COUNT_MAX)
+                || !(1..=MAX_DYNAMIC_TEXT_LENGTH as u16).contains(&total_length)
                 || offset > total_length
                 || payload.is_empty()
                 || payload.len() > (total_length - offset) as usize =>
@@ -324,7 +342,10 @@ pub fn build_frame(
             });
         }
         Opcode::DynamicClear | Opcode::Capabilities
-            if slot != LIST_SLOT || !payload.is_empty() || offset != 0 || total_length != 0 =>
+            if !dynamic_slot_is_valid(slot, DYNAMIC_SLOT_COUNT_MAX)
+                || !payload.is_empty()
+                || offset != 0
+                || total_length != 0 =>
         {
             return Err(ProtocolError::InvalidRequest {
                 operation: opcode.name(),
@@ -410,12 +431,23 @@ pub fn build_lock_request(request_id: u8) -> Result<Frame, ProtocolError> {
     build_frame(Opcode::Lock, request_id, AUTH_SLOT, &[], 0, 0)
 }
 
+/// `CAPABILITIES` accepts any valid dynamic object index and the firmware
+/// returns identical metadata for all of them; the client always probes the
+/// first object so the request stays valid on a device with one object.
 pub fn build_capabilities_request(request_id: u8) -> Result<Frame, ProtocolError> {
-    build_frame(Opcode::Capabilities, request_id, LIST_SLOT, &[], 0, 0)
+    build_frame(
+        Opcode::Capabilities,
+        request_id,
+        DYNAMIC_FIRST_SLOT,
+        &[],
+        0,
+        0,
+    )
 }
 
 pub fn build_dynamic_begin_request(
     request_id: u8,
+    slot: u8,
     total_length: usize,
     ttl_seconds: Option<u32>,
     keep_after_execute: bool,
@@ -453,7 +485,7 @@ pub fn build_dynamic_begin_request(
     build_frame(
         Opcode::DynamicBegin,
         request_id,
-        LIST_SLOT,
+        slot,
         &payload[..payload_length],
         0,
         total_length,
@@ -462,6 +494,7 @@ pub fn build_dynamic_begin_request(
 
 pub fn build_dynamic_data_request(
     request_id: u8,
+    slot: u8,
     offset: usize,
     total_length: usize,
     payload: &[u8],
@@ -475,25 +508,26 @@ pub fn build_dynamic_data_request(
     build_frame(
         Opcode::DynamicData,
         request_id,
-        LIST_SLOT,
+        slot,
         payload,
         offset,
         total_length,
     )
 }
 
-pub fn build_dynamic_clear_request(request_id: u8) -> Result<Frame, ProtocolError> {
-    build_frame(Opcode::DynamicClear, request_id, LIST_SLOT, &[], 0, 0)
+pub fn build_dynamic_clear_request(request_id: u8, slot: u8) -> Result<Frame, ProtocolError> {
+    build_frame(Opcode::DynamicClear, request_id, slot, &[], 0, 0)
 }
 
 /// Parse the fixed capability metadata response after common response identity,
-/// status, and padding validation has completed.
+/// status, and padding validation has completed. The response must belong to a
+/// valid dynamic object index: a capability answer cannot come from the static
+/// `LIST_SLOT` sentinel or from an index the device does not have.
 pub fn parse_dynamic_capabilities_response(
     response: &Frame,
 ) -> Result<DynamicCapabilities, ProtocolError> {
     if response[VERSION_OFFSET] != VERSION
         || response[OPCODE_OFFSET] != Opcode::Capabilities as u8
-        || response[SLOT_OFFSET] != LIST_SLOT
         || Status::try_from(response[STATUS_OFFSET])? != Status::Ok
         || response[PAYLOAD_LENGTH_OFFSET] as usize != DYNAMIC_CAPABILITIES_LENGTH
         || read_u16(response, OFFSET_OFFSET) != 0
@@ -519,11 +553,11 @@ pub fn parse_dynamic_capabilities_response(
             payload[18..22].try_into().expect("fixed field"),
         ),
     };
-    if capabilities.capability_version != 1
-        || capabilities.dynamic_object_count != 1
+    if capabilities.capability_version != DYNAMIC_CAPABILITY_VERSION
+        || !dynamic_slot_is_valid(response[SLOT_OFFSET], capabilities.dynamic_object_count)
         || lifecycle_flags & !DYNAMIC_LIFECYCLE_KNOWN_MASK != 0
         || lifecycle_flags & DYNAMIC_LIFECYCLE_REQUIRED_MASK != DYNAMIC_LIFECYCLE_REQUIRED_MASK
-        || capabilities.max_dynamic_length != MAX_TEXT_LENGTH as u16
+        || capabilities.max_dynamic_length != MAX_DYNAMIC_TEXT_LENGTH as u16
         || capabilities.default_ttl_seconds != DYNAMIC_DEFAULT_TTL_SECONDS
         || capabilities.min_ttl_seconds != DYNAMIC_MIN_TTL_SECONDS
         || capabilities.max_ttl_seconds != DYNAMIC_MAX_TTL_SECONDS
@@ -646,9 +680,10 @@ pub fn validate_request(frame: &Frame) -> Result<Opcode, ProtocolError> {
             }
         }
         Opcode::DynamicBegin => {
-            if frame[SLOT_OFFSET] != LIST_SLOT
+            if !dynamic_slot_is_valid(frame[SLOT_OFFSET], DYNAMIC_SLOT_COUNT_MAX)
                 || read_u16(frame, OFFSET_OFFSET) != 0
-                || !(1..=MAX_TEXT_LENGTH as u16).contains(&read_u16(frame, TOTAL_LENGTH_OFFSET))
+                || !(1..=MAX_DYNAMIC_TEXT_LENGTH as u16)
+                    .contains(&read_u16(frame, TOTAL_LENGTH_OFFSET))
                 || !valid_dynamic_begin_payload(
                     &frame[PAYLOAD_OFFSET..PAYLOAD_OFFSET + payload_length],
                 )
@@ -661,8 +696,8 @@ pub fn validate_request(frame: &Frame) -> Result<Opcode, ProtocolError> {
         Opcode::DynamicData => {
             let offset = read_u16(frame, OFFSET_OFFSET);
             let total = read_u16(frame, TOTAL_LENGTH_OFFSET);
-            if frame[SLOT_OFFSET] != LIST_SLOT
-                || !(1..=MAX_TEXT_LENGTH as u16).contains(&total)
+            if !dynamic_slot_is_valid(frame[SLOT_OFFSET], DYNAMIC_SLOT_COUNT_MAX)
+                || !(1..=MAX_DYNAMIC_TEXT_LENGTH as u16).contains(&total)
                 || offset > total
                 || payload_length == 0
                 || payload_length > (total - offset) as usize
@@ -673,7 +708,7 @@ pub fn validate_request(frame: &Frame) -> Result<Opcode, ProtocolError> {
             }
         }
         Opcode::DynamicClear | Opcode::Capabilities => {
-            if frame[SLOT_OFFSET] != LIST_SLOT
+            if !dynamic_slot_is_valid(frame[SLOT_OFFSET], DYNAMIC_SLOT_COUNT_MAX)
                 || payload_length != 0
                 || read_u16(frame, OFFSET_OFFSET) != 0
                 || read_u16(frame, TOTAL_LENGTH_OFFSET) != 0
@@ -985,6 +1020,7 @@ mod tests {
 
         let capabilities = build_capabilities_request(1).unwrap();
         assert_eq!(validate_request(&capabilities), Ok(Opcode::Capabilities));
+        assert_eq!(capabilities[SLOT_OFFSET], DYNAMIC_FIRST_SLOT);
         assert!(capabilities[PAYLOAD_OFFSET..].iter().all(|byte| *byte == 0));
 
         for (ttl, keep, expected_length) in [
@@ -993,8 +1029,9 @@ mod tests {
             (Some(600), false, 4),
             (Some(600), true, 5),
         ] {
-            let begin = build_dynamic_begin_request(2, 23, ttl, keep).unwrap();
+            let begin = build_dynamic_begin_request(2, 7, 23, ttl, keep).unwrap();
             assert_eq!(validate_request(&begin), Ok(Opcode::DynamicBegin));
+            assert_eq!(begin[SLOT_OFFSET], 7);
             assert_eq!(begin[PAYLOAD_LENGTH_OFFSET] as usize, expected_length);
             assert!(begin[PAYLOAD_OFFSET + expected_length..]
                 .iter()
@@ -1002,51 +1039,196 @@ mod tests {
             assert_eq!(read_u16(&begin, TOTAL_LENGTH_OFFSET), 23);
         }
 
-        let data = build_dynamic_data_request(2, 22, 23, b"x").unwrap();
+        let data = build_dynamic_data_request(2, 7, 22, 23, b"x").unwrap();
         assert_eq!(validate_request(&data), Ok(Opcode::DynamicData));
-        let clear = build_dynamic_clear_request(3).unwrap();
+        assert_eq!(data[SLOT_OFFSET], 7);
+        let clear = build_dynamic_clear_request(3, 7).unwrap();
         assert_eq!(validate_request(&clear), Ok(Opcode::DynamicClear));
-        assert!(build_dynamic_begin_request(2, 0, None, false).is_err());
-        assert!(build_dynamic_begin_request(2, 1, Some(0), false).is_err());
-        assert!(build_dynamic_begin_request(2, 1, Some(86_401), false).is_err());
+        assert_eq!(clear[SLOT_OFFSET], 7);
+        assert!(build_dynamic_begin_request(2, 0, 0, None, false).is_err());
+        assert!(build_dynamic_begin_request(2, 0, 1, Some(0), false).is_err());
+        assert!(build_dynamic_begin_request(2, 0, 1, Some(86_401), false).is_err());
         assert!(build_frame(Opcode::DynamicBegin, 2, LIST_SLOT, &[2], 0, 1).is_err());
     }
 
     #[test]
+    fn dynamic_slot_validation_rejects_sentinel_and_protocol_out_of_range() {
+        assert!(dynamic_slot_is_valid(0, DYNAMIC_SLOT_COUNT_MAX));
+        assert!(dynamic_slot_is_valid(7, DYNAMIC_SLOT_COUNT_MAX));
+        assert!(!dynamic_slot_is_valid(LIST_SLOT, DYNAMIC_SLOT_COUNT_MAX));
+        assert!(!dynamic_slot_is_valid(8, DYNAMIC_SLOT_COUNT_MAX));
+        assert!(!dynamic_slot_is_valid(9, DYNAMIC_SLOT_COUNT_MAX));
+        assert!(!dynamic_slot_is_valid(0, 0));
+        assert!(!dynamic_slot_is_valid(0, 9));
+        assert!(dynamic_slot_is_valid(0, 1));
+        assert!(!dynamic_slot_is_valid(1, 1));
+        assert!(dynamic_slot_is_valid(7, 8));
+
+        // Slot 0 and the highest valid object index are accepted; the static
+        // LIST sentinel and every index above it are not.
+        for slot in [0u8, 7] {
+            assert_eq!(
+                validate_request(&build_dynamic_begin_request(1, slot, 1, None, false).unwrap()),
+                Ok(Opcode::DynamicBegin)
+            );
+            assert_eq!(
+                validate_request(&build_dynamic_data_request(1, slot, 0, 1, b"x").unwrap()),
+                Ok(Opcode::DynamicData)
+            );
+            assert_eq!(
+                validate_request(&build_dynamic_clear_request(1, slot).unwrap()),
+                Ok(Opcode::DynamicClear)
+            );
+        }
+        for slot in [LIST_SLOT, 8, 16, 0xfe] {
+            assert!(matches!(
+                build_dynamic_begin_request(1, slot, 1, None, false),
+                Err(ProtocolError::InvalidRequest { .. })
+            ));
+            assert!(matches!(
+                build_dynamic_data_request(1, slot, 0, 1, b"x"),
+                Err(ProtocolError::InvalidRequest { .. })
+            ));
+            assert!(matches!(
+                build_dynamic_clear_request(1, slot),
+                Err(ProtocolError::InvalidRequest { .. })
+            ));
+            assert!(matches!(
+                build_frame(Opcode::Capabilities, 1, slot, &[], 0, 0),
+                Err(ProtocolError::InvalidRequest { .. })
+            ));
+            assert!(matches!(
+                validate_request(&{
+                    let mut frame = build_dynamic_clear_request(1, 0).unwrap();
+                    frame[SLOT_OFFSET] = slot;
+                    frame
+                }),
+                Err(ProtocolError::InvalidRequest { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn dynamic_length_bounds_follow_the_512_byte_object_contract() {
+        assert_eq!(MAX_DYNAMIC_TEXT_LENGTH, 512);
+
+        for total in [1usize, 22, 23, 511, 512] {
+            let begin = build_dynamic_begin_request(1, 0, total, None, false).unwrap();
+            assert_eq!(read_u16(&begin, TOTAL_LENGTH_OFFSET), total as u16);
+            assert_eq!(validate_request(&begin), Ok(Opcode::DynamicBegin));
+        }
+        assert!(build_dynamic_begin_request(1, 0, 0, None, false).is_err());
+        assert!(build_dynamic_begin_request(1, 0, 513, None, false).is_err());
+
+        // A 512-byte object needs 24 chunks: 23 full 22-byte chunks plus 6 bytes.
+        let mut offset = 0usize;
+        let mut chunks = 0usize;
+        while offset < 512 {
+            let end = (offset + PAYLOAD_SIZE).min(512);
+            let chunk = &[b'x'; PAYLOAD_SIZE][..end - offset];
+            let request = build_dynamic_data_request(1, 0, offset, 512, chunk).unwrap();
+            assert_eq!(validate_request(&request), Ok(Opcode::DynamicData));
+            assert_eq!(read_u16(&request, OFFSET_OFFSET) as usize, offset);
+            assert_eq!(request[PAYLOAD_LENGTH_OFFSET] as usize, chunk.len());
+            offset = end;
+            chunks += 1;
+        }
+        assert_eq!(chunks, 24);
+
+        let final_chunk = build_dynamic_data_request(1, 0, 506, 512, &[b'x'; 6]).unwrap();
+        assert_eq!(validate_request(&final_chunk), Ok(Opcode::DynamicData));
+        assert!(build_dynamic_data_request(1, 0, 506, 512, &[b'x'; 7]).is_err());
+        let final_byte = build_dynamic_data_request(1, 0, 511, 512, b"x").unwrap();
+        assert_eq!(validate_request(&final_byte), Ok(Opcode::DynamicData));
+        assert!(build_dynamic_data_request(1, 0, 512, 512, b"x").is_err());
+        assert!(build_dynamic_data_request(1, 0, 0, 513, &[b'x'; 22]).is_err());
+        assert_eq!(
+            build_dynamic_data_request(1, 0, 0, 512, &[b'x'; PAYLOAD_SIZE + 1]),
+            Err(ProtocolError::PayloadTooLong {
+                length: PAYLOAD_SIZE + 1
+            })
+        );
+    }
+
+    #[test]
     fn dynamic_capability_parser_rejects_reserved_and_noncanonical_metadata() {
+        fn capability_response(request: &Frame, object_count: u8, version: u8) -> Frame {
+            let mut response = response_for(request, Status::Ok as u8);
+            response[PAYLOAD_LENGTH_OFFSET] = DYNAMIC_CAPABILITIES_LENGTH as u8;
+            response[TOTAL_LENGTH_OFFSET..TOTAL_LENGTH_OFFSET + 2]
+                .copy_from_slice(&(DYNAMIC_CAPABILITIES_LENGTH as u16).to_le_bytes());
+            response[PAYLOAD_OFFSET] = version;
+            response[PAYLOAD_OFFSET + 1] = object_count;
+            response[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4]
+                .copy_from_slice(&0x004f_u16.to_le_bytes());
+            response[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 6]
+                .copy_from_slice(&(MAX_DYNAMIC_TEXT_LENGTH as u16).to_le_bytes());
+            response[PAYLOAD_OFFSET + 6..PAYLOAD_OFFSET + 10]
+                .copy_from_slice(&DYNAMIC_DEFAULT_TTL_SECONDS.to_le_bytes());
+            response[PAYLOAD_OFFSET + 10..PAYLOAD_OFFSET + 14]
+                .copy_from_slice(&DYNAMIC_MIN_TTL_SECONDS.to_le_bytes());
+            response[PAYLOAD_OFFSET + 14..PAYLOAD_OFFSET + 18]
+                .copy_from_slice(&DYNAMIC_MAX_TTL_SECONDS.to_le_bytes());
+            response[PAYLOAD_OFFSET + 18..PAYLOAD_OFFSET + 22]
+                .copy_from_slice(&DYNAMIC_TRANSACTION_TIMEOUT_SECONDS.to_le_bytes());
+            response
+        }
+
         let request = build_capabilities_request(7).unwrap();
-        let mut response = response_for(&request, Status::Ok as u8);
-        response[PAYLOAD_LENGTH_OFFSET] = DYNAMIC_CAPABILITIES_LENGTH as u8;
-        response[TOTAL_LENGTH_OFFSET..TOTAL_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(DYNAMIC_CAPABILITIES_LENGTH as u16).to_le_bytes());
-        response[PAYLOAD_OFFSET] = 1;
-        response[PAYLOAD_OFFSET + 1] = 1;
-        response[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4].copy_from_slice(&0x004f_u16.to_le_bytes());
-        response[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 6]
-            .copy_from_slice(&(MAX_TEXT_LENGTH as u16).to_le_bytes());
-        response[PAYLOAD_OFFSET + 6..PAYLOAD_OFFSET + 10]
-            .copy_from_slice(&DYNAMIC_DEFAULT_TTL_SECONDS.to_le_bytes());
-        response[PAYLOAD_OFFSET + 10..PAYLOAD_OFFSET + 14]
-            .copy_from_slice(&DYNAMIC_MIN_TTL_SECONDS.to_le_bytes());
-        response[PAYLOAD_OFFSET + 14..PAYLOAD_OFFSET + 18]
-            .copy_from_slice(&DYNAMIC_MAX_TTL_SECONDS.to_le_bytes());
-        response[PAYLOAD_OFFSET + 18..PAYLOAD_OFFSET + 22]
-            .copy_from_slice(&DYNAMIC_TRANSACTION_TIMEOUT_SECONDS.to_le_bytes());
+        assert_eq!(request[SLOT_OFFSET], DYNAMIC_FIRST_SLOT);
+        let response = capability_response(&request, 8, DYNAMIC_CAPABILITY_VERSION);
         assert_eq!(
             parse_dynamic_capabilities_response(&response).unwrap(),
             DynamicCapabilities {
-                capability_version: 1,
-                dynamic_object_count: 1,
+                capability_version: 2,
+                dynamic_object_count: 8,
                 lifecycle_flags: 0x004f,
-                max_dynamic_length: 256,
+                max_dynamic_length: 512,
                 default_ttl_seconds: 300,
                 min_ttl_seconds: 1,
                 max_ttl_seconds: 86_400,
                 transaction_timeout_seconds: 30,
             }
         );
+        assert_eq!(
+            parse_dynamic_capabilities_response(&capability_response(
+                &request,
+                1,
+                DYNAMIC_CAPABILITY_VERSION
+            ))
+            .unwrap()
+            .dynamic_object_count,
+            1
+        );
 
-        for (offset, value) in [(PAYLOAD_OFFSET, 2), (PAYLOAD_OFFSET + 1, 2)] {
+        // A capability answer must belong to a real object index: the static
+        // LIST sentinel and any index above the reported object count are
+        // malformed metadata.
+        let mut sentinel_slot = response;
+        sentinel_slot[SLOT_OFFSET] = LIST_SLOT;
+        assert_eq!(
+            parse_dynamic_capabilities_response(&sentinel_slot),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+        let mut out_of_range_slot = response;
+        out_of_range_slot[SLOT_OFFSET] = 8;
+        assert_eq!(
+            parse_dynamic_capabilities_response(&out_of_range_slot),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+        let mut single_object = capability_response(&request, 1, DYNAMIC_CAPABILITY_VERSION);
+        single_object[SLOT_OFFSET] = 1;
+        assert_eq!(
+            parse_dynamic_capabilities_response(&single_object),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+
+        for (offset, value) in [
+            (PAYLOAD_OFFSET, 1),     // v1 capability version is never accepted
+            (PAYLOAD_OFFSET, 3),     // unknown future capability version
+            (PAYLOAD_OFFSET + 1, 0), // object count below the protocol minimum
+            (PAYLOAD_OFFSET + 1, 9), // object count above the protocol maximum
+        ] {
             let mut malformed = response;
             malformed[offset] = value;
             assert_eq!(
@@ -1054,16 +1236,51 @@ mod tests {
                 Err(ProtocolError::InvalidDynamicCapabilities)
             );
         }
+
+        let mut v1_length = response;
+        v1_length[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 6]
+            .copy_from_slice(&(MAX_TEXT_LENGTH as u16).to_le_bytes());
+        assert_eq!(
+            parse_dynamic_capabilities_response(&v1_length),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+
         let mut reserved = response;
         reserved[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4].copy_from_slice(&0x008f_u16.to_le_bytes());
         assert_eq!(
             parse_dynamic_capabilities_response(&reserved),
             Err(ProtocolError::InvalidDynamicCapabilities)
         );
+
+        let mut missing_required_flag = response;
+        missing_required_flag[PAYLOAD_OFFSET + 2..PAYLOAD_OFFSET + 4]
+            .copy_from_slice(&0x004c_u16.to_le_bytes());
+        assert_eq!(
+            parse_dynamic_capabilities_response(&missing_required_flag),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+
         let mut bad_length = response;
         bad_length[PAYLOAD_LENGTH_OFFSET] = (DYNAMIC_CAPABILITIES_LENGTH - 1) as u8;
         assert_eq!(
             parse_dynamic_capabilities_response(&bad_length),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+
+        let mut wrong_offset = response;
+        wrong_offset[OFFSET_OFFSET] = 1;
+        assert_eq!(
+            parse_dynamic_capabilities_response(&wrong_offset),
+            Err(ProtocolError::InvalidDynamicCapabilities)
+        );
+
+        // The capability response has no padding space: the payload fills the
+        // whole frame, so a short declared length is the only malformed-payload
+        // shape the firmware can produce.
+        let mut short_payload = response;
+        short_payload[PAYLOAD_LENGTH_OFFSET] = (DYNAMIC_CAPABILITIES_LENGTH - 1) as u8;
+        assert_eq!(
+            parse_dynamic_capabilities_response(&short_payload),
             Err(ProtocolError::InvalidDynamicCapabilities)
         );
     }

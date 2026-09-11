@@ -436,7 +436,7 @@ const english: MessageTable = {
   dynamicUnencryptedHelp: "Do not upload passwords, tokens, or other secrets. Dynamic Macro is available even while static management is locked.",
   dynamicMacroText: "Dynamic text",
   dynamicMacroPlaceholder: "Type a temporary macro…",
-  dynamicMacroTextHelp: "Printable US ASCII, LF, Tab, and Backspace · maximum 256 bytes.",
+  dynamicMacroTextHelp: "Printable US ASCII, LF, Tab, and Backspace · maximum 512 bytes.",
   dynamicBytes: (count, maximum) => `${count} / ${maximum} bytes`,
   dynamicCapabilityStatus: "Capability",
   dynamicCapabilityVersion: "Version",
@@ -475,7 +475,7 @@ const english: MessageTable = {
   dynamicOperationError: "Dynamic Macro operation failed. The local state is unknown; do not assume the object is present.",
   dynamicTextRequired: "Enter non-empty dynamic text.",
   dynamicUnsupportedText: "Dynamic text supports printable US ASCII, LF, Tab, and Backspace only.",
-  dynamicTextTooLong: "Dynamic text cannot exceed 256 bytes.",
+  dynamicTextTooLong: "Dynamic text cannot exceed 512 bytes.",
   dynamicTtlInvalid: "The Dynamic Macro TTL is outside the supported range.",
 };
 
@@ -672,7 +672,7 @@ const chinese: MessageTable = {
   dynamicUnencryptedHelp: "不要上传密码、令牌或其他秘密。静态管理锁定时仍可使用动态宏。",
   dynamicMacroText: "动态文本",
   dynamicMacroPlaceholder: "输入临时宏…",
-  dynamicMacroTextHelp: "可打印 US ASCII、LF、Tab 和 Backspace · 最多 256 bytes。",
+  dynamicMacroTextHelp: "可打印 US ASCII、LF、Tab 和 Backspace · 最多 512 bytes。",
   dynamicBytes: (count, maximum) => `${count} / ${maximum} bytes`,
   dynamicCapabilityStatus: "能力",
   dynamicCapabilityVersion: "版本",
@@ -711,7 +711,7 @@ const chinese: MessageTable = {
   dynamicOperationError: "动态宏操作失败。本地状态未知，不要假设对象仍存在。",
   dynamicTextRequired: "请输入非空动态文本。",
   dynamicUnsupportedText: "动态文本仅支持可打印 US ASCII、LF、Tab 和 Backspace。",
-  dynamicTextTooLong: "动态文本不能超过 256 bytes。",
+  dynamicTextTooLong: "动态文本不能超过 512 bytes。",
   dynamicTtlInvalid: "Dynamic Macro TTL 超出支持范围。",
 };
 

@@ -1,4 +1,10 @@
-export const MAX_DYNAMIC_BYTES = 256;
+/**
+ * Dynamic Protocol v2 objects are independent RAM-only buffers; a device
+ * reports its object count and max length through CAPABILITIES.
+ */
+export const MAX_DYNAMIC_BYTES = 512;
+/** The backend probes capabilities with this object and the current UI targets it. */
+export const FIRST_DYNAMIC_SLOT = 0;
 export const MIN_DYNAMIC_TTL_SECONDS = 1;
 export const MAX_DYNAMIC_TTL_SECONDS = 86_400;
 
