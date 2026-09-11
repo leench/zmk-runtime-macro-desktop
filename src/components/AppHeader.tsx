@@ -134,8 +134,15 @@ export function AppHeader({
       <div className="ml-auto flex items-center gap-1">
         <IconButton icon={refreshing ? Activity : RefreshCw} label={copy.refreshSlots} onClick={onRefresh} disabled={disabled || refreshing} />
         <IconButton icon={Zap} label={copy.dynamicMacro} active={dynamicActive} onClick={onDynamicOpen} disabled={disabled} />
-        <IconButton icon={dark ? Sun : Moon} label={copy.theme} onClick={toggleTheme} disabled={disabled} />
-        <IconButton icon={Settings} label={copy.settings} onClick={onSettings} disabled={disabled} />
+        <div
+          role="group"
+          aria-label={copy.preferences}
+          className="flex items-center gap-0.5 rounded-xl border border-line bg-surface-2 p-0.5"
+        >
+          <IconButton icon={dark ? Sun : Moon} label={copy.theme} onClick={toggleTheme} disabled={disabled} grouped />
+          <IconButton icon={Settings} label={copy.settings} onClick={onSettings} disabled={disabled} grouped />
+        </div>
+        <span className="mx-0.5 h-5 w-px bg-line-strong" aria-hidden="true" />
         <div className="relative" ref={menuRef}>
           <IconButton
             icon={MoreHorizontal}
