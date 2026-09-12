@@ -886,8 +886,11 @@ pub fn init(app: &App) -> tauri::Result<()> {
             let id = event.id().as_ref();
             match id {
                 MENU_OPEN_MAIN | MENU_SETTINGS => show_main_window(app),
-                // Explicit quit bypasses the frontend close-to-tray path. Dropping
-                // the managed state still performs the best-effort LOCK on shutdown.
+                // Explicit quit bypasses the frontend close-to-tray path. The
+                // `RunEvent::Exit` handler in `lib.rs` stops the local API server
+                // and performs the best-effort session release/LOCK, because the
+                // platform event loop ends the process without running the
+                // managed state destructor.
                 MENU_QUIT => app.exit(0),
                 _ => {
                     let Some(action) = TrayAction::from_menu_id(id) else {

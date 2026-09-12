@@ -37,6 +37,20 @@ unicode-normalization = "0.1.25"
 zeroize = "1.9"
 tauri-plugin-autostart = "2.5.1"
 
+# The local automation API (docs/DYNAMIC-AUTOMATION-PLAN.md §10) always serves a
+# fixed loopback address with HTTP/1.1 only and never enables CORS. These are the
+# current maintained releases, pinned in Cargo.lock already, so the API adds a
+# loopback endpoint instead of a second HTTP stack: `hyper` is the low-level
+# HTTP implementation, `hyper-util` supplies the tokio adapter (`TokioIo`,
+# `TokioTimer`), `http-body-util` the small JSON response body, and `tokio` only
+# the listener/stream types and the stop signal used from Tauri's own runtime
+# (`sync` carries `Notify`, which is an in-crate feature and adds no dependency).
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", default-features = false, features = ["net", "rt", "sync"] }
+
 # Keep the Linux backend explicit so HID Usage metadata remains available for
 # safe Runtime Macro HID discovery without assuming a particular HID instance.
 # Other supported platforms use hidapi's bundled portable C backend without a

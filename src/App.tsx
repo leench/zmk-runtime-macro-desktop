@@ -23,13 +23,17 @@ import {
   refreshAuthState as refreshAuthStateCommand,
   listSlots,
   lockDevice,
+  prepareTrayClose as prepareTrayCloseCommand,
   saveScenarios as saveScenarioStoreCommand,
   SCENARIO_STORE_SCHEMA_VERSION,
+  setDeviceAliases as setDeviceAliasesCommand,
   setPassword as setPasswordCommand,
   setSettings as setSettingsCommand,
   setSlot as setSlotCommand,
   setTrayLocale,
   setTrayRuntimeState,
+  subscribeDynamicStateChanged,
+  trayCloseOutcome,
   uploadDynamic as uploadDynamicCommand,
   type AuthState,
   type ClientSettings,
@@ -64,6 +68,7 @@ import { DynamicMacroModal } from "./components/DynamicMacroModal";
 import { DynamicWorkspace } from "./features/dynamic/DynamicWorkspace";
 import type { DynamicClearTarget, DynamicUploadTarget, DynamicWorkspaceBackend, WorkspaceTrayContext } from "./types/scenario";
 import { PreviewSettingStepper } from "./components/PreviewSettingStepper";
+import { backendSessionReport, backendSessionSync } from "./utils/session-sync";
 import { SelectField } from "./components/SelectField";
 import { TitleBar, type Platform } from "./components/TitleBar";
 import type { ThemeMode } from "./types/ui";
@@ -444,6 +449,11 @@ function App() {
   const autostartWriteRef = useRef(false);
   const autoReconnectInFlightRef = useRef(false);
   const missingDevicePollsRef = useRef(0);
+  // A backend-side session change is re-read once the window is idle: a
+  // notification that arrives during a window operation is replayed instead of
+  // racing the operation that owns the device.
+  const sessionSyncPendingRef = useRef(false);
+  const sessionSyncInFlightRef = useRef(false);
   const slotsRef = useRef<SlotState[]>(slots);
   const previewGenerationRef = useRef(0);
   const pageZoomQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -849,6 +859,126 @@ function App() {
     void connectDevice(id);
   }, [connectDevice, devices]);
 
+  /**
+   * Close the management surfaces that do not survive hiding the window.
+   *
+   * The device session itself is untouched: a retained session stays loaded and
+   * only the dialogs and any revealed text are dropped.
+   */
+  const closeManagementSurfaces = useCallback(() => {
+    setDynamicModalOpen(false);
+    setDynamicWorkspaceOpen(false);
+    setClearConfirm(null);
+    setSwitchConfirm(null);
+    setDeviceSwitchConfirm(null);
+    setSetupOpen(false);
+    setPasswordModalMode(null);
+    hideRevealed();
+  }, [hideRevealed]);
+
+  /**
+   * Drop every local view of a session that is no longer usable.
+   *
+   * Used by an explicit disconnect and by a close-to-tray that released the
+   * session: both end with no device, no capability, no observation and no
+   * pending management dialog.
+   */
+  const clearLocalSessionState = useCallback(() => {
+    setConnection(disconnected);
+    clearAuthDeadline();
+    setDynamicCapabilities(null);
+    setDynamicCapabilityStatus("unknown");
+    setDynamicServiceState(null);
+    setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
+    setSelectedId("");
+    closeManagementSurfaces();
+  }, [clearAuthDeadline, closeManagementSurfaces]);
+
+  /**
+   * Follow the backend after it changed the shared session outside the window.
+   *
+   * The notification carries nothing, so the window re-reads the authoritative,
+   * body-free connection answer first and only then decides: it mirrors a session
+   * it already showed or one it did not show at all (typically the one the local
+   * HTTP API opened for its write), drops the view of a session the backend no
+   * longer has, and leaves everything else untouched. The re-read sends no static
+   * management command (no login, LIST, GET, SET or CLEAR), so a locked device
+   * stays locked and a session the window does not show is never touched; the only
+   * device traffic it can cause is the Dynamic capability discovery the workspace
+   * already uses.
+   */
+  const syncSessionFromBackend = useCallback(async () => {
+    if (!inTauri() || !mounted.current) return;
+    if (busyRef.current || sessionSyncInFlightRef.current) {
+      // The window owns the device right now: replay the notification when it does
+      // not, instead of racing an operation whose result would be discarded.
+      sessionSyncPendingRef.current = true;
+      return;
+    }
+    sessionSyncInFlightRef.current = true;
+    const sequence = ++operation.current;
+    setChecking(true);
+    setBusy(true);
+    recordOperation("Sync");
+    try {
+      const answer = await getConnection();
+      if (!mounted.current || operation.current !== sequence) return;
+      const decision = backendSessionSync({
+        reported: backendSessionReport(answer),
+        shownConnected: connectionRef.current.connected,
+        shownDeviceKey: deviceKey.current,
+        hasDirtyDraft: dirtyRef.current,
+      });
+      if (decision.kind === "release") {
+        clearLocalSessionState();
+        return;
+      }
+      if (decision.kind !== "adopt") return;
+      // A session the window is about to show needs the candidate ids of a fresh
+      // enumeration, because the opaque ids of the previous one are not usable.
+      const candidates = await listDevices();
+      if (!mounted.current || operation.current !== sequence) return;
+      // A preserved draft still belongs to this device, so its slots stay and its
+      // capability is re-confirmed before the workspace claims it is ready.
+      const preserveDraft = decision.preserveDraft;
+      const preserveUnknown = preserveDraft && !connectionRef.current.connected;
+      const matching = candidates.find((device) => deviceSummaryKey(device) === decision.deviceKey);
+      // Never guess a candidate: adopting a different row could make later UI
+      // actions target another device than the backend session we just read.
+      if (!matching) return;
+      setDevices(candidates);
+      setSelectedId(matching.id);
+      if (!preserveDraft) {
+        setSlots([]);
+        setSelectedSlot(null);
+      }
+      connectionRef.current = answer;
+      deviceKey.current = decision.deviceKey;
+      autoReconnectEnabledRef.current = false;
+      missingDevicePollsRef.current = 0;
+      setConnection(answer);
+      setLabels(readLabels(answer.device));
+      if (answer.authState === "authenticated") {
+        // The window on its own never opens a management window; this only
+        // replaces a deadline it does not have yet.
+        if (authDeadlineRef.current === null) markAuthenticatedActivity(true);
+      } else {
+        clearAuthDeadline();
+      }
+      await loadDynamicCapabilities(sequence, preserveUnknown);
+    } catch {
+      // A device view the window cannot read is not acted on: keeping what it
+      // shows is the only answer that neither invents a connection, a device nor
+      // a release.
+    } finally {
+      sessionSyncInFlightRef.current = false;
+      if (mounted.current && operation.current === sequence) {
+        setChecking(false);
+        setBusy(false);
+      }
+    }
+  }, [clearAuthDeadline, clearLocalSessionState, loadDynamicCapabilities, markAuthenticatedActivity, recordOperation]);
+
   const disconnectDevice = useCallback(async () => {
     const sequence = ++operation.current;
     autoReconnectEnabledRef.current = false;
@@ -862,25 +992,13 @@ function App() {
     try {
       await disconnectDeviceCommand();
       if (!mounted.current || operation.current !== sequence) return;
-      setConnection(disconnected);
-      clearAuthDeadline();
-      setDynamicCapabilities(null);
-      setDynamicCapabilityStatus("unknown");
-      setDynamicServiceState(null);
-      setDynamicModalOpen(false);
-      setDynamicWorkspaceOpen(false);
-      setDynamicObjects((previous) => previous.map(resetDynamicObjectOperation));
-      setSelectedId("");
-      setClearConfirm(null);
-      setSwitchConfirm(null);
-      setDeviceSwitchConfirm(null);
-      hideRevealed();
+      clearLocalSessionState();
     } catch (caught) {
       if (mounted.current && operation.current === sequence) commandError(caught);
     } finally {
       if (mounted.current && operation.current === sequence) setBusy(false);
     }
-  }, [cancelPreviewLoads, clearAuthDeadline, commandError, hideRevealed, recordOperation]);
+  }, [cancelPreviewLoads, clearLocalSessionState, commandError, recordOperation]);
 
   const pollDeviceConnection = useCallback(async () => {
     const knownKey = deviceKey.current;
@@ -1683,18 +1801,78 @@ function App() {
     setCloseConfirmOpen(false);
   }, []);
 
-  // Closing the window hides it to the tray instead of quitting the app. The
-  // existing semantics stay: dirty confirmation first, then a best-effort LOCK
-  // through the normal disconnect path. Because the window survives the hide,
-  // the local state is returned to the disconnected state as well, and the
-  // close path re-arms for the next close request.
+  /**
+   * Follow the authoritative backend state after a close-to-tray whose lifecycle
+   * answer could not be used.
+   *
+   * A failed or malformed answer must never be read as "released" (which would
+   * hide a session the backend still retains) or as "retained": the window
+   * re-reads the connection and the body-free service state instead. If even that
+   * read fails, the shown state is left alone rather than invented.
+   */
+  const resyncAfterUnknownTrayClose = useCallback(async (sequence: number) => {
+    try {
+      const [nextConnection, nextDynamicState] = await Promise.all([getConnection(), getDynamicState()]);
+      if (!mounted.current || operation.current !== sequence) return;
+      if (nextConnection.connected) {
+        setConnection(nextConnection);
+        setDynamicServiceState(nextDynamicState);
+        closeManagementSurfaces();
+        return;
+      }
+      clearLocalSessionState();
+    } catch {
+      // Unreadable backend: keep the last known state instead of showing an
+      // outcome the window cannot verify.
+    }
+  }, [clearLocalSessionState, closeManagementSurfaces]);
+
+  // Closing hides the window instead of ending the process. A session the local
+  // automation API used is kept open (only the static management window is
+  // LOCKed), because a real management USB disconnect would let the firmware
+  // clear the Dynamic object that API wrote; every other session is released as
+  // before. The local state follows the backend answer, and the close path
+  // re-arms for the next close request.
   const hideWindowWithBestEffortLock = useCallback(() => {
     if (!inTauri() || closingRef.current) return;
     closingRef.current = true;
     const windowHandle = getCurrentWindow();
-    const lockAttempt = disconnectDevice().catch(() => undefined);
+    const sequence = ++operation.current;
+    autoReconnectEnabledRef.current = false;
+    missingDevicePollsRef.current = 0;
+    cancelPreviewLoads();
+    setBusy(true);
+    recordOperation("Close");
+    const closeAttempt = prepareTrayCloseCommand()
+      .then(async (answer) => {
+        if (!mounted.current || operation.current !== sequence) return;
+        const outcome = trayCloseOutcome(answer);
+        if (outcome === null) {
+          // The backend answered something the window cannot act on. Neither
+          // "released" nor "retained" may be shown for it.
+          await resyncAfterUnknownTrayClose(sequence);
+          return;
+        }
+        if (outcome.sessionRetained) {
+          // The device is still connected and still holds the object, so the
+          // loaded session state stays and only management is reported as locked.
+          setConnection((current) => current.connected ? { ...current, authState: outcome.authState } : current);
+          clearAuthDeadline();
+          closeManagementSurfaces();
+          return;
+        }
+        clearLocalSessionState();
+      })
+      .catch(async () => {
+        // A failed lifecycle call has no outcome at all, so it is never shown as
+        // "released" or "retained": the window re-reads the backend instead.
+        await resyncAfterUnknownTrayClose(sequence);
+      })
+      .finally(() => {
+        if (mounted.current && operation.current === sequence) setBusy(false);
+      });
     const hideDeadline = new Promise<void>((resolve) => { window.setTimeout(resolve, 250); });
-    void Promise.race([lockAttempt, hideDeadline])
+    void Promise.race([closeAttempt, hideDeadline])
       .then(() => windowHandle.hide())
       .then(() => {
         closingRef.current = false;
@@ -1707,7 +1885,7 @@ function App() {
           setCloseConfirmOpen(true);
         }
       });
-  }, [disconnectDevice]);
+  }, [cancelPreviewLoads, clearAuthDeadline, clearLocalSessionState, closeManagementSurfaces, recordOperation, resyncAfterUnknownTrayClose]);
 
   const hideWithoutSaving = useCallback(() => {
     closeConfirmRef.current = false;
@@ -1769,6 +1947,17 @@ function App() {
     setAliasError(null);
   }, [currentDeviceAlias, currentDeviceSummaryKey, settingsOpen]);
 
+  // The local HTTP API resolves a device by the user's alias, so the same
+  // validated map the settings modal writes is mirrored into the backend on
+  // startup and after every change. It stays a local preference: only the safe
+  // device summary key and the alias travel, never a HID path or serial number.
+  // The browser preview never invokes Tauri, and a refused mirror is not a device
+  // error, so the call site stays silent.
+  useEffect(() => {
+    if (!inTauri()) return;
+    void setDeviceAliasesCommand(deviceAliases).catch(() => undefined);
+  }, [deviceAliases]);
+
   useEffect(() => {
     mounted.current = true;
     void refreshDevices();
@@ -1826,6 +2015,37 @@ function App() {
       window.removeEventListener("beforeunload", beforeUnload);
     };
   }, [hideWindowWithBestEffortLock]);
+
+  // A completed local API write changes the shared session and the Dynamic
+  // service state outside the window. The notification deliberately carries no
+  // payload, so the window re-reads the authoritative, body-free state through the
+  // existing read-only commands and never fabricates a device, a readback of the
+  // macro itself or a management window.
+  useEffect(() => {
+    if (!inTauri()) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void subscribeDynamicStateChanged(() => {
+      void syncSessionFromBackend();
+    })
+      .then((stopListening) => {
+        if (active) unlisten = stopListening;
+        else stopListening();
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [syncSessionFromBackend]);
+
+  // A notification that arrived while a window operation was running is replayed
+  // once the window owns nothing again, so the re-read never races that operation.
+  useEffect(() => {
+    if (busy || sessionSyncInFlightRef.current || !sessionSyncPendingRef.current) return;
+    sessionSyncPendingRef.current = false;
+    void syncSessionFromBackend();
+  }, [busy, syncSessionFromBackend]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {

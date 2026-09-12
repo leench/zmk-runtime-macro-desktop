@@ -23,12 +23,27 @@ export type DeviceCandidate = {
 
 export type ConnectedDevice = Omit<DeviceCandidate, "id">;
 
-export type AuthState =
-  | "disconnected"
-  | "open"
-  | "locked"
-  | "authenticated"
-  | "credentialInvalid";
+/**
+ * Management states a session can report.
+ *
+ * The list is the runtime source of truth for both the type and the validation
+ * of a backend answer, so a state the window cannot render is refused instead
+ * of being shown as-is.
+ */
+export const AUTH_STATES = [
+  "disconnected",
+  "open",
+  "locked",
+  "authenticated",
+  "credentialInvalid",
+] as const;
+
+export type AuthState = (typeof AUTH_STATES)[number];
+
+/** Whether an unknown value is one of the management states. */
+export function isAuthState(value: unknown): value is AuthState {
+  return typeof value === "string" && (AUTH_STATES as readonly string[]).includes(value);
+}
 
 export type ConnectionState = {
   connected: boolean;
@@ -103,6 +118,63 @@ export function connectDevice(opaqueId: string): Promise<ConnectionState> {
 
 export function disconnectDevice(): Promise<void> {
   return invoke("disconnect_device");
+}
+
+/**
+ * Result of the close-to-tray lifecycle for the active session.
+ *
+ * `sessionRetained` means the shared HID session is still open because the local
+ * automation API used it, so the firmware does not clear the committed Dynamic
+ * object on a management USB disconnect. The state is body-free: it never
+ * carries macro text, a HID path, a serial number or a device identity.
+ */
+export type TrayCloseState = {
+  sessionRetained: boolean;
+  authState: AuthState;
+};
+
+/**
+ * Prepare the close-to-tray lifecycle of the active session.
+ *
+ * The window hides either way. A session the local API used only gets a
+ * best-effort LOCK and stays open; every other session is released exactly like
+ * an explicit disconnect.
+ */
+export function prepareTrayClose(): Promise<TrayCloseState> {
+  return invoke<TrayCloseState>("prepare_tray_close");
+}
+
+/**
+ * Close-to-tray outcome the window may act on.
+ *
+ * Only these two answers exist: a retained session (the device still holds the
+ * object and only the management window was locked) and a released session.
+ * Anything else — a missing field, an unknown state, a value from another
+ * command — is "unknown" and must be treated as such, because acting on it would
+ * show a released session as retained or drop the local view of a session the
+ * backend still holds.
+ */
+export type TrayCloseOutcome =
+  | { sessionRetained: true; authState: AuthState }
+  | { sessionRetained: false };
+
+/**
+ * Validate one close-to-tray answer before the window acts on it.
+ *
+ * The answer is body-free by contract: it says whether the session was kept and,
+ * when it was, what the management state is now. A malformed answer returns
+ * `null` so the caller re-reads the authoritative state instead of guessing.
+ */
+export function trayCloseOutcome(answer: unknown): TrayCloseOutcome | null {
+  if (typeof answer !== "object" || answer === null) return null;
+  const candidate = answer as { sessionRetained?: unknown; authState?: unknown };
+  const keys = Object.keys(candidate);
+  if (keys.length !== 2 || !keys.includes("sessionRetained") || !keys.includes("authState")) return null;
+  if (typeof candidate.sessionRetained !== "boolean") return null;
+  if (!isAuthState(candidate.authState)) return null;
+  return candidate.sessionRetained
+    ? { sessionRetained: true, authState: candidate.authState }
+    : { sessionRetained: false };
 }
 
 export function getConnection(): Promise<ConnectionState> {
@@ -234,12 +306,45 @@ export function getDynamicState(): Promise<DynamicServiceState> {
   return invoke<DynamicServiceState>("get_dynamic_state");
 }
 
+/**
+ * Stable global event name the backend uses when the shared HID session or the
+ * Dynamic service state changed outside the window (a local API write, which may
+ * also open the session for its device).
+ */
+export const DYNAMIC_STATE_CHANGED_EVENT = "dynamic-state-changed";
+
+/**
+ * Subscribe to backend-side changes the window did not cause itself.
+ *
+ * The notification carries no payload at all: the window re-reads the
+ * authoritative, body-free state (connection, device list and service state)
+ * through the existing read-only commands instead of accepting anything from the
+ * event, so no macro text, HID path, serial number or raw frame can arrive through
+ * it and no static management command is sent in response to it.
+ */
+export function subscribeDynamicStateChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen(DYNAMIC_STATE_CHANGED_EVENT, () => handler());
+}
+
 export function getSettings(): Promise<ClientSettings> {
   return invoke<ClientSettings>("get_settings");
 }
 
 export function setSettings(timeoutMs: number, retries: number): Promise<ClientSettings> {
   return invoke<ClientSettings>("set_settings", { timeoutMs, retries });
+}
+
+/**
+ * Mirror the validated local alias map into the backend.
+ *
+ * The local HTTP API resolves a device by the user's alias, so the backend needs
+ * the same map the settings modal writes. The map stays a local preference: only
+ * the five-part safe device summary key and the alias itself are sent, never a
+ * HID path, a serial number, a candidate id or macro text. Rust re-validates
+ * every entry and refuses the whole payload instead of publishing a partial one.
+ */
+export function setDeviceAliases(aliases: Record<string, string>): Promise<void> {
+  return invoke("set_device_aliases", { aliases });
 }
 
 function inTauri(): boolean {

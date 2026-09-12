@@ -1,11 +1,14 @@
+use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::api::{ApiDynamicOutcome, ApiDynamicWrite, DeviceAliasRegistry};
 use crate::client::{ClientConfig, RuntimeMacroClient, SlotInfo};
 use crate::dynamic_service::{
     DynamicFailure, DynamicService, DynamicServiceError, DynamicServiceState,
@@ -277,6 +280,26 @@ impl HidWorker {
             .recv()
             .map_err(|_| CommandError::state_unavailable())?
     }
+
+    /// Queue one job and wait at most `wait` for it to finish.
+    ///
+    /// The job still runs on this single worker like every other session
+    /// operation. Only the application quit path uses the deadline: an
+    /// unresponsive device must not keep the process alive for the whole
+    /// retry/timeout budget of the session it is releasing.
+    fn execute_with_deadline<F>(&self, wait: Duration, operation: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let queued = self.sender.send(Box::new(move || {
+            operation();
+            let _ = finished_sender.send(());
+        }));
+        if queued.is_ok() {
+            let _ = finished_receiver.recv_timeout(wait);
+        }
+    }
 }
 
 static HID_WORKER: OnceLock<HidWorker> = OnceLock::new();
@@ -297,6 +320,178 @@ where
     tauri::async_runtime::spawn_blocking(move || execute_on_hid_worker(operation))
         .await
         .map_err(|_| CommandError::state_unavailable())?
+}
+
+/// Enumerate the connectable Runtime Macro interfaces.
+///
+/// Enumeration needs no session and never touches the desktop candidate registry,
+/// so it can run with or without the application state lock. The active record is
+/// passed through as the known record: macOS opens HID devices exclusively, so
+/// probing the interface of a healthy session again would make that same device
+/// disappear from discovery.
+fn enumerate_api_records(
+    known_record: Option<&DeviceRecord>,
+) -> Result<Vec<DeviceRecord>, CommandError> {
+    let api = new_hid_api().map_err(CommandError::from)?;
+    Ok(enumerate_devices_with_known_record(&api, known_record)
+        .into_iter()
+        .filter(DeviceRecord::is_runtime_macro_interface)
+        .collect())
+}
+
+/// Enumerate connectable Runtime Macro devices for the local HTTP API.
+///
+/// It runs on the application's single HID worker, so it serializes with every
+/// Tauri command instead of opening a second HID writer. It is strictly
+/// read-only: it opens no session, sends no protocol request, connects nothing
+/// and leaves the desktop candidate registry untouched, so a GUI selection and
+/// an active connection keep their opaque ids and their state while the API
+/// answers.
+///
+/// The returned records keep their HID path private; only the safe summary is
+/// published, and it never reaches a log, an error or the API response body.
+pub(crate) async fn api_device_records(
+    state: Arc<Mutex<AppState>>,
+) -> Result<Vec<DeviceRecord>, CommandError> {
+    run_on_hid_worker(move || {
+        // The state lock is released before the descriptor probe: enumeration
+        // needs no session, and the window must not wait for it.
+        let known_record = {
+            let state = state
+                .lock()
+                .map_err(|_| CommandError::state_unavailable())?;
+            state
+                .connection
+                .as_ref()
+                .map(|connection| connection.record.clone())
+        };
+        enumerate_api_records(known_record.as_ref())
+    })
+    .await
+}
+
+/// Find exactly one connectable record for a safe device summary key.
+///
+/// The key comes from the user's own alias map, so it is a local display
+/// identity and never a HID path, a serial number or a GUI candidate id. Zero
+/// matches means the device is not present and more than one match means the same
+/// identity is ambiguous; both are refused instead of being guessed.
+fn find_api_record<F: SessionFactory>(
+    state: &AppState<F>,
+    summary_key: &str,
+) -> Result<DeviceRecord, CommandError> {
+    let known_record = state
+        .connection
+        .as_ref()
+        .map(|connection| connection.record.clone());
+    let mut matches: Vec<DeviceRecord> = enumerate_api_records(known_record.as_ref())?
+        .into_iter()
+        .filter(|record| crate::api::summary_key(&record.summary()) == summary_key)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(CommandError::new(
+            "device_not_found",
+            "No Runtime Macro device matches the requested alias.",
+        )),
+        _ => Err(CommandError::new(
+            "ambiguous_device",
+            "The requested alias matches more than one connected device.",
+        )),
+    }
+}
+
+/// Perform one Dynamic Macro write requested by the local HTTP API.
+///
+/// Everything runs on the application's single HID worker and through the same
+/// `AppState`, `DynamicService` and session the window and the tray use, so the
+/// API never opens a second HID writer and never refreshes the GUI candidate
+/// registry. The device is resolved from live discovery by the safe summary key
+/// the requested alias resolved to; nothing is guessed.
+pub(crate) async fn api_dynamic_write(
+    state: Arc<Mutex<AppState>>,
+    write: ApiDynamicWrite,
+) -> Result<ApiDynamicOutcome, CommandError> {
+    run_on_hid_worker(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        let ApiDynamicWrite {
+            summary_key,
+            slot,
+            text,
+            ttl_seconds,
+            keep_after_execute,
+        } = write;
+        let record = find_api_record(&state, &summary_key)?;
+        api_dynamic_upload(
+            &mut state,
+            record,
+            &summary_key,
+            slot,
+            &text,
+            ttl_seconds,
+            keep_after_execute,
+        )
+    })
+    .await
+}
+
+/// Connect the resolved device if needed and upload one Dynamic object.
+///
+/// The session rules are the ones the API contract promises:
+///
+/// - with no active session the resolved device is connected and kept, using the
+///   same `AUTH_INFO` handshake the window performs;
+/// - the session of the same device is reused instead of being reopened;
+/// - a different active device is refused instead of being switched silently, so
+///   an API call can never invalidate what the user is doing in the window.
+///
+/// A session this function opens here is not visible to the window yet; the caller
+/// announces the outcome through the payload-free change notification, and the
+/// window mirrors the connection it did not create itself by re-reading the
+/// body-free connection and device list. Nothing in that mirroring sends a static
+/// management command, so a locked device is never logged in and never listed.
+///
+/// Capability discovery runs before the upload, so the object count, the length
+/// bound, the keep support and the device default TTL are known; the reported TTL
+/// is the device's own default when the caller omitted one. Dynamic commands stay
+/// outside the static management/auth gate: a locked device is neither logged in
+/// nor touched through a static command.
+pub(crate) fn api_dynamic_upload<F: SessionFactory>(
+    state: &mut AppState<F>,
+    record: DeviceRecord,
+    summary_key: &str,
+    slot: u8,
+    text: &str,
+    ttl_seconds: Option<u32>,
+    keep_after_execute: bool,
+) -> Result<ApiDynamicOutcome, CommandError> {
+    match state.connected_summary_key() {
+        Some(active) if active == summary_key => {}
+        Some(_) => {
+            return Err(CommandError::new(
+                "device_conflict",
+                "Another device is currently active; the API never switches devices.",
+            ))
+        }
+        None => {
+            state.connect_record(record)?;
+        }
+    }
+
+    let capabilities = state.dynamic_capabilities()?;
+    let effective_ttl = ttl_seconds.unwrap_or(capabilities.default_ttl_seconds);
+    state.upload_dynamic(slot, text, ttl_seconds, keep_after_execute)?;
+    // The API now depends on this session: the window hiding must not drop it,
+    // because a real management USB disconnect would clear the object the device
+    // just acknowledged.
+    state.retain_session_for_api();
+    Ok(ApiDynamicOutcome {
+        text_length: u16::try_from(text.len()).unwrap_or(u16::MAX),
+        ttl_seconds: effective_ttl,
+        keep_after_execute,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -361,6 +556,20 @@ pub struct ConnectionState {
     pub auth_state: AuthState,
 }
 
+/// Result of the close-to-tray lifecycle for the active session.
+///
+/// `session_retained` means the shared HID session is still open because the
+/// local HTTP API used it, so the firmware does not clear the committed Dynamic
+/// object on a management USB disconnect. The state is body-free: it says
+/// whether a session was kept and what the management state is now, and it never
+/// carries macro text, a HID path, a serial number or a device identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayCloseState {
+    pub session_retained: bool,
+    pub auth_state: AuthState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSettings {
@@ -385,7 +594,11 @@ impl From<SlotInfo> for SlotMetadata {
     }
 }
 
-fn safe_product_name(product_name: Option<&str>) -> Option<String> {
+/// Reduce a HID product name to a bounded, control-free display string.
+///
+/// It is the only place a product name enters a DTO, so both the desktop
+/// candidate list and the local HTTP API publish the same sanitized text.
+pub(crate) fn safe_product_name(product_name: Option<&str>) -> Option<String> {
     let product_name = product_name?;
     let mut safe = String::new();
     for character in product_name.chars().take(64) {
@@ -620,6 +833,11 @@ struct ConnectedSession {
     device: ConnectedDevice,
     session: Box<dyn MacroSession>,
     auth_state: AuthState,
+    /// Whether the local HTTP API depends on this session outliving a
+    /// close-to-tray. It is set only by a successful API write and dies with the
+    /// session, so an explicit disconnect, a device switch, a transport failure,
+    /// a device replacement or application shutdown clears it for free.
+    retained_for_api: bool,
 }
 
 pub struct AppState<F: SessionFactory = HidSessionFactory> {
@@ -677,15 +895,28 @@ impl<F: SessionFactory> AppState<F> {
     }
 
     pub fn connect(&mut self, opaque_id: &str) -> Result<ConnectionState, CommandError> {
+        let record = self
+            .registry
+            .find(opaque_id)
+            .ok_or_else(CommandError::candidate_not_found)?;
+        self.connect_record(record)
+    }
+
+    /// Install a session for one exact discovery record.
+    ///
+    /// The local HTTP API resolves a device by the user's alias, so it connects
+    /// the record its own discovery found instead of consuming a GUI candidate
+    /// id. The candidate registry is deliberately not touched, so the window
+    /// keeps its own selection and its opaque ids.
+    pub(crate) fn connect_record(
+        &mut self,
+        record: DeviceRecord,
+    ) -> Result<ConnectionState, CommandError> {
         // Switching devices must not leave the previous authentication window
         // active. LOCK is best-effort because the old transport may already be
         // gone; dropping the session is unconditional.
         self.disconnect();
 
-        let record = self
-            .registry
-            .find(opaque_id)
-            .ok_or_else(CommandError::candidate_not_found)?;
         let summary = record.summary();
         let device = connected_device(&summary);
         let mut session = self
@@ -710,8 +941,81 @@ impl<F: SessionFactory> AppState<F> {
             device,
             session,
             auth_state,
+            retained_for_api: false,
         });
         Ok(self.connection_state())
+    }
+
+    /// Safe summary key of the active device, or `None` while disconnected.
+    ///
+    /// This is the same five-part local identity the alias map and the window
+    /// use; it is never a HID path, a serial number or a candidate id.
+    pub(crate) fn connected_summary_key(&self) -> Option<String> {
+        self.connection
+            .as_ref()
+            .map(|connection| crate::api::summary_key(&connection.record.summary()))
+    }
+
+    /// Mark the active session as one the local HTTP API depends on.
+    ///
+    /// Called after a successful API write: the window hiding is not a device
+    /// disconnect, and dropping the session would let the firmware clear the
+    /// object that was just committed. It is a no-op while disconnected.
+    pub(crate) fn retain_session_for_api(&mut self) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.retained_for_api = true;
+        }
+    }
+
+    /// Whether the active session is retained for the local HTTP API.
+    pub fn session_retained_for_api(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.retained_for_api)
+    }
+
+    /// Close-to-tray lifecycle for the active session.
+    ///
+    /// A session the local HTTP API used must outlive a close-to-tray: hiding the
+    /// window is not a device disconnect, and dropping the session would let the
+    /// firmware clear the committed Dynamic object on a management USB
+    /// disconnect. That session only gets a best-effort static LOCK, which clears
+    /// the management window without touching the committed object.
+    ///
+    /// Every other session keeps the previous behavior and is released. An
+    /// explicit disconnect, a device switch, a transport failure and application
+    /// shutdown still release a retained session, and a LOCK that cannot reach the
+    /// device at all leaves nothing to retain either.
+    pub fn prepare_tray_close(&mut self) -> TrayCloseState {
+        if !self.session_retained_for_api() {
+            self.disconnect();
+            return TrayCloseState {
+                session_retained: false,
+                auth_state: AuthState::Disconnected,
+            };
+        }
+        match self.lock() {
+            Ok(auth_state) => TrayCloseState {
+                session_retained: true,
+                auth_state,
+            },
+            // A LOCK that could not reach the device means the retained session is
+            // gone: release it instead of pretending it still holds the object, so
+            // the window never reports a live session that no longer exists.
+            Err(error) if lock_failure_releases_session(&error) => {
+                self.disconnect();
+                TrayCloseState {
+                    session_retained: false,
+                    auth_state: AuthState::Disconnected,
+                }
+            }
+            // A remote status (for example AUTH_NOT_CONFIGURED on an OPEN device)
+            // still leaves a usable session that keeps the object.
+            Err(_) => TrayCloseState {
+                session_retained: true,
+                auth_state: self.connection_state().auth_state,
+            },
+        }
     }
 
     pub fn connection_state(&self) -> ConnectionState {
@@ -1189,6 +1493,18 @@ impl<F: SessionFactory> Drop for AppState<F> {
     }
 }
 
+/// Whether a failed best-effort close-to-tray LOCK means the session is gone.
+///
+/// Only a transport, timeout or malformed-response failure leaves nothing usable
+/// to retain; a remote protocol status still describes a live session that simply
+/// refused the LOCK, so it keeps the committed Dynamic object.
+fn lock_failure_releases_session(error: &CommandError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "timeout" | "transport_error" | "protocol_error" | "state_unavailable"
+    )
+}
+
 fn state_after_lock_result(previous_state: AuthState) -> AuthState {
     match previous_state {
         AuthState::Open => AuthState::Open,
@@ -1324,6 +1640,58 @@ pub async fn disconnect_device(state: State<'_, Arc<Mutex<AppState>>>) -> Result
     })
     .await
 }
+
+/// Close-to-tray lifecycle of the active session.
+///
+/// The window hides either way. A session the local HTTP API used only gets a
+/// best-effort static LOCK and stays open, so the firmware does not clear the
+/// committed Dynamic object on a management USB disconnect; every other session
+/// is released exactly like an explicit disconnect. The returned state is
+/// body-free and carries no macro text, HID path, serial or device identity.
+#[tauri::command]
+pub async fn prepare_tray_close(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<TrayCloseState, CommandError> {
+    let state = Arc::clone(state.inner());
+    run_on_hid_worker(move || {
+        let mut state = state
+            .lock()
+            .map_err(|_| CommandError::state_unavailable())?;
+        Ok(state.prepare_tray_close())
+    })
+    .await
+}
+
+/// Release the shared session on the application exit path.
+///
+/// The platform event loop ends the process with `std::process::exit`, so the
+/// managed `AppState` destructor never runs on the normal quit path. This
+/// performs the same lifecycle explicitly on the single HID worker: the active
+/// session — retained for the local HTTP API or not — is released with the
+/// best-effort static LOCK an explicit disconnect performs, so a quit never
+/// leaves an authenticated management window behind. It is a no-op while
+/// disconnected and never reports an error to the caller.
+pub fn release_session_on_exit<F: SessionFactory + 'static>(state: Arc<Mutex<AppState<F>>>) {
+    // The release runs on the same single worker as every other session
+    // operation, but the quit path waits only [`SHUTDOWN_SESSION_WAIT`]: a device
+    // that stops answering must not delay the process exit for the whole retry
+    // budget. A release that misses the deadline is the same best-effort miss as
+    // a LOCK that cannot reach the device.
+    HID_WORKER
+        .get_or_init(HidWorker::new)
+        .execute_with_deadline(SHUTDOWN_SESSION_WAIT, move || {
+            if let Ok(mut state) = state.lock() {
+                state.disconnect();
+            }
+        });
+}
+
+/// How long the quit path waits for the session release it queued.
+///
+/// A healthy LOCK answers in milliseconds, so this only bounds an unresponsive
+/// device; it is deliberately far below the maximum retry/timeout budget a
+/// session can be configured with.
+const SHUTDOWN_SESSION_WAIT: Duration = Duration::from_millis(1_500);
 
 #[tauri::command]
 pub async fn get_connection(
@@ -1564,6 +1932,34 @@ pub async fn set_tray_runtime_state(
             "The tray menu state could not be updated.",
         )
     })
+}
+
+/// Replace the local device alias map the HTTP API resolves device names with.
+///
+/// The desktop owns the aliases in its own local storage; this command only
+/// mirrors the validated map into the running process so the loopback API can
+/// answer with the user's own names. Every key and alias is re-validated here,
+/// so a frontend bug cannot introduce a device path as a key, an unbounded or
+/// control-character alias, or one name shared by two devices, and the rejected
+/// value is never echoed back.
+///
+/// The first accepted map is also what makes the API ready, so an empty map is
+/// a real mirror and not a no-op: before the first accepted map `GET
+/// /api/v1/devices` answers `503 service_not_ready` instead of a device list
+/// whose aliases would all look unset, and a refused map leaves that state
+/// unchanged.
+#[tauri::command]
+pub async fn set_device_aliases(
+    aliases: BTreeMap<String, String>,
+    registry: State<'_, Arc<Mutex<DeviceAliasRegistry>>>,
+) -> Result<(), CommandError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| CommandError::state_unavailable())?;
+    registry
+        .replace(&aliases)
+        .map_err(|error| CommandError::new(error.code(), error.message()))?;
+    Ok(())
 }
 
 /// Maps a frontend locale tag onto a tray locale.
@@ -2268,6 +2664,541 @@ mod tests {
         assert!(get_calls.lock().unwrap().is_empty());
         assert!(set_calls.lock().unwrap().is_empty());
         assert!(clear_calls.lock().unwrap().is_empty());
+    }
+
+    /// One API write fixture: an exact discovery record and its safe summary
+    /// key, which is what the alias map resolves to.
+    fn api_write_fixture() -> (DeviceRecord, String) {
+        let record = record(
+            b"api-dynamic",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        );
+        let key = crate::api::summary_key(&record.summary());
+        (record, key)
+    }
+
+    /// A second, differently identified device for the conflict case.
+    fn api_write_fixture_other() -> (DeviceRecord, String) {
+        let record = record(
+            b"api-dynamic-other",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            3,
+        );
+        let key = crate::api::summary_key(&record.summary());
+        (record, key)
+    }
+
+    #[test]
+    fn an_api_write_connects_the_resolved_device_and_uploads_through_the_service() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let open_count = Arc::clone(&factory.open_count);
+        let auth_info_calls = Arc::clone(&factory.auth_info_calls);
+        let dynamic_capabilities_calls = Arc::clone(&factory.dynamic_capabilities_calls);
+        let dynamic_upload_calls = Arc::clone(&factory.dynamic_upload_calls);
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+        // The API resolves the device from its own discovery, so it never needs a
+        // GUI candidate: the registry stays empty and its ids are untouched.
+        assert!(state.refresh_records(Vec::new()).is_empty());
+
+        let outcome = api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false)
+            .expect("the write is accepted");
+
+        assert_eq!(
+            outcome,
+            ApiDynamicOutcome {
+                text_length: 11,
+                ttl_seconds: crate::protocol::DYNAMIC_DEFAULT_TTL_SECONDS,
+                keep_after_execute: false,
+            }
+        );
+        assert_eq!(*open_count.lock().unwrap(), 1);
+        // The API performs the same public v2 handshake the window does, and the
+        // capability exchange runs before the upload.
+        assert_eq!(*auth_info_calls.lock().unwrap(), 1);
+        assert_eq!(*dynamic_capabilities_calls.lock().unwrap(), 1);
+        assert_eq!(
+            dynamic_upload_calls.lock().unwrap().as_slice(),
+            &[(0, b"api-fixture".to_vec(), None, false)]
+        );
+        // The session is kept: dropping it would make the firmware clear the
+        // object on a real management USB disconnect.
+        assert!(state.connection_state().connected);
+        // The service published a body-free local observation.
+        let snapshot = state.dynamic_state();
+        assert_eq!(snapshot.status, DynamicServiceStatus::CommittedLocally);
+        assert_eq!(snapshot.objects[0].slot, 0);
+        assert_eq!(snapshot.objects[0].text_length, Some(11));
+        let serialized = serde_json::to_string(&snapshot).expect("state JSON");
+        assert!(!serialized.contains("api-fixture"), "{serialized}");
+    }
+
+    #[test]
+    fn an_api_write_reuses_the_same_device_and_never_switches_an_active_one() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let open_count = Arc::clone(&factory.open_count);
+        let dynamic_upload_calls = Arc::clone(&factory.dynamic_upload_calls);
+        let mut state = AppState::new(factory);
+        let (first, first_key) = api_write_fixture();
+        let (second, second_key) = api_write_fixture_other();
+
+        api_dynamic_upload(&mut state, first, &first_key, 0, "first", None, false)
+            .expect("first write");
+        // The same device is reused instead of being reopened.
+        api_dynamic_upload(
+            &mut state,
+            second.clone(),
+            &first_key,
+            1,
+            "second",
+            Some(60),
+            false,
+        )
+        .expect("second write");
+        assert_eq!(*open_count.lock().unwrap(), 1);
+        assert_eq!(dynamic_upload_calls.lock().unwrap().len(), 2);
+
+        // A different device is refused before anything is opened, and the
+        // active session and its observations stay exactly as they were.
+        let snapshot = state.dynamic_state();
+        let error = api_dynamic_upload(&mut state, second, &second_key, 0, "third", None, false)
+            .unwrap_err();
+        assert_eq!(error.code, "device_conflict");
+        assert_eq!(*open_count.lock().unwrap(), 1);
+        assert_eq!(dynamic_upload_calls.lock().unwrap().len(), 2);
+        assert_eq!(state.dynamic_state(), snapshot);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn an_api_write_reports_the_device_default_ttl_and_an_explicit_one() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        // An omitted TTL is sent as the device default, and the reported TTL is
+        // the device's own default from the capability exchange.
+        let outcome = api_dynamic_upload(&mut state, record.clone(), &key, 0, "x", None, true)
+            .expect("write");
+        assert_eq!(outcome.ttl_seconds, 300);
+        assert!(outcome.keep_after_execute);
+        assert_eq!(outcome.text_length, 1);
+
+        let outcome =
+            api_dynamic_upload(&mut state, record, &key, 0, "x", Some(900), false).expect("write");
+        assert_eq!(outcome.ttl_seconds, 900);
+        assert!(!outcome.keep_after_execute);
+    }
+
+    #[test]
+    fn an_api_write_bypasses_the_static_auth_gate_on_a_locked_device() {
+        let (mut factory, _) = factory(Ok(vec![SlotInfo { slot: 0, length: 1 }]));
+        factory.auth_info_result = Ok(AuthInfo {
+            password_configured: true,
+            session_authenticated: false,
+            kdf_id: crate::auth::KDF_ID,
+            iterations: crate::auth::DEFAULT_ITERATIONS,
+            salt: [0x73; crate::auth::SALT_SIZE],
+        });
+        let list_calls = Arc::clone(&factory.list_calls);
+        let get_calls = Arc::clone(&factory.get_calls);
+        let set_calls = Arc::clone(&factory.set_calls);
+        let clear_calls = Arc::clone(&factory.clear_calls);
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let dynamic_upload_calls = Arc::clone(&factory.dynamic_upload_calls);
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        api_dynamic_upload(
+            &mut state,
+            record,
+            &key,
+            7,
+            "locked-fixture",
+            Some(60),
+            true,
+        )
+        .expect("a locked device still accepts a Dynamic write");
+
+        assert_eq!(state.connection_state().auth_state, AuthState::Locked);
+        assert_eq!(
+            dynamic_upload_calls.lock().unwrap().as_slice(),
+            &[(7, b"locked-fixture".to_vec(), Some(60), true)]
+        );
+        // No static command ran, and the API neither logged in nor locked: the
+        // Dynamic path stays outside the static management gate.
+        assert_eq!(*list_calls.lock().unwrap(), 0);
+        assert!(get_calls.lock().unwrap().is_empty());
+        assert!(set_calls.lock().unwrap().is_empty());
+        assert!(clear_calls.lock().unwrap().is_empty());
+        assert_eq!(*lock_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_api_write_stops_before_the_upload_when_capability_discovery_fails() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_capabilities_result = Err(ClientError::Remote(Status::BadOpcode));
+        let dynamic_upload_calls = Arc::clone(&factory.dynamic_upload_calls);
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        let error = api_dynamic_upload(&mut state, record, &key, 0, "x", None, false).unwrap_err();
+        assert_eq!(error.code, "dynamic_unsupported");
+        // No upload was attempted, and the remote status kept the session.
+        assert!(dynamic_upload_calls.lock().unwrap().is_empty());
+        assert!(state.connection_state().connected);
+        assert_eq!(
+            state.dynamic_state().status,
+            DynamicServiceStatus::Unsupported
+        );
+    }
+
+    #[test]
+    fn an_api_write_publishes_a_failed_upload_without_the_text() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_upload_result = Err(ClientError::Remote(Status::BadSlot));
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        let error = api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false)
+            .unwrap_err();
+        assert_eq!(error.code, "bad_slot");
+        let serialized = serde_json::to_string(&state.dynamic_state()).expect("state JSON");
+        assert!(serialized.contains("bad_slot"), "{serialized}");
+        assert!(!serialized.contains("api-fixture"), "{serialized}");
+    }
+
+    #[test]
+    fn an_api_write_retains_the_session_across_a_close_to_tray() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+        assert!(state.session_retained_for_api());
+
+        let close = state.prepare_tray_close();
+
+        // The session the API used survives the hide: a real management USB
+        // disconnect would otherwise let the firmware clear the object.
+        assert!(close.session_retained);
+        assert!(state.connection_state().connected);
+        // The static management window is closed with a best-effort LOCK.
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
+        // The fixture device is OPEN, so there is no password window to close and
+        // the management state stays open while the session itself is retained.
+        assert_eq!(close.auth_state, AuthState::Open);
+        // No dynamic observation survives as "forgotten": the object is still
+        // there as far as the service knows.
+        assert_eq!(
+            state.dynamic_state().status,
+            DynamicServiceStatus::CommittedLocally
+        );
+    }
+
+    #[test]
+    fn a_close_to_tray_without_api_use_releases_the_session() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let mut state = connected_state(factory);
+        assert!(!state.session_retained_for_api());
+
+        let close = state.prepare_tray_close();
+
+        // A window-owned session keeps the previous behavior: released locally
+        // after a best-effort LOCK.
+        assert!(!close.session_retained);
+        assert_eq!(close.auth_state, AuthState::Disconnected);
+        assert!(!state.connection_state().connected);
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
+        assert_eq!(state.dynamic_state().status, DynamicServiceStatus::Unknown);
+    }
+
+    #[test]
+    fn a_close_to_tray_after_a_failed_api_write_releases_the_session() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_upload_result = Err(ClientError::Remote(Status::BadSlot));
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).unwrap_err();
+
+        // Nothing was committed by the API, so nothing has to outlive the window.
+        assert!(!state.session_retained_for_api());
+        let close = state.prepare_tray_close();
+        assert!(!close.session_retained);
+        assert!(!state.connection_state().connected);
+    }
+
+    #[test]
+    fn an_explicit_disconnect_releases_a_retained_session() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+
+        state.disconnect();
+
+        assert!(!state.connection_state().connected);
+        assert!(!state.session_retained_for_api());
+        // The explicit disconnect still LOCKs best-effort and drops the session.
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
+        // A later close has nothing left to retain.
+        let close = state.prepare_tray_close();
+        assert!(!close.session_retained);
+        assert_eq!(state.dynamic_state().status, DynamicServiceStatus::Unknown);
+    }
+
+    #[test]
+    fn a_device_switch_releases_a_retained_session() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let open_count = Arc::clone(&factory.open_count);
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+
+        // The window connecting another device is an explicit device switch: the
+        // retained session is dropped instead of being kept in the background.
+        let other = state.refresh_records(vec![DeviceRecord::for_test(
+            b"other-device",
+            DeviceSummary {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                product_name: Some("Example Keyboard".to_string()),
+                interface_number: 3,
+                usage_page: RUNTIME_MACRO_USAGE_PAGE,
+                usage: RUNTIME_MACRO_USAGE,
+            },
+        )])[0]
+            .clone();
+        state.connect(&other.id).unwrap();
+
+        assert!(state.connection_state().connected);
+        assert!(!state.session_retained_for_api());
+        assert_eq!(*open_count.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_transport_failure_releases_a_retained_session() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.dynamic_upload_result = Err(ClientError::Transport(TransportError::Fatal(
+            "device went away".to_string(),
+        )));
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+
+        let error = api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false)
+            .unwrap_err();
+
+        assert_eq!(error.code, "transport_error");
+        // No observation and no session survive a lost transport, so the retained
+        // flag is gone with the session it belonged to.
+        assert!(!state.connection_state().connected);
+        assert!(!state.session_retained_for_api());
+        assert_eq!(state.dynamic_state().status, DynamicServiceStatus::Unknown);
+        assert!(!state.prepare_tray_close().session_retained);
+    }
+
+    #[test]
+    fn a_close_to_tray_that_cannot_reach_the_device_releases_the_retained_session() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        // The device stops answering before the close: the session is retained by
+        // the API write, but a LOCK that exhausts the transport proves it is gone.
+        factory.lock_result = Err(ClientError::Transport(TransportError::Timeout));
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+        assert!(state.session_retained_for_api());
+
+        let close = state.prepare_tray_close();
+        assert!(!close.session_retained);
+        assert_eq!(close.auth_state, AuthState::Disconnected);
+        assert!(!state.connection_state().connected);
+    }
+
+    #[test]
+    fn a_close_to_tray_keeps_the_session_when_the_device_refuses_the_lock() {
+        let (mut factory, _) = factory(Ok(Vec::new()));
+        factory.lock_result = Err(ClientError::Remote(Status::AuthNotConfigured));
+        let mut state = AppState::new(factory);
+        let (record, key) = api_write_fixture();
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+
+        let close = state.prepare_tray_close();
+
+        // An OPEN device answers AUTH_NOT_CONFIGURED, which is a live session: the
+        // object still has to survive the hide.
+        assert!(close.session_retained);
+        assert_eq!(close.auth_state, AuthState::Open);
+        assert!(state.connection_state().connected);
+    }
+
+    #[test]
+    fn dropping_the_state_releases_a_retained_session_with_a_best_effort_lock() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let (record, key) = api_write_fixture();
+        let mut state = AppState::new(factory);
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+        assert!(state.session_retained_for_api());
+
+        // Application shutdown drops the managed state; the retained session must
+        // not outlive the process (or leak a stale handle into a later state).
+        drop(state);
+
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
+    }
+
+    /// A sink for the payload-free state notification, so the API server can run
+    /// inside a test without a window.
+    #[derive(Default)]
+    struct ApiNotifierSink;
+
+    impl crate::api::DynamicStateNotifier for ApiNotifierSink {
+        fn dynamic_state_changed(&self) {}
+    }
+
+    #[test]
+    fn the_quit_path_releases_a_retained_session_with_a_best_effort_lock() {
+        let (factory, _) = factory(Ok(Vec::new()));
+        let lock_calls = Arc::clone(&factory.lock_calls);
+        let (record, key) = api_write_fixture();
+        let state = Arc::new(Mutex::new(AppState::new(factory)));
+        {
+            let mut guard = state.lock().unwrap();
+            api_dynamic_upload(&mut guard, record, &key, 0, "api-fixture", None, false)
+                .expect("write");
+            assert!(guard.session_retained_for_api());
+        }
+
+        // The quit path cannot rely on the destructor, so it releases the session
+        // — retained included — through the same single HID worker and the same
+        // best-effort LOCK an explicit disconnect performs.
+        release_session_on_exit(Arc::clone(&state));
+
+        let guard = state.lock().unwrap();
+        assert!(!guard.connection_state().connected);
+        assert!(!guard.session_retained_for_api());
+        assert_eq!(guard.dynamic_state().status, DynamicServiceStatus::Unknown);
+        drop(guard);
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
+
+        // A later drop of the same state does not LOCK a second time.
+        drop(state);
+        assert_eq!(*lock_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn stopping_the_api_server_releases_its_shared_state_reference() {
+        let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState::default()));
+        let listener = crate::api::bind_loopback("127.0.0.1:0").expect("bind loopback");
+        let source = Arc::new(crate::api::HidApiDeviceSource::new(Arc::clone(&state)));
+        let aliases = Arc::new(Mutex::new(crate::api::DeviceAliasRegistry::default()));
+        let (server, task) =
+            crate::api::spawn_acceptor(listener, source, aliases, Arc::new(ApiNotifierSink));
+
+        // While the API runs it holds a second reference to the shared state, so
+        // dropping the managed state alone would not run `AppState`'s destructor.
+        assert_eq!(Arc::strong_count(&state), 2);
+
+        server.shutdown();
+
+        tauri::async_runtime::block_on(task).expect("the acceptor stops cleanly");
+        // The explicit stop releases the listener and that reference, so the
+        // state is never kept alive behind the application.
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[test]
+    fn a_dynamic_api_write_publishes_the_same_service_state_a_gui_write_does() {
+        // The API and the window share one AppState, one DynamicService and one HID
+        // worker, so both kinds of write land in the same observed state instead of
+        // two parallel ones.
+        let (factory, _) = factory(Ok(Vec::new()));
+        let mut state = AppState::new(factory);
+        let candidate = state.refresh_records(vec![record(
+            b"shared-service",
+            RUNTIME_MACRO_USAGE_PAGE,
+            RUNTIME_MACRO_USAGE,
+            2,
+        )])[0]
+            .clone();
+        state.connect(&candidate.id).unwrap();
+
+        // The window path first, through the same state.
+        state.upload_dynamic(1, "gui", None, false).unwrap();
+        let (record, key) = api_write_fixture();
+        api_dynamic_upload(&mut state, record, &key, 0, "api-fixture", None, false).expect("write");
+
+        let snapshot = state.dynamic_state();
+        assert_eq!(snapshot.status, DynamicServiceStatus::CommittedLocally);
+        // The state is expanded over the reported object count, in slot order.
+        assert_eq!(
+            snapshot.objects.len(),
+            usize::from(crate::protocol::DYNAMIC_SLOT_COUNT_MAX)
+        );
+        assert_eq!(snapshot.objects[0].slot, 0);
+        assert_eq!(snapshot.objects[0].text_length, Some(11));
+        assert_eq!(snapshot.objects[1].slot, 1);
+        assert_eq!(snapshot.objects[1].text_length, Some(3));
+        // Every other object stays unknown instead of being invented.
+        assert!(snapshot.objects[2..]
+            .iter()
+            .all(|object| object.text_length.is_none()));
+        let serialized = serde_json::to_string(&snapshot).expect("state JSON");
+        assert!(!serialized.contains("api-fixture"), "{serialized}");
+        assert!(!serialized.contains("gui"), "{serialized}");
+    }
+
+    #[test]
+    fn every_hid_job_runs_on_the_single_named_worker_thread() {
+        // The API and every Tauri command share this worker, which is what makes a
+        // second HID writer impossible and serializes GUI, tray and API operations.
+        let worker = execute_on_hid_worker(|| {
+            Ok(std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string())
+        })
+        .expect("the worker answers");
+        assert_eq!(worker, "zmk-hid-worker");
+    }
+
+    #[test]
+    fn the_hid_worker_serializes_jobs_instead_of_interleaving_them() {
+        let log: Arc<StdMutex<Vec<(usize, char)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for job in 0..4 {
+            let log = Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                execute_on_hid_worker(move || {
+                    log.lock().unwrap().push((job, 'a'));
+                    // A second job that entered the same worker would have to
+                    // appear here before this job leaves, which the assertions
+                    // below would catch.
+                    std::thread::yield_now();
+                    log.lock().unwrap().push((job, 'z'));
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 8);
+        for pair in log.chunks(2) {
+            assert_eq!(pair[0].1, 'a');
+            assert_eq!(pair[1].1, 'z');
+            assert_eq!(pair[0].0, pair[1].0);
+        }
     }
 
     #[test]
