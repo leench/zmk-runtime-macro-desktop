@@ -2031,7 +2031,7 @@ function App() {
 
       {settingsOpen ? (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-6 py-8 backdrop-blur-[2px]" role="presentation">
-          <section className="w-full max-w-[560px] rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <section className="max-h-[calc(100vh-4rem)] w-full max-w-[560px] overflow-y-auto rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/15" role="dialog" aria-modal="true" aria-labelledby="settings-title">
             <div className="flex items-start justify-between gap-4">
               <div><p className="font-mono text-xs uppercase tracking-wide text-ink-subtle">{copy.preferences}</p><h2 id="settings-title" className="mt-1 text-xl font-semibold text-ink">{copy.settings}</h2></div>
               <button type="button" onClick={restorePageZoom} disabled={settingsBusy} aria-label={copy.close} className="grid h-9 w-9 place-items-center rounded-lg text-ink-subtle hover:bg-surface-2 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" aria-hidden="true" /></button>
