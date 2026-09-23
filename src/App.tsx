@@ -18,6 +18,7 @@ import {
   getDynamicState,
   getSettings,
   getSlot,
+  hideMainWindowToTray,
   listDevices,
   loadScenarios as loadScenarioStoreCommand,
   refreshAuthState as refreshAuthStateCommand,
@@ -1836,7 +1837,6 @@ function App() {
   const hideWindowWithBestEffortLock = useCallback(() => {
     if (!inTauri() || closingRef.current) return;
     closingRef.current = true;
-    const windowHandle = getCurrentWindow();
     const sequence = ++operation.current;
     autoReconnectEnabledRef.current = false;
     missingDevicePollsRef.current = 0;
@@ -1873,7 +1873,7 @@ function App() {
       });
     const hideDeadline = new Promise<void>((resolve) => { window.setTimeout(resolve, 250); });
     void Promise.race([closeAttempt, hideDeadline])
-      .then(() => windowHandle.hide())
+      .then(() => hideMainWindowToTray())
       .then(() => {
         closingRef.current = false;
         closeConfirmRef.current = false;

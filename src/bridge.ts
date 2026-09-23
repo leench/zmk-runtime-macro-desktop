@@ -144,6 +144,11 @@ export function prepareTrayClose(): Promise<TrayCloseState> {
   return invoke<TrayCloseState>("prepare_tray_close");
 }
 
+/** Hide to the tray, also removing the macOS Dock icon until the window reopens. */
+export function hideMainWindowToTray(): Promise<void> {
+  return invoke("hide_main_window_to_tray");
+}
+
 /**
  * Close-to-tray outcome the window may act on.
  *

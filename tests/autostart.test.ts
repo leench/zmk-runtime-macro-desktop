@@ -7,6 +7,7 @@ import {
   disableAutostart,
   enableAutostart,
   getAutostartEnabled,
+  hideMainWindowToTray,
   type CommandError,
 } from "../src/bridge.ts";
 import { getMessages, translateCommandError } from "../src/i18n.ts";
@@ -99,6 +100,16 @@ test("the wrappers call exactly the three plugin commands", async () => {
     for (const call of host.calls) {
       assert.deepEqual(Object.keys(call.args), [], `${call.cmd} must send no arguments`);
     }
+  } finally {
+    host.restore();
+  }
+});
+
+test("hiding to the tray invokes the native window and Dock lifecycle without a payload", async () => {
+  const host = installFakeTauriHost();
+  try {
+    await hideMainWindowToTray();
+    assert.deepEqual(host.calls, [{ cmd: "hide_main_window_to_tray", args: {} }]);
   } finally {
     host.restore();
   }

@@ -836,10 +836,27 @@ impl TrayMenuItems {
 /// window entry point behaves the same after a hide-to-tray or a second launch.
 pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        // A tray-only launch has no Dock icon on macOS. Restore it before
+        // showing the window so the foreground app behaves like a normal app.
+        #[cfg(target_os = "macos")]
+        let _ = app.set_dock_visibility(true);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+/// Hide the main window to the tray; on macOS hide its Dock icon only after
+/// the window was successfully hidden. The tray remains the entry point.
+#[tauri::command]
+pub fn hide_main_window_to_tray(app: AppHandle) -> Result<(), &'static str> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Main window unavailable.")?;
+    window.hide().map_err(|_| "Could not hide main window.")?;
+    #[cfg(target_os = "macos")]
+    let _ = app.set_dock_visibility(false);
+    Ok(())
 }
 
 /// Restores the window and asks the connected window to run `action`.

@@ -46,6 +46,7 @@ pub fn run() {
             commands::connect_device,
             commands::disconnect_device,
             commands::prepare_tray_close,
+            tray::hide_main_window_to_tray,
             commands::get_connection,
             commands::refresh_auth_state,
             commands::authenticate,
@@ -68,6 +69,13 @@ pub fn run() {
             scenario_store::save_scenarios,
         ])
         .setup(move |app| {
+            // On macOS a hidden window alone still leaves an icon in the Dock.
+            // Apply the tray-only policy before creating any native UI so a login
+            // autostart launch does not expose a normal application icon.
+            #[cfg(target_os = "macos")]
+            if autostart::is_autostart_launch(std::env::args()) {
+                let _ = app.set_dock_visibility(false);
+            }
             tray::init(app)?;
             // The local automation API starts with the application, including a
             // tray-only autostart launch. It stays optional: a busy port or an

@@ -14,9 +14,10 @@
 //!    and no device identifier, because the login entry is written to a file or a
 //!    registry value on the user's machine.
 //! 2. The launch semantics. The main window is created hidden
-//!    (`src-tauri/tauri.conf.json`) so an autostart launch cannot flash it, every
-//!    other launch shows it, and a second autostart launch never raises an
-//!    already running instance.
+//!    (`src-tauri/tauri.conf.json`) so an autostart launch cannot flash it, and
+//!    macOS also hides the Dock icon for the tray-only launch. Every other launch
+//!    shows the window and restores normal Dock visibility; a second autostart
+//!    launch never raises an already running instance.
 //!
 //! An autostart launch changes nothing else: it does not connect to a device, it
 //! does not send `AUTH_INFO`, it runs no capability discovery and it reads or
