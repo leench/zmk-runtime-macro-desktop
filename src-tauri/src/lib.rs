@@ -39,9 +39,13 @@ pub fn run() {
         // Official autostart plugin: it owns the platform login entry, and this
         // app only reads or changes it on an explicit user action in Settings.
         .plugin(autostart::plugin())
+        .manage(Mutex::new(autostart::StartupWindowState::new(
+            autostart::is_autostart_launch(std::env::args()),
+        )))
         .manage(state)
         .manage(device_aliases)
         .invoke_handler(tauri::generate_handler![
+            commands::frontend_ready,
             commands::list_devices,
             commands::connect_device,
             commands::disconnect_device,
@@ -84,14 +88,10 @@ pub fn run() {
             // completed write to the window through a payload-free event. The
             // returned handle is the explicit stop the exit path below uses.
             app.manage(api::start(app.handle().clone(), api_state, api_aliases));
-            // The main window is created hidden so a login-autostart launch
-            // cannot flash it. An autostart launch stays in the tray; every other
-            // launch shows and focuses the window immediately. Neither path
-            // connects to a device, runs a capability discovery or touches a
-            // Dynamic object, so `DynamicService` still starts in `unknown`.
-            if !autostart::is_autostart_launch(std::env::args()) {
-                tray::show_main_window(app.handle());
-            }
+            // Keep the transparent window hidden until the frontend mounts.
+            // `frontend_ready` consumes the ordinary launch's pending show;
+            // autostart stays tray-only unless the user requests restoration.
+            // Neither path connects to a device or touches a Dynamic object.
             Ok(())
         })
         .build(tauri::generate_context!())

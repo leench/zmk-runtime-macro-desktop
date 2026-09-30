@@ -16,7 +16,8 @@
 //! 2. The launch semantics. The main window is created hidden
 //!    (`src-tauri/tauri.conf.json`) so an autostart launch cannot flash it, and
 //!    macOS also hides the Dock icon for the tray-only launch. Every other launch
-//!    shows the window and restores normal Dock visibility; a second autostart
+//!    shows the window after the frontend mounts and restores normal Dock
+//!    visibility; a second autostart
 //!    launch never raises an already running instance.
 //!
 //! An autostart launch changes nothing else: it does not connect to a device, it
@@ -32,6 +33,41 @@ use tauri::{plugin::TauriPlugin, Runtime};
 /// as `--autostart-extra`, `--autostart=1` or `--AUTOSTART` stays an ordinary
 /// launch and can never silently suppress the main window.
 pub const AUTOSTART_ARG: &str = "--autostart";
+
+/// Defer window restoration until React has mounted the initial UI. In
+/// particular, a transparent Linux webview must not be shown with an empty DOM.
+/// This also holds a tray/second-instance request made during initialization.
+pub struct StartupWindowState {
+    frontend_ready: bool,
+    show_requested: bool,
+}
+
+impl StartupWindowState {
+    pub fn new(autostart: bool) -> Self {
+        Self {
+            frontend_ready: false,
+            show_requested: !autostart,
+        }
+    }
+
+    pub fn request_show(&mut self) -> bool {
+        if self.frontend_ready {
+            return true;
+        }
+        self.show_requested = true;
+        false
+    }
+
+    /// Only the first notification may consume the initial show request. A
+    /// repeated mount notification must not reopen a window hidden to the tray.
+    pub fn mark_frontend_ready(&mut self) -> bool {
+        if self.frontend_ready {
+            return false;
+        }
+        self.frontend_ready = true;
+        std::mem::take(&mut self.show_requested)
+    }
+}
 
 /// Whether one argument list is a login-autostart launch.
 ///
@@ -85,6 +121,33 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn ordinary_launch_waits_for_frontend_and_shows_only_once() {
+        let mut state = StartupWindowState::new(false);
+        assert!(!state.request_show());
+        assert!(state.mark_frontend_ready());
+        assert!(!state.mark_frontend_ready());
+        // A subsequent tray/manual launch still restores an already-ready UI.
+        assert!(state.request_show());
+    }
+
+    #[test]
+    fn autostart_remains_hidden_after_frontend_mounts() {
+        let mut state = StartupWindowState::new(true);
+        assert!(!state.mark_frontend_ready());
+        assert!(!state.mark_frontend_ready());
+        assert!(state.request_show());
+    }
+
+    #[test]
+    fn manual_restore_during_autostart_is_deferred_until_frontend_mounts() {
+        let mut state = StartupWindowState::new(true);
+        assert!(!state.request_show());
+        assert!(!state.request_show());
+        assert!(state.mark_frontend_ready());
+        assert!(!state.mark_frontend_ready());
     }
 
     #[test]

@@ -835,6 +835,16 @@ impl TrayMenuItems {
 /// Used by the tray icon, the tray menu and the single-instance plugin so every
 /// window entry point behaves the same after a hide-to-tray or a second launch.
 pub fn show_main_window(app: &AppHandle) {
+    let Some(startup) = app.try_state::<Mutex<crate::autostart::StartupWindowState>>() else {
+        return;
+    };
+    let Ok(mut startup) = startup.lock() else {
+        return;
+    };
+    if !startup.request_show() {
+        return;
+    }
+    drop(startup);
     if let Some(window) = app.get_webview_window("main") {
         // A tray-only launch has no Dock icon on macOS. Restore it before
         // showing the window so the foreground app behaves like a normal app.

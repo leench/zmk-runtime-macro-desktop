@@ -356,6 +356,12 @@ function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/** Notify the backend only after React mounts; browser previews do nothing. */
+export async function notifyFrontendReady(): Promise<void> {
+  if (!inTauri()) return;
+  await invoke("frontend_ready");
+}
+
 /**
  * Login autostart, provided by the official Tauri autostart plugin.
  *

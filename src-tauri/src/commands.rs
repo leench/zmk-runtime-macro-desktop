@@ -1561,6 +1561,23 @@ fn dynamic_failure(error: &ClientError) -> DynamicFailure {
     }
 }
 
+/// Payload-free acknowledgement after the initial UI has mounted. This does
+/// not wait for device discovery or perform any HID work.
+#[tauri::command]
+pub fn frontend_ready(
+    app: tauri::AppHandle,
+    startup: State<'_, Mutex<crate::autostart::StartupWindowState>>,
+) -> Result<(), CommandError> {
+    let show = startup
+        .lock()
+        .map_err(|_| CommandError::state_unavailable())?
+        .mark_frontend_ready();
+    if show {
+        crate::tray::show_main_window(&app);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_settings(
     state: State<'_, Arc<Mutex<AppState>>>,

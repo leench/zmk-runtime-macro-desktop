@@ -8,6 +8,7 @@ import {
   enableAutostart,
   getAutostartEnabled,
   hideMainWindowToTray,
+  notifyFrontendReady,
   type CommandError,
 } from "../src/bridge.ts";
 import { getMessages, translateCommandError } from "../src/i18n.ts";
@@ -79,6 +80,20 @@ test("no autostart state is fabricated outside a desktop host", async () => {
       assert.equal(typeof error.message, "string");
       return true;
     });
+  }
+});
+
+test("frontend readiness does nothing outside a desktop host", async () => {
+  await notifyFrontendReady();
+});
+
+test("frontend readiness sends only a payload-free acknowledgement", async () => {
+  const host = installFakeTauriHost();
+  try {
+    await notifyFrontendReady();
+    assert.deepEqual(host.calls, [{ cmd: "frontend_ready", args: {} }]);
+  } finally {
+    host.restore();
   }
 });
 

@@ -24,6 +24,7 @@ import {
   refreshAuthState as refreshAuthStateCommand,
   listSlots,
   lockDevice,
+  notifyFrontendReady,
   prepareTrayClose as prepareTrayCloseCommand,
   saveScenarios as saveScenarioStoreCommand,
   SCENARIO_STORE_SCHEMA_VERSION,
@@ -1903,6 +1904,13 @@ function App() {
     document.documentElement.lang = locale;
     return () => { delete document.documentElement.dataset.theme; document.documentElement.lang = ""; };
   }, [locale, theme]);
+
+  useEffect(() => {
+    // React has committed the initial UI and applied its theme. Do not wait for
+    // device discovery, or use requestAnimationFrame (hidden webviews may pause
+    // it). The backend preserves tray-only autostart and ignores duplicate ACKs.
+    void notifyFrontendReady().catch(() => undefined);
+  }, []);
 
   // The native tray menu follows the same resolved locale as the UI, on startup
   // and on every language change, without restarting the app. The browser
